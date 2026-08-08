@@ -9,7 +9,7 @@ Grok reads settings from config files, environment variables, and CLI flags. Thi
 Settings resolve highest-priority first:
 
 1. **CLI flags** (e.g. `--yolo`, `--model`, `--sandbox`)
-2. **Environment variables** (e.g. `XAI_API_KEY`, `GROK_MEMORY`)
+2. **Environment variables** (e.g. `api_key (config.toml)`, `GROK_MEMORY`)
 3. **config.toml** (`~/.grok/config.toml`)
 4. **Managed / requirements config** (files your org may deploy, e.g. `managed_config.toml` / `requirements.toml`)
 5. **Built-in defaults**
@@ -216,7 +216,7 @@ base_url = "https://api.example.com/v1"  # OpenAI-compatible endpoint
 name = "Display Name"                 # shown in model picker
 description = "Model description"      # optional
 api_key = "sk-..."                    # API key for this provider
-env_key = "XAI_API_KEY"               # env var(s) holding the API key; string or array (first set, non-empty wins)
+env_key = "api_key (config.toml)"               # env var(s) holding the API key; string or array (first set, non-empty wins)
 temperature = 0.7                     # sampling temperature (0.0-2.0)
 top_p = 0.95                          # nucleus sampling parameter
 max_completion_tokens = 8192          # max tokens per response
@@ -225,7 +225,7 @@ query_params = { api-version = "2026-07-22" } # query params appended to every r
 env_http_headers = { "X-Tenant" = "TENANT_TOKEN" }    # request headers from env vars, resolved at client build
 ```
 
-Credential resolution: `api_key` > `env_key` > signed-in session token > `XAI_API_KEY`. See [Custom Models](11-custom-models.md#request-query-parameters) for `query_params` and `env_http_headers`, and [Sandbox Mode](18-sandbox.md#shell-environment-policy) for `[shell_environment_policy]`, which restricts the environment variables tool subprocesses inherit.
+Credential resolution: `api_key` > `env_key`. See [Custom Models](11-custom-models.md#request-query-parameters) for `query_params` and `env_http_headers`, and [Sandbox Mode](18-sandbox.md#shell-environment-policy) for `[shell_environment_policy]`, which restricts the environment variables tool subprocesses inherit.
 
 To override a built-in model, use its name as the section key and set only the fields you need:
 
@@ -700,7 +700,7 @@ The key ones. See the README for the complete list.
 
 | Variable | Description |
 |----------|-------------|
-| `XAI_API_KEY` | API key from console.x.ai |
+| `api_key (config.toml)` | API key from console.x.ai |
 | `GROK_AUTH_PROVIDER_COMMAND` | External auth binary path |
 | `GROK_AUTH_PROVIDER_LABEL` | Display name on TUI login screen |
 | `GROK_AUTH_TOKEN_TTL` | Token lifetime in seconds |

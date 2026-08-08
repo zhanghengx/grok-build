@@ -733,7 +733,7 @@ async fn run_auth_flow_steps(
         "auth: no OAuth2 configuration available (neither enterprise OIDC nor xAI OAuth2 configured)"
     );
     anyhow::bail!(
-        "No OAuth2 configuration available. Run `grok login` to authenticate, or contact your administrator if you use enterprise SSO."
+        "No API key configured. Set api_key or env_key in ~/.grok/config.toml."
     )
 }
 
@@ -814,274 +814,20 @@ fn expired_refreshable_session(auth_manager: &AuthManager) -> Option<GrokAuth> {
         .filter(|a| a.is_xai_auth() && a.refresh_token.is_some())
 }
 
-/// Cold-start mint via non-interactive providers (external command, devbox);
-/// `None` when none is available. Persists the result into `auth_manager` (disk
-/// and in-memory) so per-request `auth()` self-heals. Carries no timeout of its
-/// own: the readiness-path caller imposes `STARTUP_AUTH_TIMEOUT`, while the
-/// leader's background re-mint runs uncapped (only the provider's ~300s ceiling).
-pub(crate) async fn mint_session_noninteractive(
-    auth_manager: &Arc<AuthManager>,
-) -> Option<GrokAuth> {
-    let grok_com_config = auth_manager.grok_com_config();
-    // preferred_method=api_key: never auto-mint OIDC (fail-closed).
-    if grok_com_config.blocks_automatic_oidc() {
-        tracing::debug!(
-            "mint_session_noninteractive: skipped (preferred_method=api_key blocks automatic OIDC)"
-        );
-        return None;
-    }
-
-    if let Some(cmd) = grok_com_config.auth_provider_command.as_deref() {
-        match run_external_auth_provider(cmd, auth_manager, false, None).await {
-            Ok((auth, _)) => return Some(auth),
-            Err(e) => {
-                tracing::debug!(error = %e, "mint_session_noninteractive: external provider failed");
-            }
-        }
-    }
-
-    if crate::auth::devbox_login::is_devbox_environment() {
-        match crate::auth::devbox_login::mint_devbox_auth(auth_manager).await {
-            Ok(new_auth) => return Some(persist_or_use_minted(auth_manager, new_auth).await),
-            Err(e) => {
-                tracing::debug!(error = %e, "mint_session_noninteractive: devbox mint failed");
-            }
-        }
-    }
-
-    None
-}
-
-/// Persist a minted token; on persist failure, return it unpersisted rather
-/// than dropping a valid credential.
-async fn persist_or_use_minted(auth_manager: &AuthManager, new_auth: GrokAuth) -> GrokAuth {
-    match auth_manager.save_without_enrichment(new_auth.clone()).await {
-        Ok(auth) => {
-            let _ = auth_manager.remove_scope(LEGACY_AUTH_SCOPE);
-            auth
-        }
-        Err(e) => {
-            tracing::warn!(error = %e, "mint persist failed; using unpersisted token");
-            new_auth
-        }
-    }
-}
-
-/// Print the CLI "signed in" confirmation, clearing the spinner line first.
-fn report_signed_in(auth: &GrokAuth) {
-    eprint!("\r\x1b[K");
-    match auth.email {
-        Some(ref email) => eprintln!("✓ Signed in as {email}"),
-        None => eprintln!("✓ Signed in"),
-    }
-}
-
 /// CLI auth entrypoint. For GUI, use `run_auth_flow_with_stderr_bridge`.
 pub async fn ensure_authenticated(
     grok_com_config: &GrokComConfig,
-    reauth: bool,
-    message_prefix: Option<&str>,
-) -> anyhow::Result<GrokAuth> {
-    ensure_authenticated_with_override(
-        grok_com_config,
-        reauth,
-        message_prefix,
-        LoginTransportOverride::None,
-    )
-    .await
-}
-
-/// Like [`ensure_authenticated`] but with an explicit login-transport override
-/// (from `--oauth` / `--device-auth`). Used by `run_cli_login`.
-pub async fn ensure_authenticated_with_override(
-    grok_com_config: &GrokComConfig,
-    reauth: bool,
-    message_prefix: Option<&str>,
-    login_override: LoginTransportOverride,
+    _reauth: bool,
+    _message_prefix: Option<&str>,
 ) -> anyhow::Result<GrokAuth> {
     let grok_home = grok_home::grok_home();
     let auth_manager = Arc::new(AuthManager::new(&grok_home, grok_com_config.clone()));
-
-    // If not re-authing, accept any valid non-WebLogin credential.
-    // WebLogin tokens are always skipped — they must be migrated to OIDC.
-    if !reauth && let Some(auth) = auth_manager.current() {
-        if auth.auth_mode != super::AuthMode::WebLogin {
-            return Ok(auth);
-        }
-        tracing::info!("auth: skipping cached WebLogin credential, will migrate to OIDC");
-        auth_manager.clear_in_memory();
-        let _ = auth_manager.remove_scope(LEGACY_AUTH_SCOPE);
+    match auth_manager.auth().await {
+        Ok(auth) => Ok(auth),
+        Err(_) => anyhow::bail!(
+            "No credentials found. Configure api_key or env_key in ~/.grok/config.toml."
+        ),
     }
-
-    // Context only — the flow below prints the "Signing in…" line itself.
-    if let Some(msg) = message_prefix {
-        eprintln!("{msg}");
-    }
-
-    let (auth, did_auth) = run_auth_flow(
-        &auth_manager,
-        grok_com_config,
-        reauth,
-        None,
-        None,
-        None,
-        login_override,
-    )
-    .await?;
-
-    if did_auth {
-        report_signed_in(&auth);
-    }
-
-    Ok(auth)
-}
-
-/// Decides *whether to prompt* for an interactive login (the wire credential is
-/// chosen separately by `ShellAuthCredentialProvider`).
-///
-/// With `has_noninteractive_auth`, only refresh a cached token best-effort (no
-/// browser, no cold mint); otherwise require an interactive login.
-pub async fn ensure_authenticated_or_noninteractive(
-    grok_com_config: &GrokComConfig,
-    has_noninteractive_auth: bool,
-    message_prefix: Option<&str>,
-) -> anyhow::Result<Option<GrokAuth>> {
-    if has_noninteractive_auth {
-        Ok(try_ensure_fresh_auth(grok_com_config).await)
-    } else {
-        ensure_authenticated(grok_com_config, false, message_prefix)
-            .await
-            .map(Some)
-    }
-}
-
-/// Unified `grok login` handler for CLI entry points (tui, pager).
-///
-/// Precedence: `--oauth` forces loopback, `--device-auth` forces device,
-/// otherwise `GROK_LOGIN_DEVICE_FLOW` env / `[auth] login_device_flow` config /
-/// loopback default. Both transports run through `run_auth_flow_inner` so the
-/// external auth provider and devbox auto-migration are tried first.
-pub async fn run_cli_login(
-    config: &crate::agent::config::Config,
-    oauth: bool,
-    device_auth: bool,
-    devbox: bool,
-) -> anyhow::Result<()> {
-    // Devbox never reaches the login funnel, so it reports nothing and needs
-    // no telemetry client — and `AuthManager::new` is not free (it logs, and
-    // may rewrite auth.json to drop a stale scope).
-    if devbox {
-        let auth = super::devbox_login::run_devbox_login(config).await?;
-        return apply_post_login_config(auth).await;
-    }
-
-    // Agent bootstrap is what normally initializes the product telemetry
-    // client, and `grok login` never boots an agent, so without this every
-    // event this process emits is dropped before reaching a sink. One manager
-    // serves both the identity it reads and the login flow below.
-    let auth_manager = Arc::new(AuthManager::new(
-        &grok_home::grok_home(),
-        config.grok_com_config.clone(),
-    ));
-    crate::agent::init::update_telemetry_config(config, &auth_manager);
-
-    let result = run_cli_login_steps(config, &auth_manager, oauth, device_auth).await;
-
-    // Posts run on a spawned task and this process exits as soon as we return.
-    xai_grok_telemetry::session_ctx::drain_pending(CLI_TELEMETRY_DRAIN).await;
-    result
-}
-
-/// Returns as soon as the post lands (~1.7s cold), so the bound only bites on a
-/// black-holed network — where waiting out the HTTP client timeout would be worse.
-const CLI_TELEMETRY_DRAIN: std::time::Duration = std::time::Duration::from_secs(5);
-
-async fn run_cli_login_steps(
-    config: &crate::agent::config::Config,
-    auth_manager: &Arc<AuthManager>,
-    oauth: bool,
-    device_auth: bool,
-) -> anyhow::Result<()> {
-    let login_override = LoginTransportOverride::from_flags(oauth, device_auth);
-
-    // Mirror `run_auth_flow_inner`'s precedence: enterprise OIDC (oidc=Some,
-    // oauth2=None) always uses the loopback flow; only the xAI OAuth2 provider
-    // supports the device flow. Without this guard, `grok login` on an
-    // enterprise-OIDC deployment would wrongly enter the device branch (which
-    // requires `oauth2`) and error.
-    let authenticated = if cli_should_use_device(&config.grok_com_config, login_override).await {
-        if config.grok_com_config.oauth2.is_none() {
-            // No OIDC and no oauth2 here, so `--oauth` can't help.
-            anyhow::bail!("Sign-in is not available for this deployment. Set XAI_API_KEY instead.");
-        }
-        // Route through the shared inner flow (not `run_device_code_login`
-        // directly) so the external auth provider and devbox auto-migration run
-        // before the interactive device login. `force_interactive` skips the
-        // up-front clear, so abandoning the device prompt doesn't log the user
-        // out; on `NotEnabled` it falls back to loopback.
-        // Already resolved/logged above; pass `Preresolved(true)` so the inner flow
-        // honors device without a second fetch or a duplicate `cli`-attributed log.
-        let (auth, did_auth) = run_auth_flow_interactive(
-            auth_manager,
-            &config.grok_com_config,
-            None,
-            None,
-            None,
-            LoginTransportOverride::Preresolved(true),
-        )
-        .await?;
-        if did_auth {
-            report_signed_in(&auth);
-        }
-        auth
-    } else {
-        // OIDC has no device endpoint, so `--device-auth` falls back here.
-        if device_auth && crate::auth::oidc::is_configured(&config.grok_com_config) {
-            eprintln!(
-                "Device-code login isn't available for your SSO provider; using browser sign-in."
-            );
-        }
-        // Loopback. `reauth=true` clears creds up front (legacy-scope hygiene),
-        // so abandoning logs you out — unlike the device branch above. Calls
-        // `run_auth_flow` rather than `ensure_authenticated_with_override`,
-        // which would build a second `AuthManager`; with `reauth` set and no
-        // message prefix, the rest of that wrapper is a no-op.
-        // Already resolved/logged above; pass `Preresolved(false)` so the inner
-        // flow honors loopback without a duplicate `cli`-attributed log.
-        let (auth, did_auth) = run_auth_flow(
-            auth_manager,
-            &config.grok_com_config,
-            true,
-            None,
-            None,
-            None,
-            LoginTransportOverride::Preresolved(false),
-        )
-        .await?;
-        if did_auth {
-            report_signed_in(&auth);
-        }
-        auth
-    };
-
-    apply_post_login_config(authenticated).await
-}
-
-/// Sync this principal's config now rather than waiting for the background
-/// tick. Stay quiet about absence/failure during login — confirm only when
-/// config was actually applied; `grok setup` reports the no-config case.
-async fn apply_post_login_config(authenticated: GrokAuth) -> anyhow::Result<()> {
-    let outcome = crate::managed_config::post_login_sync(Some(authenticated)).await;
-    match outcome {
-        crate::managed_config::ManagedConfigSync::Updated { is_team: true } => {
-            eprintln!("Applied your team's managed configuration.");
-        }
-        crate::managed_config::ManagedConfigSync::Updated { is_team: false } => {
-            eprintln!("Applied your deployment's managed configuration.");
-        }
-        _ => {}
-    }
-    Ok(())
 }
 
 /// Result of a logout operation. Used by both the CLI subcommand and
@@ -1092,7 +838,7 @@ pub struct LogoutResult {
     pub was_logged_in: bool,
     /// Email of the session that was cleared (if available).
     pub email: Option<String>,
-    /// `true` if `XAI_API_KEY` / `GROK_CODE_XAI_API_KEY` env var is set.
+    /// `true` if an API key is configured in config.toml.
     pub api_key_still_set: bool,
 }
 
@@ -1144,33 +890,8 @@ pub fn perform_logout(
     Ok(LogoutResult {
         was_logged_in,
         email,
-        api_key_still_set: crate::agent::auth_method::has_xai_api_key_env(),
+        api_key_still_set: false,
     })
-}
-
-/// `grok logout` CLI handler. Calls [`perform_logout`] and formats
-/// the result to stderr.
-pub fn run_cli_logout(config: &crate::agent::config::Config) -> anyhow::Result<()> {
-    let grok_home = grok_home::grok_home();
-    let auth_manager = AuthManager::new(&grok_home, config.grok_com_config.clone());
-    let result = perform_logout(&auth_manager, None)
-        .map_err(|e| anyhow::anyhow!("Failed to clear auth: {e}"))?;
-    if !result.was_logged_in {
-        eprintln!("No cached session to log out of.");
-        if result.api_key_still_set {
-            eprintln!("You are authenticated via XAI_API_KEY (environment variable).");
-        }
-        return Ok(());
-    }
-    if let Some(email) = result.email {
-        eprintln!("Logged out (was signed in as {email})");
-    } else {
-        eprintln!("Logged out");
-    }
-    if result.api_key_still_set {
-        eprintln!("XAI_API_KEY is still set and will be used for authentication.");
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -1289,32 +1010,6 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[tokio::test]
-    async fn persist_or_use_minted_returns_token_when_save_fails() {
-        use std::os::unix::fs::PermissionsExt;
-        // Read-only grok_home: reading a missing auth.json succeeds (empty), but
-        // writing fails — exercising the save-failure path.
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
-        let mgr = Arc::new(AuthManager::new(dir.path(), GrokComConfig::default()));
-        let minted = oidc_session("minted-token", Some("rt"));
-
-        let save = mgr.save_without_enrichment(minted.clone()).await;
-        // Root bypasses 0o500, so the write can't be forced to fail there — skip
-        // explicitly. Non-root MUST see the save fail (or this proves nothing).
-        if unsafe { libc::geteuid() } == 0 {
-            return;
-        }
-        assert!(
-            save.is_err(),
-            "non-root: save into a read-only dir must fail"
-        );
-        let out = persist_or_use_minted(&mgr, minted).await;
-        assert_eq!(
-            out.key, "minted-token",
-            "must return the unpersisted minted token"
-        );
-    }
 
     /// Proxy URL on a closed port: inline enrichment fails fast instead of
     /// reaching outside the test.
@@ -1326,20 +1021,6 @@ mod tests {
         format!("http://127.0.0.1:{port}")
     }
 
-    #[tokio::test]
-    async fn mint_session_noninteractive_uses_external_provider() {
-        let dir = tempfile::tempdir().unwrap();
-        let cfg = GrokComConfig {
-            auth_provider_command: Some("printf '%s' xai-ext-token".to_string()),
-            ..GrokComConfig::default()
-        };
-        let mgr = Arc::new(
-            AuthManager::new(dir.path(), cfg.clone()).with_proxy_base_url(&dead_proxy_url()),
-        );
-
-        let auth = mint_session_noninteractive(&mgr).await;
-        assert_eq!(auth.map(|a| a.key), Some("xai-ext-token".to_string()));
-    }
 
     #[tokio::test]
     async fn interactive_login_carries_no_expired_flag_even_over_a_stale_credential() {

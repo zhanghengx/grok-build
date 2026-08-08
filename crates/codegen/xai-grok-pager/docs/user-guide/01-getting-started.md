@@ -58,10 +58,10 @@ grok
 
 On first launch, Grok opens your browser to authenticate with grok.com. After you sign in, Grok stores your credentials in `~/.grok/auth.json`, where they persist across sessions. Grok refreshes your credentials automatically and prompts you to sign in again when they can no longer be renewed.
 
-If you prefer API key authentication (e.g., for CI/CD or environments without a browser), set the `XAI_API_KEY` environment variable instead:
+If you prefer API key authentication (e.g., for CI/CD or environments without a browser), set the `api_key (config.toml)` environment variable instead:
 
 ```bash
-export XAI_API_KEY="xai-..."
+Configure api_key in config.toml
 grok
 ```
 

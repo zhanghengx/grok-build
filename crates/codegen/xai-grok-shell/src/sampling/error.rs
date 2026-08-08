@@ -131,17 +131,6 @@ pub(crate) fn map_sampling_err_to_acp(err: SamplingError) -> acp::Error {
             // explanation visible to the user without triggering the client's
             // re-auth flow on -32000.
             StatusCode::FORBIDDEN => {
-                let message = if message.contains("requires a Grok subscription")
-                    && crate::agent::auth_method::has_xai_api_key_env()
-                {
-                    format!(
-                        "{message}\n\nYou have an API key set (XAI_API_KEY). \
-                         Your cached OAuth session is being used instead. \
-                         To use your API key, run `grok logout` or type /logout in the TUI."
-                    )
-                } else {
-                    message
-                };
                 // 403 is content-safety, never auth: on this setup path it stays
                 // `internal_error` → `server_error`.
                 acp::Error::internal_error().data(message)
@@ -679,31 +668,6 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn forbidden_subscription_error_includes_api_key_hint_when_env_set() {
-        with_api_key_env(Some("xai-test"), || {
-            let err = SamplingError::Api {
-                status: StatusCode::FORBIDDEN,
-                message: "The model 'grok-build' requires a Grok subscription.".into(),
-                model_metadata: None,
-                retry_after_secs: None,
-                should_retry: None,
-            };
-            let acp_err = map_sampling_err_to_acp(err);
-            let data = acp_err.data.unwrap();
-            let msg = data.as_str().unwrap();
-            assert!(
-                msg.contains("grok logout"),
-                "should suggest grok logout when API key is available: {msg}"
-            );
-            assert!(
-                msg.contains("/logout"),
-                "should mention /logout TUI command: {msg}"
-            );
-        });
-    }
-
-    #[test]
-    #[serial_test::serial]
     fn forbidden_subscription_error_no_hint_without_api_key() {
         with_api_key_env(None, || {
             let err = SamplingError::Api {
@@ -717,7 +681,7 @@ mod tests {
             let data = acp_err.data.unwrap();
             let msg = data.as_str().unwrap();
             assert!(
-                !msg.contains("grok logout"),
+                !msg.contains("unconfigure api_key in config.toml"),
                 "should NOT suggest logout when no API key is available: {msg}"
             );
         });
@@ -738,7 +702,7 @@ mod tests {
             let data = acp_err.data.unwrap();
             let msg = data.as_str().unwrap();
             assert!(
-                !msg.contains("grok logout"),
+                !msg.contains("unconfigure api_key in config.toml"),
                 "should NOT suggest logout for non-subscription 403: {msg}"
             );
         });

@@ -23,7 +23,7 @@ grok agent stdio
 ## Contents
 
 - [Installation](#installation)
-- [Authentication](#authentication) — browser login, API key, OIDC, external auth providers
+- [Authentication](#authentication) — API key configuration
 - **Using Grok**
   - [Interactive TUI](#interactive-tui) — shortcuts, slash commands, file references
   - [Headless Mode](#headless-mode) — scripting, CI/CD, output formats
@@ -81,279 +81,54 @@ grok update
 
 ## Authentication
 
-### Browser Login (Default)
-
-On first launch, Grok opens your browser to authenticate with grok.com:
-
-```bash
-grok
-```
-
-Credentials are stored in `~/.grok/auth.json` and persist across sessions. Tokens expire after 7 days; Grok will prompt you to re-authenticate when needed.
-
-### Re-authenticate
-
-To switch accounts or fix authentication issues:
-
-```bash
-grok login
-```
+Grok authenticates to model providers using API keys configured in `~/.grok/config.toml`. There is no browser login, OAuth, OIDC, or session-based authentication -- only manual API key configuration.
 
 ### API Key
 
-For CI/CD, automation, or environments without browser access, use an API key from [console.x.ai](https://console.x.ai):
+Set an API key for your model in `~/.grok/config.toml`:
+
+```toml
+# ~/.grok/config.toml
+[model.grok-build]
+api_key = "your-api-key"
+```
+
+Or use an environment variable:
+
+```toml
+[model.grok-build]
+env_key = "XAI_API_KEY"
+```
 
 ```bash
-export XAI_API_KEY="xai-..."
+export XAI_API_KEY="your-api-key"
 grok
 ```
 
-The API key takes precedence over browser credentials.
+Get an API key from [console.x.ai](https://console.x.ai).
 
-### OIDC (Customer SSO)
+### Per-Model Configuration
 
-Authenticate developers via your own Identity Provider (Okta, Azure AD, Auth0) instead of `accounts.x.ai`.
-
-**1. Register a public client in your IdP:**
-- Grant type: Authorization Code with PKCE
-- Redirect URI: `http://127.0.0.1/callback` (the CLI uses a random ephemeral port; most IdPs treat loopback redirects as port-agnostic per [RFC 8252 §7.3](https://tools.ietf.org/html/rfc8252#section-7.3))
-- No client secret (PKCE only, per [RFC 8252](https://tools.ietf.org/html/rfc8252))
-
-**2. Configure the CLI** (config file or env vars):
+Each model can have its own `api_key`, `env_key`, and `base_url`:
 
 ```toml
-# ~/.grok/config.toml
-[grok_com_config.oidc]
-issuer = "https://acme.okta.com"
-client_id = "0oa1b2c3d4e5f6g7h8i9"
+[model.grok-build]
+api_key = "your-xai-key"
+base_url = "https://api.x.ai/v1"
+
+[model.my-custom-model]
+model = "claude-sonnet-4-5"
+api_key = "your-anthropic-key"
+base_url = "https://api.anthropic.com/v1"
+context_window = 200000
 ```
 
-```bash
-# Or via environment variables
-export GROK_OIDC_ISSUER="https://acme.okta.com"
-export GROK_OIDC_CLIENT_ID="0oa1b2c3d4e5f6g7h8i9"
-```
+See [Custom Models](#custom-models) for full configuration options.
 
-Customers typically also override the API endpoint to point at their own proxy:
-```bash
-export GROK_CLI_CHAT_PROXY_BASE_URL="https://grok-proxy.acme.com/v1"
-```
-
-**3. Run `grok`.** The CLI discovers endpoints via `{issuer}/.well-known/openid-configuration`, opens the IdP login page, and stores tokens in `~/.grok/auth.json`. The OIDC token is sent as `Authorization: Bearer` to the configured proxy. Tokens auto-refresh silently via the stored `refresh_token`.
-
-**Optional fields:**
-
-| Field | Default | Notes |
-|-------|---------|-------|
-| `scopes` | `["openid", "profile", "email", "offline_access"]` | `offline_access` enables silent token refresh; add custom scopes if needed |
-| `audience` | None | Required by some IdPs (e.g. Auth0) |
-
-### External Auth Provider
-
-For environments where browser-based login isn't possible (sandboxed VMs, CI runners, air-gapped networks), delegate authentication to an external binary or script. This is the recommended approach for enterprise deployments where your company runs its own auth infrastructure (SSO, device code flows, certificate auth, etc.).
-
-Grok is provider-agnostic — it doesn't know or care how your binary authenticates. It just runs the command, reads a token from stdout, and stores it. Your binary is a black box that handles the entire auth flow.
-
-#### How It Works
-
-```
-┌──────────────┐     sh -c     ┌────────────────────────┐
-│     Grok     │──────────────▶│  your auth binary      │
-│              │               │                        │
-│  reads       │◀── stdout ────│  prints token          │
-│  auth.json   │               │                        │
-│              │   (stderr)    │  prints status/URLs    │──▶ user's terminal
-└──────────────┘               └────────────────────────┘
-```
-
-1. Grok runs your command via `sh -c "<command>"`
-2. Your binary does whatever auth flow it needs (SSO login, device code, cert exchange, etc.)
-3. **stderr** → displayed directly to the user (use for login URLs, status messages, progress)
-4. **stdout** → captured by Grok and saved to `~/.grok/auth.json` as the access token
-5. exit 0 → success; exit non-zero → Grok falls through to interactive login
-
-#### The stdout / stderr Contract
-
-This is the most important thing to get right:
-
-| Stream | What to print | Who sees it |
-|--------|---------------|-------------|
-| **stdout** | The token — nothing else | Grok (parsed and stored in `auth.json`) |
-| **stderr** | Login URLs, status messages, errors, progress | The user (displayed in their terminal) |
-
-**Do not print anything to stdout except the token.** No progress messages, no debug output, no "Login successful!" text. Grok reads stdout verbatim and tries to parse it as a token. Any extra text will break parsing.
-
-#### stdout Token Format
-
-The token on stdout can be either:
-
-**1. Bare string** — just the raw token, nothing else:
-```
-eyJhbGciOiJSUzI1NiIs...
-```
-
-**2. JSON** — with optional refresh token and expiry:
-```json
-{"access_token": "eyJhbGciOi...", "refresh_token": "ref-tok", "expires_in": 3600}
-```
-
-Use JSON if your tokens expire and you want Grok to automatically re-run the binary before expiry. The `expires_in` field (seconds until expiry) tells Grok when to proactively refresh. Without it, Grok assumes tokens last 30 days.
-
-#### Minimal Example
-
-```bash
-#!/bin/sh
-# Print login URL / status to stderr (user sees this)
-echo "Authenticating via Acme Corp SSO..." >&2
-echo "Visit: https://sso.acme.com/device-login?code=ABCD-1234" >&2
-
-# ... do the auth flow, get a token ...
-
-# Print ONLY the token to stdout (Grok captures this)
-echo "eyJhbGciOiJSUzI1NiIs..."
-```
-
-#### Configuration
-
-```toml
-# ~/.grok/config.toml
-[auth]
-auth_provider_command = "/usr/local/bin/my-auth-provider"
-auth_provider_label = "Acme Corp"   # optional — customizes the TUI login button
-auth_token_ttl = 3600               # optional — token lifetime in seconds (see below)
-```
-
-```bash
-# Or via environment variables
-export GROK_AUTH_PROVIDER_COMMAND="/usr/local/bin/my-auth-provider"
-export GROK_AUTH_PROVIDER_LABEL="Acme Corp"   # optional
-export GROK_AUTH_TOKEN_TTL=3600               # optional
-```
-
-If your binary outputs a bare token string (not JSON with `expires_in`), set `auth_token_ttl` to the token's expected lifetime in seconds. Without it, Grok cannot detect expiry proactively and will only refresh after a 401.
-
-The command runs through the platform shell — `sh -c` on macOS/Linux, `cmd /C` on Windows — so it can be a binary path, a script, or a pipeline.
-
-> **Windows:** write the path as a TOML *literal* string (single quotes) so backslashes survive: `auth_provider_command = 'C:\corp\grok-auth.exe'`. Inside a double-quoted TOML string `\t`, `\n`, `\r`, `\b` and `\f` are escape sequences, so `"C:\temp\auth.exe"` parses into a path containing a tab character and the provider fails to start — after which Grok falls back to browser login as if the setting were ignored.
-
-When `auth_provider_label` is set, the TUI welcome screen shows **"Login with Acme Corp"** instead of "Login with grok.com". In headless mode (`grok -p`), the label has no effect — stderr from your binary is printed directly to the terminal.
-
-> **Enterprise setup:** For a complete enterprise `config.toml` combining external auth, corporate proxy, and telemetry settings, see [Enterprise Deployment](#enterprise-deployment) in the Configuration section.
-
-#### Example: Device Code Flow Provider
-
-```bash
-#!/bin/sh
-# 1. Request device code from your IdP
-RESP=$(curl -s -X POST https://auth.acme.com/device/code -d "client_id=grok-cli")
-CODE=$(echo "$RESP" | jq -r '.user_code')
-URL=$(echo "$RESP" | jq -r '.verification_uri')
-DEVICE_CODE=$(echo "$RESP" | jq -r '.device_code')
-
-# 2. Show login URL to user (stderr — user sees this in their terminal)
-echo "Open $URL and enter code: $CODE" >&2
-
-# 3. Poll until user approves
-while true; do
-  TOKEN=$(curl -s -X POST https://auth.acme.com/device/token \
-    -d "device_code=$DEVICE_CODE&grant_type=urn:ietf:params:oauth:grant-type:device_code" \
-    | jq -r 'select(.access_token) | .access_token')
-  [ -n "$TOKEN" ] && break
-  sleep 5
-done
-
-# 4. Print token to stdout — JSON format enables auto-refresh
-echo "{\"access_token\": \"$TOKEN\", \"expires_in\": 3600}"
-```
-
-#### Example: Auth Binary with Refresh Support
-
-Grok runs your binary on two different contracts, and `GROK_AUTH_EXPIRED` is how it tells them apart:
-
-| | `GROK_AUTH_EXPIRED=1` | unset |
-|---|---|---|
-| **What it is** | A headless refresh over a credential Grok already holds — near-expiry rotation, or a token the server rejected | A sign-in: `grok login`, the sign-in screen, or the escalation after a headless run couldn't mint |
-| **Is anyone watching?** | No. stdin is closed and nothing renders your prompts | Yes. A user is waiting, and your stderr reaches them |
-| **Budget** | A few seconds (7s), then Grok kills the process | 300s — enough for a browser round trip or a device code |
-| **So your binary should** | Mint silently, or **exit non-zero**. Never block | Do the full SSO flow, and always mint fresh |
-
-```bash
-#!/bin/sh
-if [ "$GROK_AUTH_EXPIRED" = "1" ]; then
-    # Headless: silent refresh only. If that can't work — the SSO session
-    # lapsed, say — exit non-zero rather than block. Grok then shows the
-    # sign-in screen, which re-runs this binary with the variable unset.
-    echo "Refreshing token..." >&2
-    TOKEN=$(my-company-auth --refresh --silent) || exit 1
-else
-    # A user is attached — full interactive SSO flow.
-    echo "Authenticating via Acme Corp SSO..." >&2
-    TOKEN=$(my-company-auth --login --interactive)
-fi
-
-if [ -z "$TOKEN" ]; then
-    echo "Authentication failed" >&2
-    exit 1
-fi
-
-echo "{\"access_token\": \"$TOKEN\", \"expires_in\": 3600}"
-```
-
-Exiting promptly on `GROK_AUTH_EXPIRED=1` is what makes the handover to the sign-in screen fast: a binary that blocks instead pays the whole refresh timeout on every start with an expired token.
-
-One case stays ambiguous, and only in **leader mode** (`--leader`, or `[cli] use_leader = true`; off by default): with no credential at all, the leader makes one extra attempt in the background just after startup, and that run has the variable unset, like a sign-in. A binary that mints without help (service account, keytab, mounted token) succeeds there and the session heals itself. One that must prompt just sits, up to the 300s sign-in ceiling — nothing waits on it, the sign-in screen is already up, and its stderr goes to `~/.grok/leader.log` rather than to the user.
-
-`GROK_AUTH_EXPIRED` is optional — if your binary ignores it, Grok still works. It just runs the same flow for both login and refresh, and a flow that prompts will be killed on the headless run before it can finish.
-
-### Automatic Credential Refresh
-
-Grok supports automatic credential refresh for external auth providers and OIDC. When Grok detects that your token is expired (either locally based on `expires_in`, or when the server returns a 401), it automatically re-runs your `auth_provider_command` to obtain new credentials before retrying the request.
-
-This is transparent — you don't need to do anything. Grok handles it in the background during your session.
-
-**When does refresh happen?**
-
-- **Before expiry:** If your binary returned `expires_in` in its JSON output, or you set `auth_token_ttl` in config, Grok re-runs the binary ~5 minutes before the token expires, so you never see an auth error.
-- **On auth error:** If the server rejects a request with 401/403 (e.g. token was revoked or expired), Grok re-runs the binary and retries the request once.
-- **When the refresh run can't mint:** refreshes are headless (no stdin, short timeout), so a binary that needs you to complete an SSO flow cannot succeed there. Grok then stops treating the stored credential as usable and runs your binary in its interactive mode instead — at startup that is the same sign-in flow a machine with no credentials gets; mid-session the turn fails with a re-auth prompt and `/login` re-runs the binary.
-- **OIDC:** If you're using OIDC and have a `refresh_token`, Grok silently refreshes via your IdP without re-opening the browser.
-
-**Tuning the refresh buffer:**
-
-```bash
-# Grok refreshes tokens 5 minutes before expiry by default.
-# Set to 0 to only refresh on 401. Set higher for very short-lived tokens.
-export GROK_AUTH_EARLY_INVALIDATION_SECS=300
-```
-
-**Keep in mind:**
-- When using `auth_provider_command`, you don't need to run `grok login` before starting — Grok runs your binary automatically on first launch. You _can_ run `grok login` to explicitly hydrate `auth.json` ahead of time if you prefer.
-- If both OIDC and `auth_provider_command` are configured: at **login** time, Grok tries OIDC silent refresh first (if a `refresh_token` exists), then the external binary, then browser-based login. During a **session**, whichever method is configured is used exclusively — if `auth_provider_command` is set it handles all mid-session refreshes; otherwise OIDC silent refresh is used.
-- Your binary's stderr output is displayed to the user but interactive stdin is not supported. This works well for browser-based SSO flows where the binary displays a URL and you complete authentication in the browser.
-
-#### Troubleshooting Auth
-
-Enable debug logging to trace the auth flow:
-
-```bash
-grok --debug-file /tmp/grok-auth.log -p "hello"
-tail -f /tmp/grok-auth.log
-```
-
-Common log messages:
-
-| Log message | What it means |
-|-------------|---------------|
-| `auth: running external auth provider (headless refresh)` | Your binary is being called with `GROK_AUTH_EXPIRED=1` and a few seconds to work |
-| `auth: running external auth provider (interactive login)` | Your binary is being called on the sign-in contract: no `GROK_AUTH_EXPIRED`, stderr shown, 300s |
-| `auth: external auth provider returned fresh token` | Success — token was parsed and stored |
-| `auth: external auth provider failed` | Binary exited non-zero, or exited 0 but stdout was empty/unparseable (the `error` field has details) |
-| `auth: external auth provider timed out (likely needs interactive auth), killing` | Binary didn't exit before the 7s headless-refresh timeout and was killed. Exiting non-zero on `GROK_AUTH_EXPIRED=1` avoids this wait entirely |
-| `auth: failed to start external auth provider` | The command couldn't be spawned (e.g. binary not found) |
 
 ### Per-Model Auth Providers
 
-`auth_provider_command` above replaces Grok's *session* auth: it mints the token sent to xAI's backend. If you instead want xAI models on normal xAI login while **other models** route through a gateway (LiteLLM, corporate proxy) whose bearer tokens rotate, use a named auth provider — the rotating-token analogue of a per-model `api_key`/`env_key`.
+`auth_provider_command` above provides a rotating token for custom endpoints. If you want **some models** to route through a gateway (LiteLLM, corporate proxy) whose bearer tokens rotate, use a named auth provider — the rotating-token analogue of a per-model `api_key`/`env_key`.
 
 ```toml
 # ~/.grok/config.toml
@@ -385,44 +160,10 @@ auth_provider = "litellm"
 - Active sessions pick up edits or removal of a provider table at the next model switch or new session. Once picked up, an edit invalidates the cached token, so the edited command runs at the next use; removal drops the cached token.
 - Helper models (web search, session summary, image description) read the shared cache and never run the command; point them at providers your chat model keeps warm. Subagents refresh tokens the same way their parent session does.
 
-**Interaction with other credentials:** a literal `api_key`/`env_key` on the model wins over its `auth_provider`. Provider-backed models are BYOK: your xAI session token is never sent to their endpoints, and a failing provider command fails the request rather than falling back to the session token.
+**Interaction with other credentials:** a literal `api_key`/`env_key` on the model wins over its `auth_provider`. Provider-backed models are BYOK: your API key is never sent to their endpoints, and a failing provider command fails the request rather than falling back to a static API key.
 
-**Security:** provider commands execute code, so they are honored only from trusted config layers (`~/.grok/config.toml`, managed config, requirements). A project's `.grok/config.toml` can never define one. Whatever layer sets a model's `base_url` decides where that model's minted token is sent, and `base_url` (unlike the provider table) is not stripped from remote or campaign patches, the same as for a static `env_key`. Keep provider tables and the model `base_url` in layers you trust. The command inherits Grok's environment (so it sees `PATH`, `HOME`, and any other secrets there), but Grok's own first-party credentials (`XAI_API_KEY`, `GROK_DEPLOYMENT_KEY`, and related keys) are removed so a BYOK helper never receives them; write helpers that read only what they need, and prefer the `GROK_AUTH_PROVIDER_*` handback for the prior credential.
+**Security:** provider commands execute code, so they are honored only from trusted config layers (`~/.grok/config.toml`, managed config, requirements). A project's `.grok/config.toml` can never define one. Whatever layer sets a model's `base_url` decides where that model's minted token is sent, and `base_url` (unlike the provider table) is not stripped from remote or campaign patches, the same as for a static `env_key`. Keep provider tables and the model `base_url` in layers you trust. The command inherits Grok's environment (so it sees `PATH`, `HOME`, and any other secrets there), but Grok's own first-party credentials (model `api_key` / `env_key`, `GROK_DEPLOYMENT_KEY`, and related keys) are removed so a BYOK helper never receives them; write helpers that read only what they need, and prefer the `GROK_AUTH_PROVIDER_*` handback for the prior credential.
 
-### Using auth.json for API Access
-
-If you've authenticated with `grok login`, you can use the stored credentials to call the CLI chat proxy directly via curl. The proxy requires specific headers that mirror what the grok CLI sends internally:
-
-```bash
-curl -s -N -X POST "https://cli-chat-proxy.grok.com/v1/chat/completions" \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer $(jq -r '."https://accounts.x.ai/sign-in".key' ~/.grok/auth.json)" \
-  -H "X-XAI-Token-Auth: xai-grok-cli" \
-  -H "x-grok-model-override: grok-build" \
-  -d '{
-    "model": "grok-build",
-    "messages": [{"role": "user", "content": "Hello!"}],
-    "stream": true
-  }'
-```
-
-**Required headers:**
-
-| Header                           | Required | Purpose                                                                                                                                                                                   |
-| -------------------------------- | -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `Authorization: Bearer <token>`  | Yes      | Session token from `~/.grok/auth.json` (set by `grok login`)                                                                                                                              |
-| `X-XAI-Token-Auth: xai-grok-cli` | Yes      | Tells the auth middleware to validate as a CLI session token                                                                                                                              |
-| `x-grok-model-override: <model>` | Yes\*    | The proxy uses this header (not the JSON body) to route to the correct backend. \*Can be omitted for `grok-build` which is on the default route, but always safe to include. |
-
-**Streaming vs non-streaming:**
-
-Most models behind the proxy only support streaming. Always use `"stream": true` unless you know the model supports non-streaming.
-
-| Model                 | Non-streaming  | Streaming    |
-| --------------------- | -------------- | ------------ |
-| `grok-build`    | ✅ Supported   | ✅ Supported |
-
-> **Note:** `auth.json` tokens expire after 7 days. Run `grok login` to refresh.
 
 ---
 
@@ -1824,7 +1565,7 @@ max_completion_tokens = 8192          # Max tokens per response
 context_window = 256000               # Total context window in tokens (for auto-compact)
 ```
 
-**Credential resolution order:** `api_key` → `env_key` → cached `auth_provider` token (terminal: a cache miss resolves to no credential, never the session token) → session token → `XAI_API_KEY`. See [Per-Model Auth Providers](#per-model-auth-providers).
+**Credential resolution order:** `api_key` then `env_key` then cached `auth_provider` token. See [Per-Model Auth Providers](#per-model-auth-providers).
 
 The `context_window` parameter is used to calculate when auto-compact should trigger. If not specified, Grok falls back to built-in defaults for known models.
 
@@ -1935,14 +1676,14 @@ Point Grok at a custom OpenAI-compatible `/v1/models` endpoint instead of the de
 | Variable | Required | Description |
 |----------|----------|-------------|
 | `GROK_MODELS_BASE_URL` | Yes | Base URL for inference / chat completions (e.g. `https://api.acme.com/v1`). The model list is fetched from `{base_url}/models` automatically |
-| `XAI_API_KEY` | Yes | API key sent as `Authorization: Bearer` to the custom endpoint |
+| `api_key (config.toml)` | Yes | API key sent as `Authorization: Bearer` to the custom endpoint |
 | `GROK_MODELS_LIST_URL` | No | Override the model list URL if it differs from `{base_url}/models` |
 
 **Setup:**
 
 ```bash
 export GROK_MODELS_BASE_URL="https://api.acme.com/v1"
-export XAI_API_KEY="xai-..."
+Configure api_key in config.toml
 grok
 ```
 
@@ -1963,7 +1704,7 @@ api_key = "my-api-key"
 
 When using `[endpoints]` with partial model overrides, the `base_url` is inherited from the endpoints config — you don't need to specify it in each `[model.*]` section.
 
-**Auth behavior:** When `models_base_url` is set, Grok uses API key auth (`Authorization: Bearer`) instead of session auth. `grok login` is not required — only the API key.
+**Auth behavior:** When `models_base_url` is set, Grok uses API key auth (`Authorization: Bearer`) . Per-model `api_key` or `env_key` in config.toml provides the key.
 
 ---
 
@@ -2498,7 +2239,7 @@ The agent persists all session updates automatically. Clients can reconnect and 
 
 | Variable                         | Description                                                                                              |
 | -------------------------------- | -------------------------------------------------------------------------------------------------------- |
-| `XAI_API_KEY`         | API key from [console.x.ai](https://console.x.ai). Used for custom endpoint auth and API key login      |
+| `api_key (config.toml)`         | API key from [console.x.ai](https://console.x.ai). Used for custom endpoint auth and API key login      |
 | `GROK_CLI_CHAT_PROXY_BASE_URL`  | Override the cli-chat-proxy URL (default: `https://cli-chat-proxy.grok.com/v1`)                          |
 | `GROK_MODELS_BASE_URL`          | Custom base URL for inference. Model list auto-fetched from `{base_url}/models` (see [Custom Models Endpoint](#custom-models-endpoint)) |
 | `GROK_MODELS_LIST_URL`          | Override the model list URL if it differs from `{GROK_MODELS_BASE_URL}/models`                                              |
@@ -2618,7 +2359,7 @@ GROK_LOG_FILE=/tmp/grok-debug.log RUST_LOG="info,xai_grok_shell::auth=debug" gro
 
 ```bash
 # Clear credentials and re-login
-grok login
+api_key (config.toml)
 
 # Debug auth issues — check the log for "auth:" entries
 grok --debug-file /tmp/grok-auth.log -p "hello"

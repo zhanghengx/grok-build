@@ -208,7 +208,8 @@ pub(crate) async fn first_party_env_key_allows_advertise(
     api_base_url: &str,
     timeout: Duration,
 ) -> bool {
-    let Ok(key) = crate::agent::auth_method::read_xai_api_key_env() else {
+    let Ok(key) = std::env::var("XAI_API_KEY")
+        .or_else(|_| std::env::var("GROK_CODE_XAI_API_KEY")) else {
         return false;
     };
     probe_xai_api_key(&key, api_base_url, timeout)

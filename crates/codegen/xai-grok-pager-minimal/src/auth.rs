@@ -14,7 +14,11 @@ use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
-use xai_grok_pager::app::app_view::{AuthState, TrustState};
+#[cfg(test)]
+use xai_grok_pager::app::app_view::DEFAULT_API_BASE_URL;
+use xai_grok_pager::app::app_view::{
+    ApiConfigurationField, ApiConfigurationStatus, AuthState, TrustState,
+};
 use xai_grok_pager::theme::Theme;
 
 /// What the minimal live region shows when there is no active agent yet: the
@@ -22,6 +26,17 @@ use xai_grok_pager::theme::Theme;
 /// folder-trust question, or a brief "starting" transient once authenticated
 /// (and trusted). Computed before the draw closure so the closure can own it.
 pub(super) enum MinimalAuthHint {
+    /// API-key-only startup has no configured API connection. Show the exact
+    /// model configuration required instead of a stale browser-login status.
+    ConfigurationRequired {
+        base_url: String,
+        base_url_cursor: usize,
+        api_key: String,
+        api_key_cursor: usize,
+        field: ApiConfigurationField,
+        status: ApiConfigurationStatus,
+        error: Option<String>,
+    },
     /// Interactive sign-in underway — show the URL (when known) and the device
     /// code (when the URL carries one). Covers device flow and the external
     /// command flow (where the provider opens its own browser; `url` may be
@@ -46,13 +61,51 @@ pub(super) enum MinimalAuthHint {
 /// `Done`, when the user has access and is not ZDR-blocked (those gates already
 /// block sessions, and the input interceptor only answers trust under the same
 /// conditions).
+#[cfg(test)]
 pub(super) fn minimal_auth_hint(
     auth: &AuthState,
     trust: &TrustState,
     has_access: bool,
     is_zdr_blocked: bool,
 ) -> MinimalAuthHint {
+    minimal_auth_hint_with_config(
+        auth,
+        trust,
+        has_access,
+        is_zdr_blocked,
+        DEFAULT_API_BASE_URL,
+        DEFAULT_API_BASE_URL.len(),
+        "",
+        0,
+        ApiConfigurationField::BaseUrl,
+        ApiConfigurationStatus::Editing,
+        None,
+    )
+}
+
+pub(super) fn minimal_auth_hint_with_config(
+    auth: &AuthState,
+    trust: &TrustState,
+    has_access: bool,
+    is_zdr_blocked: bool,
+    base_url: &str,
+    base_url_cursor: usize,
+    api_key: &str,
+    api_key_cursor: usize,
+    field: ApiConfigurationField,
+    status: ApiConfigurationStatus,
+    error: Option<&str>,
+) -> MinimalAuthHint {
     match auth {
+        AuthState::ConfigRequired => MinimalAuthHint::ConfigurationRequired {
+            base_url: base_url.to_owned(),
+            base_url_cursor,
+            api_key: api_key.to_owned(),
+            api_key_cursor,
+            field,
+            status,
+            error: error.map(str::to_owned),
+        },
         AuthState::Authenticating { auth_url, .. } => MinimalAuthHint::SigningIn {
             url: auth_url.clone(),
             code: auth_url
@@ -85,6 +138,8 @@ pub(super) fn minimal_auth_hint(
 /// instead of clipping to the idle prompt height.
 pub(super) fn auth_hint_rows(hint: &MinimalAuthHint, width: u16) -> u16 {
     match hint {
+        // Header + config path + model table + base URL + API key + status + hint.
+        MinimalAuthHint::ConfigurationRequired { .. } => 7,
         // header + blank + "Opening browser…"
         MinimalAuthHint::SigningIn { url: None, code: _ } => 3,
         // header + blank + "Open this URL" + url rows + optional code block +
@@ -185,11 +240,103 @@ fn render_url(
     y.saturating_add(1)
 }
 
+/// Render one compact API configuration field. Minimal mode uses a flush-left
+/// row instead of a bordered box, but keeps focus and masking visible.
+fn render_config_field(
+    buf: &mut Buffer,
+    area: Rect,
+    y: u16,
+    bottom: u16,
+    label: &str,
+    value: &str,
+    cursor_byte: usize,
+    focused: bool,
+    masked: bool,
+    theme: &Theme,
+) -> (Option<(u16, u16)>, u16) {
+    let marker = if focused { "> " } else { "  " };
+    let prefix_width = marker.chars().count() + label.chars().count() + 2;
+    let value_width = area.width.saturating_sub(prefix_width as u16) as usize;
+    let (shown, cursor_column) = if value.is_empty() {
+        (
+            if masked {
+                "Enter API key...".to_owned()
+            } else {
+                "Enter base URL...".to_owned()
+            },
+            0,
+        )
+    } else {
+        let (display, display_cursor_byte) = if masked {
+            let cursor_text = value.get(..cursor_byte).unwrap_or(value);
+            (
+                value.chars().map(|_| '\u{2022}').collect::<String>(),
+                cursor_text.chars().count() * '\u{2022}'.len_utf8(),
+            )
+        } else {
+            (
+                value.to_owned(),
+                if value.is_char_boundary(cursor_byte) {
+                    cursor_byte
+                } else {
+                    value.len()
+                },
+            )
+        };
+        let buffer = xai_ratatui_textarea::EditBuffer::from_parts(
+            &display,
+            display_cursor_byte.min(display.len()),
+        );
+        let viewport = buffer.single_line_viewport(value_width);
+        (
+            display[viewport.visible_byte_range].to_owned(),
+            viewport.cursor_display_column,
+        )
+    };
+    let value_style = if value.is_empty() {
+        theme.muted().bg(Color::Reset)
+    } else if masked {
+        Style::default().fg(theme.accent_user).bg(Color::Reset)
+    } else {
+        Style::default().fg(theme.text_primary).bg(Color::Reset)
+    };
+    let line = Line::from(vec![
+        Span::styled(
+            format!("{marker}{label}: "),
+            Style::default().fg(if focused {
+                theme.accent_user
+            } else {
+                theme.gray
+            }),
+        ),
+        Span::styled(shown, value_style),
+    ]);
+    if y < bottom {
+        buf.set_line(area.x, y, &line, area.width);
+    }
+
+    let cursor = if focused && y < bottom && value_width > 0 {
+        let x = area.x + prefix_width as u16 + cursor_column as u16;
+        Some((
+            x.min(area.x.saturating_add(area.width.saturating_sub(1))),
+            y,
+        ))
+    } else {
+        None
+    };
+    (cursor, y.saturating_add(1))
+}
+
 /// Render the sign-in / trust flow (or transient status) in the live region when
 /// no agent exists yet. Top-aligned in `area`; clips to its height.
-pub(super) fn render_auth(buf: &mut Buffer, area: Rect, theme: &Theme, hint: &MinimalAuthHint) {
+pub(super) fn render_auth(
+    buf: &mut Buffer,
+    area: Rect,
+    theme: &Theme,
+    hint: &MinimalAuthHint,
+) -> Option<(u16, u16)> {
     if area.width == 0 || area.height == 0 {
-        return;
+        return None;
     }
     let bottom = area.y + area.height;
     let mut y = area.y;
@@ -200,6 +347,110 @@ pub(super) fn render_auth(buf: &mut Buffer, area: Rect, theme: &Theme, hint: &Mi
         .bg(Color::Reset);
 
     match hint {
+        MinimalAuthHint::ConfigurationRequired {
+            base_url,
+            base_url_cursor,
+            api_key,
+            api_key_cursor,
+            field,
+            status,
+            error,
+        } => {
+            y = put_line(
+                buf,
+                area,
+                y,
+                bottom,
+                Line::from(Span::styled("Configure Grok API", bold)),
+            );
+            y = put_line(
+                buf,
+                area,
+                y,
+                bottom,
+                Line::from(Span::styled("~/.grok/config.toml", gray)),
+            );
+            y = put_line(
+                buf,
+                area,
+                y,
+                bottom,
+                Line::from(Span::styled(
+                    format!("[model.\"{}\"]", xai_grok_shell::models::default_model()),
+                    bold,
+                )),
+            );
+            let (base_cursor, next_y) = render_config_field(
+                buf,
+                area,
+                y,
+                bottom,
+                "base_url",
+                base_url,
+                *base_url_cursor,
+                *field == ApiConfigurationField::BaseUrl
+                    && *status == ApiConfigurationStatus::Editing,
+                false,
+                theme,
+            );
+            y = next_y;
+            let (key_cursor, next_y) = render_config_field(
+                buf,
+                area,
+                y,
+                bottom,
+                "api_key",
+                api_key,
+                *api_key_cursor,
+                *field == ApiConfigurationField::ApiKey
+                    && *status == ApiConfigurationStatus::Editing,
+                true,
+                theme,
+            );
+            y = next_y;
+            let (status_text, status_style) = if let Some(error) = error {
+                (
+                    error.as_str(),
+                    Style::default().fg(theme.warning).bg(Color::Reset),
+                )
+            } else {
+                match status {
+                    ApiConfigurationStatus::Editing => ("Enter to apply configuration", gray),
+                    ApiConfigurationStatus::Saving => ("Saving configuration...", gray),
+                    ApiConfigurationStatus::Reloading => ("Applying configuration...", gray),
+                }
+            };
+            y = put_line(
+                buf,
+                area,
+                y,
+                bottom,
+                Line::from(Span::styled(status_text, status_style)),
+            );
+            let _ = put_line(
+                buf,
+                area,
+                y,
+                bottom,
+                Line::from(vec![
+                    Span::styled("tab", bold),
+                    Span::styled(" switch  ", gray),
+                    Span::styled("enter", bold),
+                    Span::styled(" apply  ", gray),
+                    Span::styled("esc", bold),
+                    Span::styled(" quit", gray),
+                ]),
+            );
+            if *field == ApiConfigurationField::BaseUrl
+                && *status == ApiConfigurationStatus::Editing
+            {
+                return base_cursor;
+            }
+            if *field == ApiConfigurationField::ApiKey && *status == ApiConfigurationStatus::Editing
+            {
+                return key_cursor;
+            }
+        }
         MinimalAuthHint::SigningIn { url, code } => {
             y = put_line(
                 buf,
@@ -370,6 +621,7 @@ pub(super) fn render_auth(buf: &mut Buffer, area: Rect, theme: &Theme, hint: &Mi
             );
         }
     }
+    None
 }
 
 #[cfg(test)]
@@ -433,6 +685,10 @@ mod tests {
             MinimalAuthHint::Starting
         ));
         assert!(matches!(
+            minimal_auth_hint(&AuthState::ConfigRequired, &trust_done, true, false),
+            MinimalAuthHint::ConfigurationRequired { .. }
+        ));
+        assert!(matches!(
             minimal_auth_hint(
                 &AuthState::Pending {
                     error: Some("nope".into())
@@ -493,6 +749,47 @@ mod tests {
             text.contains("Waiting for approval"),
             "waiting line: {text:?}"
         );
+    }
+
+    #[test]
+    fn render_auth_shows_api_configuration() {
+        let theme = Theme::current();
+        let area = Rect::new(0, 0, 80, 8);
+        let mut buf = Buffer::empty(area);
+        render_auth(
+            &mut buf,
+            area,
+            &theme,
+            &MinimalAuthHint::ConfigurationRequired {
+                base_url: DEFAULT_API_BASE_URL.to_owned(),
+                base_url_cursor: DEFAULT_API_BASE_URL.len(),
+                api_key: "xai-secret".to_owned(),
+                api_key_cursor: "xai-secret".len(),
+                field: ApiConfigurationField::ApiKey,
+                status: ApiConfigurationStatus::Editing,
+                error: None,
+            },
+        );
+        let text = buffer_text(&buf, area);
+        assert!(text.contains("Configure Grok API"), "{text:?}");
+        assert!(
+            text.contains(&format!(
+                "[model.\"{}\"]",
+                xai_grok_shell::models::default_model()
+            )),
+            "{text:?}"
+        );
+        assert!(text.contains("base_url: https://api.x.ai/v1"), "{text:?}");
+        assert!(
+            text.contains(&format!(
+                "api_key: {}",
+                "\u{2022}".repeat("xai-secret".chars().count())
+            )),
+            "{text:?}"
+        );
+        assert!(!text.contains("xai-secret"), "{text:?}");
+        assert!(text.contains("tab switch  enter apply"), "{text:?}");
+        assert!(!text.contains("Opening your browser"), "{text:?}");
     }
 
     #[test]

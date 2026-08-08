@@ -20,50 +20,20 @@ pub(crate) fn new_shared_auth_method_id(initial: Option<acp::AuthMethodId>) -> S
     ))
 }
 
-/// Env var that, when set, advertises `xai.api_key` as a viable auth method.
-///
-/// Kept as a constant so test code and the production check stay in sync.
-pub const XAI_API_KEY_ENV_VAR: &str = "XAI_API_KEY";
-
-/// Legacy env var name. Checked as a fallback when `XAI_API_KEY` is not set,
-/// so existing deployments that use the old name keep working.
-pub const LEGACY_XAI_API_KEY_ENV_VAR: &str = "GROK_CODE_XAI_API_KEY";
-
-/// Read the API key from the environment.
-///
-/// Checks `XAI_API_KEY` first, then falls back to the legacy
-/// `GROK_CODE_XAI_API_KEY` for backward compatibility.
-pub(crate) fn read_xai_api_key_env() -> Result<String, std::env::VarError> {
-    std::env::var(XAI_API_KEY_ENV_VAR).or_else(|_| std::env::var(LEGACY_XAI_API_KEY_ENV_VAR))
-}
-
-/// Returns `true` if either `XAI_API_KEY` or `GROK_CODE_XAI_API_KEY` is set.
-pub fn has_xai_api_key_env() -> bool {
-    read_xai_api_key_env().is_ok()
-}
-
 /// Whether `xai.api_key` should be advertised (and pushed FIRST) when building
 /// the `auth_methods` list at `initialize()` time.
 ///
-/// Regression: `xai.api_key` must stay first when only per-model credentials
-/// exist (no global `XAI_API_KEY`). Deferring it made BYOK users hit the login
-/// screen because the pager uses `auth_methods.first()` for startup metadata.
+/// Only per-model credentials (`api_key`/`env_key` in config.toml) are
+/// checked. The global `XAI_API_KEY` env var has been removed.
 ///
 /// [`build_auth_methods`] consumes this predicate and pins the ordering;
 /// its tests catch call-site and predicate regressions.
 ///
-/// Probes `std::env` at call time and consults each `ModelEntry` for a
-/// resolvable api_key/env_key -- both inputs can change between calls, so the
-/// result is not cached.
+/// `disable_api_key_auth` is the admin kill switch: when true the method is
+/// never advertised, regardless of available credentials.
 ///
-/// `disable_api_key_auth` (`[grok_com_config] disable_api_key_auth` /
-/// `GROK_DISABLE_API_KEY_AUTH`) is the admin kill switch: when true the
-/// method is never advertised, regardless of available credentials, so
-/// `XAI_API_KEY` can't bypass a deployment's forced IdP login.
-///
-/// Presence-only for the first-party env key (treats it as usable). Login
-/// paths that have run the validity probe should call
-/// [`should_advertise_xai_api_key_with_env_ok`] with the probe result instead.
+/// Presence-only check. Login paths that have run the validity probe should
+/// call [`should_advertise_xai_api_key_with_env_ok`] with the probe result instead.
 pub(crate) fn should_advertise_xai_api_key<'a, I>(disable_api_key_auth: bool, models: I) -> bool
 where
     I: IntoIterator<Item = &'a ModelEntry>,
@@ -85,8 +55,7 @@ where
     if disable_api_key_auth {
         return false;
     }
-    let has_byok = models.into_iter().any(ModelEntry::has_own_credentials);
-    has_byok || (has_xai_api_key_env() && first_party_env_ok)
+    models.into_iter().any(ModelEntry::has_own_credentials)
 }
 
 /// Inputs to [`build_auth_methods`].
@@ -401,9 +370,9 @@ pub(crate) fn session_token_auth_gate(
 }
 
 pub const AUTH_ERROR_SESSION_EXPIRED: &str =
-    "Session expired. Run `grok login` to re-authenticate.";
+    "API key is invalid. Set a valid api_key or env_key in ~/.grok/config.toml.";
 
-pub const AUTH_ERROR_API_KEY: &str = "Authentication failed. Run `grok login`, set XAI_API_KEY, or add api_key to ~/.grok/config.toml.";
+pub const AUTH_ERROR_API_KEY: &str = "API key authentication failed. Set a valid api_key or env_key in ~/.grok/config.toml.";
 
 /// Next ACP method id when `cached_token` cannot proceed (missing / expired /
 /// legacy WebLogin), or `None` when fallthrough is forbidden.
@@ -429,11 +398,11 @@ pub(crate) fn method_id_after_cached_token_unavailable(
 }
 
 /// Error when `preferred_method=api_key` but no key/BYOK credentials exist.
-pub const PREFERRED_API_KEY_UNAVAILABLE: &str = "preferred_method=api_key but no API key is configured (set XAI_API_KEY or model api_key/env_key in config.toml).";
+pub const PREFERRED_API_KEY_UNAVAILABLE: &str = "preferred_method=api_key but no API key is configured (set model api_key/env_key in config.toml).";
 
 /// Error when `preferred_method=oidc` but the session path cannot proceed.
 pub const PREFERRED_OIDC_UNAVAILABLE: &str =
-    "preferred_method=oidc but no session is available. Run `grok login` to authenticate.";
+    "preferred_method=oidc but no session is available. Set api_key or env_key in ~/.grok/config.toml instead.";
 
 pub const XAI_API_KEY_METHOD_ID: &str = "xai.api_key";
 pub(crate) fn xai_api_key_auth_method() -> acp::AuthMethod {
@@ -443,7 +412,7 @@ pub(crate) fn xai_api_key_auth_method() -> acp::AuthMethod {
             "xai.api_key".to_string(),
         )
         .description(Some(format!(
-            "{XAI_API_KEY_ENV_VAR} or api_key/env_key in config.toml"
+            "api_key/env_key in config.toml"
         ))),
     )
 }
@@ -782,7 +751,7 @@ mod tests {
 
         // Make sure no global key is masking the per-model path we're trying
         // to exercise. Held until end-of-scope so we restore on panic too.
-        let _global = EnvGuard::unset(XAI_API_KEY_ENV_VAR);
+        // XAI_API_KEY env var removed; only per-model credentials are checked.
 
         let dm = crate::models::default_model();
         let toml: toml::Value = toml::from_str(&format!(
@@ -850,153 +819,9 @@ mod tests {
         }
     }
 
-    /// `XAI_API_KEY` alone (no per-model creds) also triggers
-    /// advertising `xai.api_key` as the first method. Historical "external
-    /// key" path; covered here so the predicate keeps treating env-var-only
-    /// users the same as per-model users.
-    #[test]
-    #[serial]
-    fn global_external_api_key_advertises_xai_api_key_first() {
-        let _set = EnvGuard::set(XAI_API_KEY_ENV_VAR, "xai-external-key");
-        let cfg = Config::default();
-        let models = resolve_model_list(&cfg, None);
-        let has_external_api_key = should_advertise_xai_api_key(false, models.values());
-        assert!(has_external_api_key);
-        let built = build_auth_methods(AuthMethodsBuildInputs {
-            has_external_api_key,
-            ..default_inputs()
-        });
-        assert_eq!(first_kind(&built.methods), Some(AuthMethodKind::XaiApiKey));
-    }
-
-    /// Admin kill switch (`disable_api_key_auth`): the predicate must return
-    /// false even when credentials are available everywhere (global env var
-    /// AND per-model env_key), so the builder never advertises `xai.api_key`
-    /// and the pager sends the user to the deployment's login method instead.
-    #[test]
-    #[serial]
-    fn disable_api_key_auth_suppresses_xai_api_key_method() {
-        let _set = EnvGuard::set(XAI_API_KEY_ENV_VAR, "xai-external-key");
-        let cfg = Config::default();
-        let models = resolve_model_list(&cfg, None);
-
-        // Flag off: today's behavior (advertised first).
-        assert!(should_advertise_xai_api_key(false, models.values()));
-
-        // Flag on: never advertised, regardless of credentials.
-        let has_external_api_key = should_advertise_xai_api_key(true, models.values());
-        assert!(!has_external_api_key);
-        let built = build_auth_methods(AuthMethodsBuildInputs {
-            has_external_api_key,
-            ..default_inputs()
-        });
-        assert!(
-            !built
-                .methods
-                .iter()
-                .any(|m| AuthMethodKind::from_id(m.id()) == AuthMethodKind::XaiApiKey),
-            "xai.api_key must not be advertised when disable_api_key_auth is set",
-        );
-        assert_eq!(
-            first_kind(&built.methods),
-            Some(AuthMethodKind::GrokCom),
-            "with api-key auth disabled and no cached token, the login method \
-             must lead so the pager requires interactive login",
-        );
-        assert!(built.default_auth_method_id.is_none());
-    }
-
-    #[test]
-    #[serial]
-    fn env_key_probe_unusable_suppresses_advertise_without_byok() {
-        let _set = EnvGuard::set(XAI_API_KEY_ENV_VAR, "xai-dead-key");
-        let _legacy = EnvGuard::unset(LEGACY_XAI_API_KEY_ENV_VAR);
-        let cfg = Config::default();
-        let models = resolve_model_list(&cfg, None);
-        assert!(
-            should_advertise_xai_api_key(false, models.values()),
-            "presence-only helper still sees the env key"
-        );
-        assert!(
-            !should_advertise_xai_api_key_with_env_ok(false, models.values(), false),
-            "probe-unusable env key alone must not advertise"
-        );
-        let built = build_auth_methods(AuthMethodsBuildInputs {
-            has_external_api_key: false,
-            ..default_inputs()
-        });
-        assert_eq!(first_kind(&built.methods), Some(AuthMethodKind::GrokCom));
-    }
-
-    #[test]
-    #[serial]
-    fn env_key_probe_ok_still_advertises() {
-        let _set = EnvGuard::set(XAI_API_KEY_ENV_VAR, "xai-live-key");
-        let cfg = Config::default();
-        let models = resolve_model_list(&cfg, None);
-        assert!(should_advertise_xai_api_key_with_env_ok(
-            false,
-            models.values(),
-            true
-        ));
-    }
-
-    #[test]
-    #[serial]
-    fn byok_advertises_even_when_env_probe_unusable() {
-        const TEST_ENV_VAR: &str = "TEST_BYOK_PROBE_INDEPENDENT_TOKEN";
-        let _unset = EnvGuard::unset(XAI_API_KEY_ENV_VAR);
-        let _legacy = EnvGuard::unset(LEGACY_XAI_API_KEY_ENV_VAR);
-        let _byok = EnvGuard::set(TEST_ENV_VAR, "enterprise-secret-token");
-
-        let dm = crate::models::default_model();
-        let toml: toml::Value = toml::from_str(&format!(
-            r#"
-            [model."{dm}"]
-            model = "{dm}"
-            base_url = "https://inference.example.com/v1"
-            context_window = 200000
-            env_key = "{TEST_ENV_VAR}"
-            "#,
-        ))
-        .unwrap();
-        let cfg = Config::new_from_toml_cfg(&toml).expect("config should parse");
-        let models = resolve_model_list(&cfg, None);
-        assert!(
-            should_advertise_xai_api_key_with_env_ok(false, models.values(), false),
-            "BYOK must not depend on the first-party env probe"
-        );
-    }
-
-    /// Legacy `GROK_CODE_XAI_API_KEY` env var is accepted as a fallback
-    /// when `XAI_API_KEY` is not set, ensuring existing deployments keep working.
-    #[test]
-    #[serial]
-    fn legacy_env_var_fallback_advertises_xai_api_key() {
-        let _unset_new = EnvGuard::unset(XAI_API_KEY_ENV_VAR);
-        let _set_legacy = EnvGuard::set(LEGACY_XAI_API_KEY_ENV_VAR, "xai-legacy-key");
-        assert!(has_xai_api_key_env());
-        assert_eq!(read_xai_api_key_env().unwrap(), "xai-legacy-key");
-
-        let cfg = Config::default();
-        let models = resolve_model_list(&cfg, None);
-        let has_external_api_key = should_advertise_xai_api_key(false, models.values());
-        assert!(has_external_api_key);
-    }
-
-    /// When both `XAI_API_KEY` and `GROK_CODE_XAI_API_KEY` are set,
-    /// the new name takes precedence.
-    #[test]
-    #[serial]
-    fn new_env_var_takes_precedence_over_legacy() {
-        let _new = EnvGuard::set(XAI_API_KEY_ENV_VAR, "new-key");
-        let _legacy = EnvGuard::set(LEGACY_XAI_API_KEY_ENV_VAR, "old-key");
-        assert_eq!(read_xai_api_key_env().unwrap(), "new-key");
-    }
-
-    // -- grok login --legacy regression coverage ------------------------
+    // -- legacy token regression coverage ------------------------
     //
-    // `grok login --legacy` produces a GrokAuth with `auth_mode: WebLogin`,
+    // A legacy relay token produces a GrokAuth with `auth_mode: WebLogin`,
     // `oidc_issuer: None`, and no `expires_at` (30-day hardcoded TTL).
     // When this token is present via the `GROK_AUTH` env var (or via legacy
     // scope fallback in auth.json), `AuthManager::new` returns it from
@@ -1022,9 +847,9 @@ mod tests {
 
         // Ensure clean slate for "no other auth available".
         let _g1 = EnvGuard::unset("GROK_AUTH_PATH");
-        let _g2 = EnvGuard::unset(XAI_API_KEY_ENV_VAR);
+        // XAI_API_KEY env var removed.
 
-        // Construct a legacy-style token exactly as `grok login --legacy`
+        // Construct a legacy-style token exactly as the old relay
         // produces: WebLogin mode, no OIDC fields, no refresh_token, no
         // expires_at (is_expired falls back to 30-day age check).
         let legacy_token = GrokAuth {

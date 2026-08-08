@@ -887,6 +887,116 @@ fn from_config_without_prefetch_produces_usable_catalog() {
     );
 }
 
+#[tokio::test]
+async fn model_endpoint_refresh_uses_model_key_and_updates_catalog() {
+    use std::sync::Mutex;
+
+    struct CapturingEndpoint {
+        request: Arc<Mutex<Option<ModelEndpointRequest>>>,
+        catalog: IndexMap<String, ModelEntry>,
+    }
+    impl ModelsEndpoint for CapturingEndpoint {
+        fn fetch_models(
+            &self,
+            _endpoints: config::EndpointsConfig,
+            _auth: Option<GrokAuth>,
+            _fetch_auth: ModelFetchAuth,
+        ) -> ModelsFetchFuture {
+            Box::pin(async { None })
+        }
+
+        fn fetch_model_endpoint(&self, request: ModelEndpointRequest) -> ModelsFetchFuture {
+            *self.request.lock().unwrap() = Some(request);
+            let catalog = self.catalog.clone();
+            Box::pin(async move { Some(catalog) })
+        }
+    }
+
+    let cfg = config_from_toml(
+        r#"
+            [model.endpoint-model]
+            base_url = "https://provider.example/v1"
+            api_key = "model-api-key"
+            api_backend = "chat_completions"
+            "#,
+    );
+    let tmp = tempfile::TempDir::new().unwrap();
+    let auth_manager = Arc::new(AuthManager::new(tmp.path(), GrokComConfig::default()));
+    auth_manager.hot_swap(GrokAuth::test_default());
+    let request = Arc::new(Mutex::new(None));
+    let mgr = ModelsManagerBuilder::new(
+        None,
+        resolve_model_catalog(&cfg, None),
+        acp::ModelId::new("endpoint-model"),
+        auth_manager,
+        cfg,
+    )
+    .endpoint(Arc::new(CapturingEndpoint {
+        request: request.clone(),
+        catalog: make_prefetched(&["provider-model"]),
+    }))
+    .cache(test_cache_manager(tmp.path()))
+    .build();
+
+    assert!(mgr.refresh_current_model_endpoint().await);
+    let request = request.lock().unwrap().take().expect("request captured");
+    assert_eq!(request.base_url, "https://provider.example/v1");
+    assert_eq!(request.api_key, "model-api-key");
+    assert_eq!(request.auth_provider, None);
+    assert!(mgr.available().contains_key(&acp::ModelId::new("provider-model")));
+    assert!(mgr.models().contains_key("provider-model"));
+}
+
+#[tokio::test]
+async fn model_endpoint_without_model_credential_is_not_requested() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct CountingEndpoint {
+        calls: Arc<AtomicUsize>,
+    }
+    impl ModelsEndpoint for CountingEndpoint {
+        fn fetch_models(
+            &self,
+            _endpoints: config::EndpointsConfig,
+            _auth: Option<GrokAuth>,
+            _fetch_auth: ModelFetchAuth,
+        ) -> ModelsFetchFuture {
+            Box::pin(async { None })
+        }
+
+        fn fetch_model_endpoint(&self, _request: ModelEndpointRequest) -> ModelsFetchFuture {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { None })
+        }
+    }
+
+    let cfg = config_from_toml(
+        r#"
+            [model.endpoint-model]
+            base_url = "https://provider.example/v1"
+            "#,
+    );
+    let tmp = tempfile::TempDir::new().unwrap();
+    let auth_manager = Arc::new(AuthManager::new(tmp.path(), GrokComConfig::default()));
+    auth_manager.hot_swap(GrokAuth::test_default());
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mgr = ModelsManagerBuilder::new(
+        None,
+        resolve_model_catalog(&cfg, None),
+        acp::ModelId::new("endpoint-model"),
+        auth_manager,
+        cfg,
+    )
+    .endpoint(Arc::new(CountingEndpoint {
+        calls: calls.clone(),
+    }))
+    .cache(test_cache_manager(tmp.path()))
+    .build();
+
+    assert!(!mgr.refresh_current_model_endpoint().await);
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
 // ── auth-change refresh: has_fetched_real_catalog flag ─────────────
 
 #[test]

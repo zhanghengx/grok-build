@@ -10,6 +10,37 @@ use super::agent::AgentId;
 use crate::scrollback::entry::EntryId;
 use agent_client_protocol as acp;
 use xai_grok_shell::sampling::types::ReasoningEffort;
+
+/// Owned secret text whose debug representation never includes its contents.
+///
+/// API keys cross the action/effect boundary so they can be persisted off the
+/// event-loop thread, but they should remain safe if an effect is inspected in
+/// a diagnostic or panic report.
+#[derive(Clone, Eq, PartialEq)]
+pub struct SecretString(String);
+
+impl SecretString {
+    pub fn new(value: String) -> Self {
+        Self(value)
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for SecretString {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("SecretString(REDACTED)")
+    }
+}
+
+impl From<String> for SecretString {
+    fn from(value: String) -> Self {
+        Self::new(value)
+    }
+}
+
 /// Typed error for model switch failures. Replaces the raw `String` in
 /// `TaskResult::SwitchModelComplete` so dispatch can match on the variant
 /// instead of parsing strings.
@@ -654,6 +685,10 @@ pub enum Action {
     CancelLogin,
     /// User submitted a manually-pasted auth token (loopback mode).
     SubmitAuthCode(String),
+    /// User submitted the API base URL and key from the first-run form.
+    /// The values are read from the app-owned editors during dispatch so the
+    /// action itself never carries a secret in debug output.
+    SubmitApiConfiguration,
     /// Copy the auth URL to the clipboard during authentication.
     CopyAuthUrl,
     /// Show the raw auth URL with mouse capture disabled for manual copy.
@@ -1741,6 +1776,13 @@ pub enum Effect {
     PollAuthUrl { request_seq: u64 },
     /// Submit a manually-pasted auth code (ext request).
     SubmitAuthCode { request_seq: u64, code: String },
+    /// Persist the API model connection settings to config.toml.
+    PersistApiConfiguration {
+        base_url: String,
+        api_key: SecretString,
+    },
+    /// Ask the shell to re-read model configuration after it was persisted.
+    ReloadApiConfiguration,
     /// Fetch MCP server list from the shell (x.ai/mcp/list).
     FetchMcpsList {
         agent_id: AgentId,
@@ -2468,6 +2510,14 @@ pub enum TaskResult {
     /// Auth code was submitted (fire-and-forget).
     AuthCodeSubmitted {
         request_seq: u64,
+    },
+    /// API model connection settings were persisted.
+    ApiConfigurationPersisted {
+        result: Result<(), String>,
+    },
+    /// The shell finished applying the persisted API model configuration.
+    ApiConfigurationReloaded {
+        result: Result<(), String>,
     },
     /// MCP server list fetched from shell.
     McpsListLoaded {

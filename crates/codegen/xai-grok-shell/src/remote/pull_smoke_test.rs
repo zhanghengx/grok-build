@@ -30,7 +30,7 @@ mod tests {
             ContentBlock, ContentChunk, SessionNotification, SessionUpdate, TextContent,
         };
 
-        let auth = load_prod_auth().expect("No auth.json — run `grok login`");
+        let auth = load_prod_auth().expect("No API key configured — set api_key in ~/.grok/config.toml");
         let am = Arc::new(crate::auth::AuthManager::new(
             &crate::util::grok_home::grok_home(),
             crate::auth::GrokComConfig::default(),

@@ -1,6 +1,7 @@
 //! Async task-result application: routes task results into state.
 use super::auth::{
-    ensure_login_method, handle_auth_complete, handle_auth_url_ready, handle_mcp_auth_trigger_done,
+    ensure_login_method, handle_api_configuration_persisted, handle_api_configuration_reloaded,
+    handle_auth_complete, handle_auth_url_ready, handle_mcp_auth_trigger_done,
     handle_mcp_setup_submit_done,
 };
 use super::billing::{
@@ -706,6 +707,12 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
             mode,
         } => handle_auth_url_ready(app, request_seq, auth_url, external, mode),
         TaskResult::AuthCodeSubmitted { .. } => vec![],
+        TaskResult::ApiConfigurationPersisted { result } => {
+            handle_api_configuration_persisted(app, result)
+        }
+        TaskResult::ApiConfigurationReloaded { result } => {
+            handle_api_configuration_reloaded(app, result)
+        }
         TaskResult::AuthCancelComplete => vec![],
         TaskResult::McpsListLoaded { agent_id, result } => {
             use crate::views::extensions_modal::TabDataState;

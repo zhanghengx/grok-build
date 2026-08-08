@@ -1856,11 +1856,11 @@ async fn permanent_failure_reads_absent_after_clear_so_auth_reports_not_logged_i
     );
     assert!(mgr.permanent_failure().is_some());
 
-    // User runs `grok logout` which calls clear().
+    // User runs `unconfigure api_key in config.toml` which calls clear().
     mgr.clear().unwrap();
 
     // The diagnostic the user now sees on the next request should be
-    // "Not logged in. Run `grok login`.", not the stale invalid_grant.
+    // "No API key configured. Set api_key or env_key in ~/.grok/config.toml.", not the stale invalid_grant.
     let err = mgr.auth().await.unwrap_err();
     assert!(
         matches!(err, AuthError::NotLoggedIn),

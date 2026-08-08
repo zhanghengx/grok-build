@@ -66,7 +66,7 @@ async fn handle_internal(
         }
         InternalMethod::ReloadSkills => handle_reload_skills(agent),
         InternalMethod::ReloadWorkflows => handle_reload_workflows(agent),
-        InternalMethod::ReloadModels => handle_reload_models(agent),
+        InternalMethod::ReloadModels => handle_reload_models(agent).await,
         InternalMethod::ReloadModelsCache => handle_reload_models_cache(agent),
         InternalMethod::AuthCleared => handle_auth_cleared(agent),
         // Arrives as a notification, so it never reaches this request path.
@@ -597,7 +597,7 @@ fn cwd_matches(session_cwd: &std::path::Path, target_cwd: &std::path::Path) -> b
 /// `new_with_models()` for user TOML config entries, and swaps the model list
 /// in-place. Prefetched (API) and default models are NOT re-fetched -- only
 /// BYOK entries from config are updated.
-fn handle_reload_models(agent: &MvpAgent) -> ExtResult {
+async fn handle_reload_models(agent: &MvpAgent) -> ExtResult {
     let disk_config = crate::config::load_effective_config()
         .map_err(|e| acp::Error::internal_error().data(e.to_string()))?;
 
@@ -634,6 +634,12 @@ fn handle_reload_models(agent: &MvpAgent) -> ExtResult {
 
     agent.models_manager.apply_config(merged_config);
     agent.sync_process_static_api_key(None);
+
+    // A config-only model endpoint is the source of the picker catalog. Fetch
+    // it after applying the new override so onboarding updates the live Pager
+    // without requiring an agent restart.
+    agent.models_manager.refresh_current_model_endpoint().await;
+    agent.ensure_api_key_auth_method_from_models();
 
     let count = agent.models_manager.models().len();
     tracing::info!(count, "model list reloaded from config.toml");

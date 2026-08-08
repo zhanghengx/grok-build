@@ -934,7 +934,18 @@ pub(crate) async fn run(
     // Seed auth state from ACP connection metadata.
     // --force-login overrides: show the login screen even when credentials exist.
     let force_login = args.force_login && !connection.auth_methods.is_empty();
-    let needs_interactive_login = connection.needs_login || force_login;
+    // Login was removed in favor of manually configured API credentials. A
+    // legacy agent can still advertise only grok.com/oidc methods; treating
+    // that as interactive login starts a flow which can never complete and
+    // leaves the welcome screen at "Connecting...". Surface the actionable
+    // API configuration screen instead.
+    let requires_api_configuration = requires_api_configuration(&connection.auth_methods);
+    let needs_interactive_login =
+        (connection.needs_login || force_login) && !requires_api_configuration;
+    if requires_api_configuration {
+        app.welcome_prompt_focused = false;
+        app.auth_state = AuthState::ConfigRequired;
+    }
     if needs_interactive_login {
         app.welcome_prompt_focused = false;
 
@@ -989,7 +1000,9 @@ pub(crate) async fn run(
     // else: auth_state defaults to Done (already authenticated eagerly)
     // Effects stashed until after the initial render, so the user sees the
     // welcome/auth UI right away.
-    let mut post_render_effects = if needs_interactive_login {
+    let mut post_render_effects = if requires_api_configuration {
+        vec![]
+    } else if needs_interactive_login {
         if connection.auth_methods.is_empty() {
             // preferred_method pin unavailable — no advertised method to start.
             app.auth_state = super::app_view::AuthState::Pending {
@@ -3864,10 +3877,41 @@ fn process_effects(
     false
 }
 
+/// Whether the welcome screen must ask for manual API configuration.
+///
+/// An empty list is the normal API-key-only first-run case. Older agents can
+/// still advertise only browser-login methods; those are equally unusable in
+/// this build and must not start the old login flow.
+fn requires_api_configuration(auth_methods: &[acp::AuthMethod]) -> bool {
+    auth_methods.is_empty()
+        || auth_methods.iter().all(|method| {
+            xai_grok_shell::agent::auth_method::AuthMethodKind::from_id(method.id())
+                .needs_interactive_login()
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crossterm::event::{KeyEvent, KeyEventState};
+
+    fn auth_method(id: &str) -> acp::AuthMethod {
+        acp::AuthMethod::Agent(acp::AuthMethodAgent::new(
+            acp::AuthMethodId::new(id),
+            id.to_owned(),
+        ))
+    }
+
+    #[test]
+    fn only_interactive_or_missing_auth_methods_require_api_configuration() {
+        assert!(requires_api_configuration(&[]));
+        assert!(requires_api_configuration(&[
+            auth_method("grok.com"),
+            auth_method("oidc"),
+        ]));
+        assert!(!requires_api_configuration(&[auth_method("xai.api_key")]));
+        assert!(!requires_api_configuration(&[auth_method("cached_token")]));
+    }
 
     #[cfg(feature = "local-workspace")]
     #[test]
