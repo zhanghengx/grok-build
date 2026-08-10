@@ -593,6 +593,154 @@ fn login_with_empty_auth_methods_fails_closed() {
     assert!(app.login_method_id.is_none());
 }
 
+#[test]
+fn api_configuration_submission_trims_values_and_starts_persistence() {
+    let mut app = test_app();
+    app.auth_state = AuthState::ConfigRequired;
+    app.api_base_url_input
+        .set_text("  https://proxy.example/v1  ");
+    app.api_key_input.set_text("  xai-test-secret  ");
+    app.api_configuration_backend = xai_grok_shell::sampling::ApiBackend::Responses;
+
+    let effects = dispatch(Action::SubmitApiConfiguration, &mut app);
+
+    assert_eq!(app.api_base_url_input.text(), "https://proxy.example/v1");
+    assert_eq!(app.api_key_input.text(), "xai-test-secret");
+    assert_eq!(
+        app.api_configuration_status,
+        crate::app::app_view::ApiConfigurationStatus::Saving
+    );
+    assert!(app.api_configuration_error.is_none());
+    assert!(matches!(
+        &effects[..],
+        [Effect::PersistApiConfiguration {
+            base_url,
+            api_key,
+            api_backend,
+        }]
+            if base_url == "https://proxy.example/v1"
+                && api_key.as_str() == "xai-test-secret"
+                && api_backend == &xai_grok_shell::sampling::ApiBackend::Responses
+    ));
+    assert!(!format!("{:?}", Action::SubmitApiConfiguration).contains("xai-test-secret"));
+    assert!(!format!("{:?}", effects).contains("xai-test-secret"));
+}
+
+#[test]
+fn api_configuration_submission_requires_both_fields() {
+    let mut app = test_app();
+    app.auth_state = AuthState::ConfigRequired;
+
+    assert!(dispatch(Action::SubmitApiConfiguration, &mut app).is_empty());
+    assert_eq!(
+        app.api_configuration_field,
+        crate::app::app_view::ApiConfigurationField::ApiKey
+    );
+    assert_eq!(
+        app.api_configuration_error.as_deref(),
+        Some("api_key is required")
+    );
+
+    app.api_key_input.set_text("xai-test-secret");
+    app.api_base_url_input.reset();
+    assert!(dispatch(Action::SubmitApiConfiguration, &mut app).is_empty());
+    assert_eq!(
+        app.api_configuration_field,
+        crate::app::app_view::ApiConfigurationField::BaseUrl
+    );
+    assert_eq!(
+        app.api_configuration_error.as_deref(),
+        Some("base_url is required")
+    );
+}
+
+#[test]
+fn api_configuration_persist_and_reload_states_are_explicit() {
+    let mut app = test_app();
+    app.auth_state = AuthState::ConfigRequired;
+    app.api_configuration_status = crate::app::app_view::ApiConfigurationStatus::Saving;
+
+    let effects = dispatch(
+        Action::TaskComplete(TaskResult::ApiConfigurationPersisted { result: Ok(()) }),
+        &mut app,
+    );
+    assert_eq!(
+        app.api_configuration_status,
+        crate::app::app_view::ApiConfigurationStatus::Reloading
+    );
+    assert!(matches!(&effects[..], [Effect::ReloadApiConfiguration]));
+
+    app.deferred_startup.session =
+        Some(crate::app::session_startup::DeferredSessionStartup::Load {
+            session_id: "deferred-session".into(),
+            session_cwd: None,
+            chat_kind: false,
+        });
+    let effects = dispatch(
+        Action::TaskComplete(TaskResult::ApiConfigurationReloaded { result: Ok(()) }),
+        &mut app,
+    );
+    assert!(
+        effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::LoadSession { .. }))
+    );
+    assert!(app.deferred_startup.session.is_none());
+    assert!(matches!(app.auth_state, AuthState::Done));
+    assert!(app.is_api_key_auth);
+    assert!(app.api_configuration_error.is_none());
+}
+
+#[test]
+fn api_configuration_failures_return_to_editing_without_secret_details() {
+    let mut app = test_app();
+    app.auth_state = AuthState::ConfigRequired;
+    app.api_configuration_status = crate::app::app_view::ApiConfigurationStatus::Saving;
+
+    dispatch(
+        Action::TaskComplete(TaskResult::ApiConfigurationPersisted {
+            result: Err("permission denied".into()),
+        }),
+        &mut app,
+    );
+    assert_eq!(
+        app.api_configuration_status,
+        crate::app::app_view::ApiConfigurationStatus::Editing
+    );
+    assert!(
+        app.api_configuration_error
+            .as_deref()
+            .is_some_and(|error| error.contains("permission denied"))
+    );
+    assert!(
+        !app.api_configuration_error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("xai-test-secret")
+    );
+
+    app.api_configuration_error = None;
+    app.api_configuration_status = crate::app::app_view::ApiConfigurationStatus::Reloading;
+    dispatch(
+        Action::TaskComplete(TaskResult::ApiConfigurationReloaded {
+            result: Err("shell rejected API configuration reload".into()),
+        }),
+        &mut app,
+    );
+    assert!(matches!(app.auth_state, AuthState::ConfigRequired));
+    assert!(
+        app.api_configuration_error
+            .as_deref()
+            .is_some_and(|error| error.contains("reload failed"))
+    );
+    assert!(
+        !app.api_configuration_error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("xai-test-secret")
+    );
+}
+
 /// Puts the app in `Authenticating` with a live task's abort handle installed
 /// (as the event loop would), returning the task's JoinHandle and the seq.
 /// Callers assert the task actually gets aborted (`unwrap_err().is_cancelled()`),

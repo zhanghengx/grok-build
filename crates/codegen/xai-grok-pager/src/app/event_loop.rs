@@ -934,7 +934,18 @@ pub(crate) async fn run(
     // Seed auth state from ACP connection metadata.
     // --force-login overrides: show the login screen even when credentials exist.
     let force_login = args.force_login && !connection.auth_methods.is_empty();
-    let needs_interactive_login = connection.needs_login || force_login;
+    // Login was removed in favor of manually configured API credentials. A
+    // legacy agent can still advertise only grok.com/oidc methods; treating
+    // that as interactive login starts a flow which can never complete and
+    // leaves the welcome screen at "Connecting...". Surface the actionable
+    // API configuration screen instead.
+    let requires_api_configuration = requires_api_configuration(&connection.auth_methods);
+    let needs_interactive_login =
+        (connection.needs_login || force_login) && !requires_api_configuration;
+    if requires_api_configuration {
+        app.welcome_prompt_focused = false;
+        app.auth_state = AuthState::ConfigRequired;
+    }
     if needs_interactive_login {
         app.welcome_prompt_focused = false;
 
@@ -989,7 +1000,9 @@ pub(crate) async fn run(
     // else: auth_state defaults to Done (already authenticated eagerly)
     // Effects stashed until after the initial render, so the user sees the
     // welcome/auth UI right away.
-    let mut post_render_effects = if needs_interactive_login {
+    let mut post_render_effects = if requires_api_configuration {
+        vec![]
+    } else if needs_interactive_login {
         if connection.auth_methods.is_empty() {
             // preferred_method pin unavailable — no advertised method to start.
             app.auth_state = super::app_view::AuthState::Pending {
@@ -3081,14 +3094,7 @@ async fn drain_and_process(
         }
     }
 
-    // The /gboom game tracks keys by press → release, so it needs the
-    // release events that `coalesce_rapid_keys` strips (and it never
-    // pastes). Skip coalescing while it owns input.
-    let coalesced = if app.gboom_active() {
-        raw_events
-    } else {
-        coalesce_rapid_keys(raw_events)
-    };
+    let coalesced = coalesce_input_events(&app.auth_state, app.gboom_active(), raw_events);
     let coalesced = csi_filter.filter(coalesced);
     let coalesced = coalesced
         .into_iter()
@@ -3326,6 +3332,22 @@ async fn drain_and_process(
     }
 }
 
+/// Keep configuration navigation keys as individual events. A rapid sequence
+/// such as `url`, Enter, `api_key`, Tab is semantically form navigation, but
+/// looks like multiline paste to the fallback coalescer used by terminals that
+/// do not send bracketed-paste markers.
+fn coalesce_input_events(
+    auth_state: &AuthState,
+    gboom_active: bool,
+    events: Vec<TimedInputEvent>,
+) -> Vec<TimedInputEvent> {
+    if gboom_active || matches!(auth_state, AuthState::ConfigRequired) {
+        events
+    } else {
+        coalesce_rapid_keys(events)
+    }
+}
+
 // ── Paste coalescing for terminals without bracketed paste ───────────
 
 /// Timeout for the first extension round (detection).  If no event
@@ -3515,9 +3537,9 @@ fn coalesce_rapid_keys(events: Vec<TimedInputEvent>) -> Vec<TimedInputEvent> {
         return events;
     }
 
-    // If Event::Paste fragments are mixed with key events (Windows
-    // Terminal can split a large bracketed paste across read boundaries),
-    // merge everything into a single Event::Paste.
+    // If Event::Paste fragments are mixed with key events (Windows Terminal
+    // can split a large bracketed paste across read boundaries), merge the
+    // character text while preserving navigation/control-key boundaries.
     let (mut has_paste, mut has_keys) = (false, false);
     for e in &events {
         has_paste |= matches!(e.event, Event::Paste(_));
@@ -3622,13 +3644,29 @@ pub(super) fn is_bare_esc_press(ev: &Event) -> bool {
     )
 }
 
-/// Merge `Event::Paste` fragments and interleaved key events into a
-/// single `Event::Paste`.  Non-paste, non-key events (Resize, Mouse,
-/// Focus) are preserved in order around the merged paste.
+/// Merge `Event::Paste` fragments and interleaved character key events into
+/// paste events. Navigation keys are preserved as boundaries: a user can
+/// paste text and immediately press Enter or Tab before the reader thread
+/// yields another batch, and those keys must still reach the active form.
+/// Non-paste, non-key events (Resize, Mouse, Focus) are preserved in order
+/// around the merged paste.
 fn merge_paste_fragments(events: Vec<TimedInputEvent>) -> Vec<TimedInputEvent> {
     let mut result = Vec::new();
     let mut merged_text = String::new();
     let mut merged_arrived_at = None;
+
+    let flush = |result: &mut Vec<TimedInputEvent>,
+                 merged_text: &mut String,
+                 merged_arrived_at: &mut Option<std::time::Instant>| {
+        if !merged_text.is_empty() {
+            result.push(TimedInputEvent {
+                event: Event::Paste(std::mem::take(merged_text)),
+                arrived_at: merged_arrived_at
+                    .take()
+                    .expect("non-empty merged paste has an arrival time"),
+            });
+        }
+    };
 
     for ev in events {
         match &ev.event {
@@ -3637,37 +3675,39 @@ fn merge_paste_fragments(events: Vec<TimedInputEvent>) -> Vec<TimedInputEvent> {
                 merged_text.push_str(text);
             }
             Event::Key(ke) if is_pasteable_key_event(&ev.event) => {
-                merged_arrived_at.get_or_insert(ev.arrived_at);
                 match ke.code {
-                    KeyCode::Char(c) => merged_text.push(c),
-                    KeyCode::Enter => merged_text.push('\n'),
-                    KeyCode::Tab => merged_text.push('\t'),
+                    KeyCode::Char(c) => {
+                        merged_arrived_at.get_or_insert(ev.arrived_at);
+                        merged_text.push(c);
+                    }
+                    // Crossterm has already recognized Event::Paste as a
+                    // complete bracketed paste. Keep a following submit or
+                    // field-navigation key distinct even when it arrived in
+                    // the same reader batch.
+                    KeyCode::Enter | KeyCode::Tab => {
+                        flush(&mut result, &mut merged_text, &mut merged_arrived_at);
+                        result.push(ev);
+                    }
                     _ => {}
                 }
             }
-            // Non-pasteable keys (Ctrl+C, Backspace, arrows, Release
-            // events, etc.) are artifacts of paste fragmentation — drop.
-            Event::Key(_) => {}
+            // A release carries no text and handlers ignore it. Preserve
+            // every non-release key as a boundary, though: Ctrl+C, arrows,
+            // Backspace, and other controls may be a real key pressed right
+            // after a paste rather than a paste fragment.
+            Event::Key(key) if key.kind == KeyEventKind::Release => {}
+            Event::Key(_) => {
+                flush(&mut result, &mut merged_text, &mut merged_arrived_at);
+                result.push(ev);
+            }
             _ => {
-                if !merged_text.is_empty() {
-                    result.push(TimedInputEvent {
-                        event: Event::Paste(std::mem::take(&mut merged_text)),
-                        arrived_at: merged_arrived_at
-                            .take()
-                            .expect("non-empty merged paste has an arrival time"),
-                    });
-                }
+                flush(&mut result, &mut merged_text, &mut merged_arrived_at);
                 result.push(ev);
             }
         }
     }
 
-    if !merged_text.is_empty() {
-        result.push(TimedInputEvent {
-            event: Event::Paste(merged_text),
-            arrived_at: merged_arrived_at.expect("non-empty merged paste has an arrival time"),
-        });
-    }
+    flush(&mut result, &mut merged_text, &mut merged_arrived_at);
 
     result
 }
@@ -3864,10 +3904,41 @@ fn process_effects(
     false
 }
 
+/// Whether the welcome screen must ask for manual API configuration.
+///
+/// An empty list is the normal API-key-only first-run case. Older agents can
+/// still advertise only browser-login methods; those are equally unusable in
+/// this build and must not start the old login flow.
+fn requires_api_configuration(auth_methods: &[acp::AuthMethod]) -> bool {
+    auth_methods.is_empty()
+        || auth_methods.iter().all(|method| {
+            xai_grok_shell::agent::auth_method::AuthMethodKind::from_id(method.id())
+                .needs_interactive_login()
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crossterm::event::{KeyEvent, KeyEventState};
+
+    fn auth_method(id: &str) -> acp::AuthMethod {
+        acp::AuthMethod::Agent(acp::AuthMethodAgent::new(
+            acp::AuthMethodId::new(id),
+            id.to_owned(),
+        ))
+    }
+
+    #[test]
+    fn only_interactive_or_missing_auth_methods_require_api_configuration() {
+        assert!(requires_api_configuration(&[]));
+        assert!(requires_api_configuration(&[
+            auth_method("grok.com"),
+            auth_method("oidc"),
+        ]));
+        assert!(!requires_api_configuration(&[auth_method("xai.api_key")]));
+        assert!(!requires_api_configuration(&[auth_method("cached_token")]));
+    }
 
     #[cfg(feature = "local-workspace")]
     #[test]
@@ -4681,8 +4752,17 @@ mod tests {
             ),
         ];
         let merged = merge_paste_fragments(fragments);
+        assert_eq!(merged.len(), 3);
         assert_eq!(merged[0].arrived_at, start);
-        assert_eq!(merged[0].event, Event::Paste("a\nb".to_owned()));
+        assert_eq!(merged[0].event, Event::Paste("a".to_owned()));
+        assert!(matches!(
+            merged[1].event,
+            Event::Key(KeyEvent {
+                code: KeyCode::Enter,
+                ..
+            })
+        ));
+        assert_eq!(merged[2].event, Event::Paste("b".to_owned()));
     }
 
     #[test]
@@ -4816,6 +4896,36 @@ mod tests {
         let result = coalesce_rapid_keys(events);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].event, Event::Paste("ab\ncd".to_string()));
+    }
+
+    #[test]
+    fn config_required_preserves_rapid_navigation_keys() {
+        let events = vec![
+            press(KeyCode::Char('u')),
+            press(KeyCode::Char('r')),
+            press(KeyCode::Char('l')),
+            press(KeyCode::Enter),
+            press(KeyCode::Char('k')),
+            press(KeyCode::Char('e')),
+            press(KeyCode::Char('y')),
+            press(KeyCode::Tab),
+        ];
+        let result = coalesce_input_events(&AuthState::ConfigRequired, false, events);
+        assert_eq!(result.len(), 8);
+        assert!(matches!(
+            result[3].event,
+            Event::Key(KeyEvent {
+                code: KeyCode::Enter,
+                ..
+            })
+        ));
+        assert!(matches!(
+            result[7].event,
+            Event::Key(KeyEvent {
+                code: KeyCode::Tab,
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -4970,8 +5080,45 @@ mod tests {
             press(KeyCode::Char('b')),
         ];
         let result = coalesce_rapid_keys(events);
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].event, Event::Paste("real pastea\nb".to_string()));
+        assert_eq!(result.len(), 3);
+        assert_eq!(result[0].event, Event::Paste("real pastea".to_string()));
+        assert!(matches!(
+            result[1].event,
+            Event::Key(KeyEvent {
+                code: KeyCode::Enter,
+                ..
+            })
+        ));
+        assert_eq!(result[2].event, Event::Paste("b".to_string()));
+    }
+
+    #[test]
+    fn bracketed_paste_navigation_keys_remain_events() {
+        let events = vec![
+            TimedInputEvent::now(Event::Paste("url".into())),
+            press(KeyCode::Tab),
+            TimedInputEvent::now(Event::Paste("key".into())),
+            press(KeyCode::Enter),
+        ];
+        let result = coalesce_rapid_keys(events);
+
+        assert_eq!(result.len(), 4);
+        assert_eq!(result[0].event, Event::Paste("url".to_string()));
+        assert!(matches!(
+            result[1].event,
+            Event::Key(KeyEvent {
+                code: KeyCode::Tab,
+                ..
+            })
+        ));
+        assert_eq!(result[2].event, Event::Paste("key".to_string()));
+        assert!(matches!(
+            result[3].event,
+            Event::Key(KeyEvent {
+                code: KeyCode::Enter,
+                ..
+            })
+        ));
     }
 
     #[test]

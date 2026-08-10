@@ -95,11 +95,19 @@ pub(super) fn prompt_style(
 /// Draw the pinned live region (tail + status + prompt) into the inline viewport.
 pub fn draw_live(app: &mut AppView, terminal: &mut PagerTerminal) {
     let force_todos = minimal_api::minimal_show_todos(app);
-    let auth_hint = crate::auth::minimal_auth_hint(
+    let auth_hint = crate::auth::minimal_auth_hint_with_config(
         &app.auth_state,
         &app.trust_state,
         app.has_access(),
         app.is_zdr_blocked(),
+        app.api_configuration_base_url(),
+        app.api_configuration_base_url_cursor(),
+        app.api_configuration_api_key(),
+        app.api_configuration_api_key_cursor(),
+        app.api_configuration_backend(),
+        app.api_configuration_field(),
+        app.api_configuration_status(),
+        app.api_configuration_error(),
     );
     let pending_hint = minimal_pending_hint(&app.pending_action);
     let transcript_hint = if minimal_api::minimal_ctrl_o_opens_transcript(app) {
@@ -143,8 +151,8 @@ pub fn draw_live(app: &mut AppView, terminal: &mut PagerTerminal) {
         Clear.render(area, frame.buffer_mut());
         let agent = agent_id.and_then(|id| agents.get_mut(&id));
         let Some(agent) = agent else {
-            crate::auth::render_auth(frame.buffer_mut(), area, &theme, &auth_hint);
-            return (None, None);
+            let cursor = crate::auth::render_auth(frame.buffer_mut(), area, &theme, &auth_hint);
+            return (cursor, None);
         };
         agent.active_pane = xai_grok_pager::app::agent_view::AgentPane::Prompt;
         let status_activity = minimal_advance_phase_timer(agent);

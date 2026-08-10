@@ -1,11 +1,23 @@
-use serde::{Deserialize, Deserializer};
+use serde::{Deserialize, Deserializer, de::Error};
+use serde_json::Value;
 
-pub fn empty_string_as_none<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+/// Deserialize an optional value while accepting an empty string as absent.
+///
+/// Some OpenAI-compatible providers emit `""` for fields that are normally
+/// nullable, such as `finish_reason`. Parse non-empty values through their
+/// regular serde implementation so unknown values still fail loudly.
+pub fn empty_string_as_none<'de, T, D>(deserializer: D) -> Result<Option<T>, D::Error>
 where
+    T: serde::de::DeserializeOwned,
     D: Deserializer<'de>,
 {
-    let opt = Option::<String>::deserialize(deserializer)?;
-    Ok(opt.filter(|s| !s.is_empty()))
+    match Option::<Value>::deserialize(deserializer)? {
+        None => Ok(None),
+        Some(Value::String(s)) if s.is_empty() => Ok(None),
+        Some(value) => serde_json::from_value(value)
+            .map(Some)
+            .map_err(D::Error::custom),
+    }
 }
 
 /// Deserialize `Option<Option<T>>`: absent (`None`) leaves, `null` (`Some(None)`)

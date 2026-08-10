@@ -152,6 +152,16 @@ fn test_app() -> AppView {
         login_method_id: None,
         auth_start_mode: AuthMode::Pending,
         auth_code_input: Default::default(),
+        api_base_url_input: {
+            let mut input = crate::input::line_editor::LineEditor::default();
+            input.set_text(crate::app::app_view::DEFAULT_API_BASE_URL);
+            input
+        },
+        api_key_input: Default::default(),
+        api_configuration_backend: xai_grok_shell::sampling::ApiBackend::default(),
+        api_configuration_field: crate::app::app_view::ApiConfigurationField::BaseUrl,
+        api_configuration_status: crate::app::app_view::ApiConfigurationStatus::Editing,
+        api_configuration_error: None,
         next_auth_request_seq: 1,
         auth_url_poll_handle: None,
         deferred_startup: Default::default(),
@@ -200,6 +210,7 @@ fn test_app() -> AppView {
         last_scroll_pos: None,
         last_cache_evict_at: None,
         welcome_prompt_rect: None,
+        welcome_api_configuration_backend_rect: None,
         welcome_auth_url_rect: None,
         welcome_on_auth_url: false,
         welcome_on_changelog_cta: false,

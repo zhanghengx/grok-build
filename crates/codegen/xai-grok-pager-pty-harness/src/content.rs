@@ -122,6 +122,7 @@ impl ContentController {
     /// `GET /v1/models`. Use [`MockModel::with_agent_type`] to configure
     /// models with different harness types for agent-type-mismatch tests.
     pub async fn start_with_models(models: Vec<MockModel>) -> Result<Self> {
+        let model_ids: Vec<String> = models.iter().map(|model| model.id.clone()).collect();
         let server = MockInferenceServer::start_with_models(models)
             .await
             .context("start mock inference server")?;
@@ -133,6 +134,15 @@ impl ContentController {
         server.set_response(default_response_text());
 
         let mut sandbox = TestSandbox::builder().mock_url(server.url()).build();
+        // The shell deliberately does not advertise a bare global key. Make
+        // this test sandbox's key an explicit credential for each mock model.
+        let config = model_ids
+            .iter()
+            .map(|model_id| format!("[model.\"{model_id}\"]\nenv_key = \"XAI_API_KEY\"\n"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(sandbox.grok_home().join("config.toml"), config)
+            .context("seed mock model API-key configuration")?;
         // Keep unrelated autocomplete work out of PTY timing assertions.
         sandbox.set_env("GROK_PROMPT_SUGGESTIONS", "false");
 

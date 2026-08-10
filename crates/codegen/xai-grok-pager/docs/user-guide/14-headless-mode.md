@@ -542,15 +542,15 @@ Key environment variables that affect headless mode:
 
 | Variable                        | Description                                                   |
 | ------------------------------- | ------------------------------------------------------------- |
-| `XAI_API_KEY`        | API key for authentication (required when no browser login)   |
+| `api_key (config.toml)`        | API key for authentication (required when no browser login)   |
 | `GROK_HOME`                    | Override config directory (default: `~/.grok`)                |
 | `GROK_LOG_FILE`                | Path to a log file (used verbatim as the path; works in headless and TUI, honors `RUST_LOG`) |
 | `RUST_LOG`                     | Log level filter (e.g. `debug`). Headless logs to stderr.     |
 
-For CI environments without browser access, set `XAI_API_KEY` with an API key from [console.x.ai](https://console.x.ai):
+For CI environments without browser access, set `api_key (config.toml)` with an API key from [console.x.ai](https://console.x.ai):
 
 ```bash
-export XAI_API_KEY="xai-..."
+Configure api_key in config.toml
 grok -p "Run the test suite" --yolo
 ```
 
@@ -569,14 +569,20 @@ grok -p "Run the test suite" --yolo
 
 ## Authentication for Headless Environments
 
-For headless use, authenticate with one of:
+For headless use, configure an API key in `~/.grok/config.toml`:
 
-- **`XAI_API_KEY`**: simplest for CI. See [Environment Variables](#environment-variables-for-headless) above.
-- **`grok login --device-auth`** (or `--device-code`): no browser needed on the target machine.
-  See [Authentication > Device Code Flow](02-authentication.md#device-code-flow).
-- **`grok login`**: browser-based OAuth2 on machines with a GUI.
+```toml
+[model.grok-build]
+api_key = "your-api-key"
+```
 
-If you've previously logged in, cached credentials are used automatically.
+Or set an environment variable:
+
+```bash
+export XAI_API_KEY="your-api-key"
+```
+
+See [Authentication](02-authentication.md) for details.
 
 ---
 
@@ -624,12 +630,12 @@ Grok stores data in `~/.grok` (override with `GROK_HOME`; see [Environment Varia
 
 For containers or CI, mount `~/.grok` read-only:
 
-- Pre-populate `auth.json` or use `XAI_API_KEY`
+- Set `api_key` or `env_key` in config.toml
 - Session persistence fails silently (ephemeral)
 - Update checks log a warning and skip
 
 ```bash
-export XAI_API_KEY="xai-..."
+Configure api_key in config.toml
 export GROK_DISABLE_AUTOUPDATER=1
 grok -p "..." --no-auto-update
 ```

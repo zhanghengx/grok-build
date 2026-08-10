@@ -66,7 +66,7 @@ async fn handle_get_bearer_token(agent: &MvpAgent) -> ExtResult {
 }
 
 fn handle_get_api_key() -> ExtResult {
-    let key = crate::agent::auth_method::read_xai_api_key_env().ok();
+    let key: Option<String> = None;
     ExtMethodResult::success(serde_json::json!({ "key": key }))
         .to_ext_response()
         .map_err(|e| acp::Error::internal_error().data(e.to_string()))

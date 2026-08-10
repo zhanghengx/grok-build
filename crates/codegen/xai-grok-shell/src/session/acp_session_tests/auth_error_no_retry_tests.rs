@@ -570,8 +570,8 @@ async fn legacy_auth_hint_on_404_model_not_found() {
                 "404 with WebLogin must include deprecation message, got: {msg}"
             );
             assert!(
-                msg.contains("grok logout"),
-                "hint must mention `grok logout`, got: {msg}"
+                msg.contains("unconfigure api_key in config.toml"),
+                "hint must mention `unconfigure api_key in config.toml`, got: {msg}"
             );
             assert!(
                 msg.contains("grok login"),
@@ -641,8 +641,8 @@ async fn legacy_auth_hint_on_401_unauthorized() {
                 "401 with WebLogin must include deprecation message, got: {msg}"
             );
             assert!(
-                msg.contains("grok logout"),
-                "hint must mention `grok logout`, got: {msg}"
+                msg.contains("unconfigure api_key in config.toml"),
+                "hint must mention `unconfigure api_key in config.toml`, got: {msg}"
             );
             assert!(
                 msg.contains("grok login"),

@@ -5,28 +5,34 @@ use thiserror::Error;
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum AuthError {
-    #[error("Not logged in. Run `grok login`.")]
+    #[error("No API key configured. Set api_key or env_key in ~/.grok/config.toml.")]
     NotLoggedIn,
 
-    /// Token expired and no refresh authority available.
-    #[error("Token expired. Run `grok login` to re-authenticate.")]
+    /// API key is invalid or rejected and no recovery path exists.
+    #[error(
+        "API key is invalid or rejected. Set a valid api_key or env_key in ~/.grok/config.toml."
+    )]
     TokenExpiredNoRefresh,
 
-    /// Server rejected the token (401) with no recovery path.
-    #[error("Authentication rejected by server. Run `grok login` to re-authenticate.")]
+    /// Server rejected the API key (401) with no recovery path.
+    #[error("API key rejected by server. Verify your api_key or env_key in ~/.grok/config.toml.")]
     ServerRejectedNoRecovery,
 
     /// All recovery strategies exhausted.
-    #[error("Auth recovery exhausted; re-authentication required.")]
+    #[error(
+        "API key authentication failed after all retries. Verify your api_key or env_key in ~/.grok/config.toml."
+    )]
     RecoveryExhausted,
 
     /// A session's team principal violates the `force_login_team_uuid` pin.
     /// `message` states which team is required vs. returned.
-    #[error("{message} Run `grok login` to sign in with the required team.")]
+    #[error("{message} Set a valid api_key in ~/.grok/config.toml.")]
     PinnedTeamMismatch { message: String },
 
-    /// Cached API-key session rejected because API-key auth is disabled.
-    #[error("API-key auth is disabled by your administrator. Run `grok login` to authenticate.")]
+    /// API key rejected because API-key auth is disabled by configuration.
+    #[error(
+        "API key authentication is disabled by your administrator. Contact your administrator."
+    )]
     ApiKeyAuthDisabled,
 
     /// Outcome of a refresh-authority attempt. Recoverability (and, for
@@ -121,15 +127,15 @@ impl RefreshTokenFailedReason {
     pub(crate) fn user_message(self) -> Cow<'static, str> {
         match self {
             Self::RefreshTokenRejected => {
-                "Your session has expired. Run `grok login` to sign in again.".into()
+                "Your API key is no longer valid. Set a valid api_key or env_key in ~/.grok/config.toml.".into()
             }
             Self::ClientRejected => {
-                "Authentication is temporarily unavailable. Run `grok login` if this persists."
+                "API key was rejected. Verify your api_key or env_key in ~/.grok/config.toml."
                     .into()
             }
             Self::ProviderInteractiveRequired => provider_login_message(None),
             Self::Other => {
-                "Authentication could not be refreshed. Run `grok login` to sign in again.".into()
+                "API key authentication failed. Set a valid api_key or env_key in ~/.grok/config.toml.".into()
             }
         }
     }
@@ -139,12 +145,12 @@ impl RefreshTokenFailedReason {
 pub(crate) fn provider_login_message(label: Option<&str>) -> Cow<'static, str> {
     match label {
         Some(label) => format!(
-            "Your session expired and {label} could not renew it in the background. \
-             Run /login to sign in again."
+            "Your API key is no longer valid and {label} could not renew it in the background. \
+             Set a valid api_key or env_key in ~/.grok/config.toml."
         )
         .into(),
-        None => "Your session expired and your sign-in helper could not renew it in the \
-                 background. Run /login to sign in again."
+        None => "Your API key is no longer valid and your auth helper could not renew it in the \
+                 background. Set a valid api_key or env_key in ~/.grok/config.toml."
             .into(),
     }
 }

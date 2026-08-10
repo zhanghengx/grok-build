@@ -88,7 +88,7 @@ pub fn default_auth_path() -> anyhow::Result<PathBuf> {
 fn read_auth_entry(path: &Path) -> anyhow::Result<(String, AuthEntry)> {
     if !path.exists() {
         anyhow::bail!(
-            "No auth credentials found at {}. Run `grok login` first.",
+            "No API key found at {}. Set api_key or env_key in ~/.grok/config.toml.",
             path.display()
         );
     }
@@ -110,7 +110,7 @@ fn read_auth_entry(path: &Path) -> anyhow::Result<(String, AuthEntry)> {
         })
         .ok_or_else(|| {
             anyhow::anyhow!(
-                "no OIDC auth entry found in {}. Run `grok login` first.",
+                "No API key found at {}. Set api_key or env_key in ~/.grok/config.toml.",
                 path.display()
             )
         })

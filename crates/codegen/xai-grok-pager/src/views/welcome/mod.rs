@@ -14,10 +14,14 @@ use ratatui::widgets::{Block, Borders, Padding, Paragraph, Widget, Wrap};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
-use crate::app::app_view::{AuthMode, AuthState, SessionPickerEntry, TrustState};
+use crate::app::app_view::{
+    ApiConfigurationField, ApiConfigurationStatus, AuthMode, AuthState, SessionPickerEntry,
+    TrustState,
+};
 use crate::startup::StartupWarning;
 use crate::theme::Theme;
 use crate::views::prompt_widget::{PromptFlag, PromptInfo, PromptWidget};
+use xai_grok_shell::sampling::ApiBackend;
 mod hero_box;
 pub(crate) mod logo;
 mod menu;
@@ -102,6 +106,8 @@ pub struct WelcomeRenderResult {
     pub menu_rects: Vec<Rect>,
     /// Hit-test rect for the prompt input area (for click to start session).
     pub prompt_rect: Option<Rect>,
+    /// Hit-test rect for the first-run API backend selector.
+    pub api_configuration_backend_rect: Option<Rect>,
     /// Hit-test rect for the import-claude banner (for click to open import modal).
     pub import_banner_rect: Option<Rect>,
     /// Hit areas from the session picker (for mouse hit-testing).
@@ -608,6 +614,14 @@ pub struct WelcomeRenderParams<'a> {
     pub login_label: Option<&'a str>,
     pub auth_code_input: &'a str,
     pub auth_code_cursor_byte: usize,
+    pub api_base_url_input: &'a str,
+    pub api_base_url_cursor_byte: usize,
+    pub api_key_input: &'a str,
+    pub api_key_cursor_byte: usize,
+    pub api_configuration_backend: ApiBackend,
+    pub api_configuration_field: ApiConfigurationField,
+    pub api_configuration_status: ApiConfigurationStatus,
+    pub api_configuration_error: Option<&'a str>,
     pub clipboard_delivery: Option<crate::clipboard::ClipboardDelivery>,
     pub show_raw_url: bool,
     pub announcement: Option<&'a xai_grok_announcements::RemoteAnnouncement>,
@@ -714,6 +728,24 @@ pub fn render_welcome(
     render_top_bar(top_bar_inner, buf, &theme, None);
 
     let mut result = match params.auth_state {
+        AuthState::ConfigRequired => {
+            let (cursor_pos, menu_rects, api_configuration_backend_rect, post_flush_escapes) =
+                render_welcome_configuration_required(
+                    content_area,
+                    buf,
+                    params,
+                    params.selected,
+                    h_margin,
+                    params.compact,
+                );
+            WelcomeRenderResult {
+                cursor_pos,
+                post_flush_escapes,
+                menu_rects,
+                api_configuration_backend_rect,
+                ..Default::default()
+            }
+        }
         AuthState::Pending { error } => {
             let label = params.login_label.unwrap_or("grok.com");
             let login_text = format!("Login with {}", label);
@@ -911,6 +943,478 @@ fn render_welcome_blocked(
         },
     );
     (menu_rects, post_flush_escapes)
+}
+
+/// Render the first-run API configuration form.
+fn render_welcome_configuration_required(
+    content_area: Rect,
+    buf: &mut Buffer,
+    params: &WelcomeRenderParams<'_>,
+    selected: Option<usize>,
+    h_margin: u16,
+    compact: bool,
+) -> (
+    Option<(u16, u16)>,
+    Vec<Rect>,
+    Option<Rect>,
+    Option<crate::terminal::overlay::PostFlush>,
+) {
+    // The regular welcome stack reserves space for the logo, prompt, and
+    // version badge. On a short terminal those reservations can push the
+    // fixed-size configuration form past the viewport, leaving the backend
+    // box painted but empty. Use a self-contained form layout while there is
+    // not enough room for the normal stack.
+    if content_area.height < 21 {
+        return render_welcome_configuration_required_compact(content_area, buf, params);
+    }
+
+    let theme = Theme::current();
+    let menu = [("esc", "Quit")];
+    let layout = WelcomeLayout::compute_stacked(WelcomeLayoutInput {
+        content_area,
+        error_height: 17,
+        menu_height: menu.len() as u16,
+        compact,
+        prompt_compact: compact,
+        ..Default::default()
+    });
+
+    render_logo(layout.logo, buf, &theme, content_area.height);
+
+    let [
+        header_area,
+        path_area,
+        base_label_area,
+        base_box_area,
+        key_label_area,
+        key_box_area,
+        backend_label_area,
+        backend_box_area,
+        status_area,
+        hint_area,
+    ] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(3),
+        Constraint::Length(1),
+        Constraint::Length(3),
+        Constraint::Length(1),
+        Constraint::Length(3),
+        Constraint::Length(1),
+        Constraint::Min(0),
+    ])
+    .areas(layout.error);
+
+    Paragraph::new(
+        Line::from(Span::styled(
+            "Configure Grok API",
+            Style::default().fg(theme.gray_bright),
+        ))
+        .alignment(Alignment::Center),
+    )
+    .render(header_area, buf);
+    Paragraph::new(
+        Line::from(vec![
+            Span::styled("~/.grok/config.toml  ", Style::default().fg(theme.gray)),
+            Span::styled(
+                format!("[model.\"{}\"]", xai_grok_shell::models::default_model()),
+                Style::default().fg(theme.text_primary),
+            ),
+        ])
+        .alignment(Alignment::Center),
+    )
+    .render(path_area, buf);
+
+    Paragraph::new(Line::from(Span::styled(
+        "base_url",
+        Style::default().fg(theme.gray_bright),
+    )))
+    .alignment(Alignment::Center)
+    .render(base_label_area, buf);
+    let base_focused = params.api_configuration_field == ApiConfigurationField::BaseUrl
+        && params.api_configuration_status == ApiConfigurationStatus::Editing;
+    let base_cursor = render_configuration_input_box(
+        base_box_area,
+        buf,
+        &theme,
+        params.api_base_url_input,
+        params.api_base_url_cursor_byte,
+        base_focused,
+        false,
+        "Enter base URL...",
+    );
+
+    Paragraph::new(Line::from(Span::styled(
+        "api_key",
+        Style::default().fg(theme.gray_bright),
+    )))
+    .alignment(Alignment::Center)
+    .render(key_label_area, buf);
+    let key_focused = params.api_configuration_field == ApiConfigurationField::ApiKey
+        && params.api_configuration_status == ApiConfigurationStatus::Editing;
+    let key_cursor = render_configuration_input_box(
+        key_box_area,
+        buf,
+        &theme,
+        params.api_key_input,
+        params.api_key_cursor_byte,
+        key_focused,
+        true,
+        "Enter API key...",
+    );
+
+    Paragraph::new(Line::from(Span::styled(
+        "api_backend",
+        Style::default().fg(theme.gray_bright),
+    )))
+    .alignment(Alignment::Center)
+    .render(backend_label_area, buf);
+    let backend_focused = params.api_configuration_field == ApiConfigurationField::ApiBackend
+        && params.api_configuration_status == ApiConfigurationStatus::Editing;
+    render_configuration_backend_box(
+        backend_box_area,
+        buf,
+        &theme,
+        params.api_configuration_backend.clone(),
+        backend_focused,
+    );
+
+    let (status, status_color) = if let Some(error) = params.api_configuration_error {
+        (error, theme.accent_error)
+    } else {
+        match params.api_configuration_status {
+            ApiConfigurationStatus::Editing => ("Enter to apply configuration", theme.gray),
+            ApiConfigurationStatus::Saving => ("Saving configuration...", theme.gray_bright),
+            ApiConfigurationStatus::Reloading => ("Applying configuration...", theme.gray_bright),
+        }
+    };
+    Paragraph::new(Line::from(Span::styled(
+        status,
+        Style::default().fg(status_color),
+    )))
+    .alignment(Alignment::Center)
+    .render(status_area, buf);
+    Paragraph::new(
+        Line::from(Span::styled(
+            "tab / arrows switch fields  ·  left/right choose backend  ·  enter apply  ·  esc quit",
+            Style::default().fg(theme.gray),
+        ))
+        .alignment(Alignment::Center),
+    )
+    .render(hint_area, buf);
+
+    let menu_area = inset_horizontal(layout.menu, prompt::prompt_inset(compact));
+    let menu_rects = render_menu(menu_area, buf, &theme, &menu, selected, None, 0);
+    render_version_badge(
+        layout.version,
+        buf,
+        &theme,
+        None,
+        h_margin,
+        false,
+        VersionBadgeMode::Full {
+            subscription_tier: None,
+        },
+    );
+    let cursor_pos = if base_focused {
+        base_cursor
+    } else if key_focused {
+        key_cursor
+    } else {
+        None
+    };
+    (cursor_pos, menu_rects, Some(backend_box_area), None)
+}
+
+/// Render the first-run form without the normal welcome-screen reservations.
+/// Each field keeps a three-row box, with its label in the top border, so the
+/// selector remains both visible and large enough to click on short terminals.
+fn render_welcome_configuration_required_compact(
+    content_area: Rect,
+    buf: &mut Buffer,
+    params: &WelcomeRenderParams<'_>,
+) -> (
+    Option<(u16, u16)>,
+    Vec<Rect>,
+    Option<Rect>,
+    Option<crate::terminal::overlay::PostFlush>,
+) {
+    let theme = Theme::current();
+    let [
+        header_area,
+        path_area,
+        base_box_area,
+        key_box_area,
+        backend_box_area,
+        status_area,
+        hint_area,
+    ] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(3),
+        Constraint::Length(3),
+        Constraint::Length(3),
+        Constraint::Length(1),
+        Constraint::Min(0),
+    ])
+    .areas(content_area);
+
+    Paragraph::new(Line::from(Span::styled(
+        "Configure Grok API",
+        Style::default().fg(theme.gray_bright),
+    )))
+    .alignment(Alignment::Center)
+    .render(header_area, buf);
+    Paragraph::new(
+        Line::from(vec![
+            Span::styled("~/.grok/config.toml  ", Style::default().fg(theme.gray)),
+            Span::styled(
+                format!("[model.\"{}\"]", xai_grok_shell::models::default_model()),
+                Style::default().fg(theme.text_primary),
+            ),
+        ])
+        .alignment(Alignment::Center),
+    )
+    .render(path_area, buf);
+
+    let base_focused = params.api_configuration_field == ApiConfigurationField::BaseUrl
+        && params.api_configuration_status == ApiConfigurationStatus::Editing;
+    let base_cursor = render_configuration_input_box_with_label(
+        base_box_area,
+        buf,
+        &theme,
+        params.api_base_url_input,
+        params.api_base_url_cursor_byte,
+        base_focused,
+        false,
+        "Enter base URL...",
+        Some("base_url"),
+    );
+
+    let key_focused = params.api_configuration_field == ApiConfigurationField::ApiKey
+        && params.api_configuration_status == ApiConfigurationStatus::Editing;
+    let key_cursor = render_configuration_input_box_with_label(
+        key_box_area,
+        buf,
+        &theme,
+        params.api_key_input,
+        params.api_key_cursor_byte,
+        key_focused,
+        true,
+        "Enter API key...",
+        Some("api_key"),
+    );
+
+    let backend_focused = params.api_configuration_field == ApiConfigurationField::ApiBackend
+        && params.api_configuration_status == ApiConfigurationStatus::Editing;
+    render_configuration_backend_box_with_label(
+        backend_box_area,
+        buf,
+        &theme,
+        params.api_configuration_backend.clone(),
+        backend_focused,
+        Some("api_backend"),
+    );
+
+    let (status, status_color) = if let Some(error) = params.api_configuration_error {
+        (error, theme.accent_error)
+    } else {
+        match params.api_configuration_status {
+            ApiConfigurationStatus::Editing => ("Enter to apply configuration", theme.gray),
+            ApiConfigurationStatus::Saving => ("Saving configuration...", theme.gray_bright),
+            ApiConfigurationStatus::Reloading => ("Applying configuration...", theme.gray_bright),
+        }
+    };
+    Paragraph::new(Line::from(Span::styled(
+        status,
+        Style::default().fg(status_color),
+    )))
+    .alignment(Alignment::Center)
+    .render(status_area, buf);
+    Paragraph::new(
+        Line::from(Span::styled(
+            "tab / arrows fields  ·  left/right backend  ·  enter apply  ·  esc quit",
+            Style::default().fg(theme.gray),
+        ))
+        .alignment(Alignment::Center),
+    )
+    .render(hint_area, buf);
+
+    let cursor_pos = if base_focused {
+        base_cursor
+    } else if key_focused {
+        key_cursor
+    } else {
+        None
+    };
+    (cursor_pos, Vec::new(), Some(backend_box_area), None)
+}
+
+fn api_backend_label(backend: ApiBackend) -> &'static str {
+    match backend {
+        ApiBackend::ChatCompletions => "Chat Completions",
+        ApiBackend::Responses => "Responses",
+        ApiBackend::Messages => "Anthropic Messages",
+    }
+}
+
+fn render_configuration_backend_box(
+    area: Rect,
+    buf: &mut Buffer,
+    theme: &Theme,
+    backend: ApiBackend,
+    focused: bool,
+) {
+    render_configuration_backend_box_with_label(area, buf, theme, backend, focused, None);
+}
+
+fn render_configuration_backend_box_with_label(
+    area: Rect,
+    buf: &mut Buffer,
+    theme: &Theme,
+    backend: ApiBackend,
+    focused: bool,
+    label: Option<&str>,
+) {
+    let border_color = if focused {
+        theme.accent_user
+    } else {
+        theme.gray_dim
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(border_color));
+    let inner = block.inner(area);
+    block.render(area, buf);
+    render_configuration_box_label(area, buf, theme, label);
+    if inner.height == 0 || inner.width == 0 {
+        return;
+    }
+    let line = Line::from(vec![
+        Span::styled("< ", Style::default().fg(theme.accent_user)),
+        Span::styled(
+            api_backend_label(backend),
+            Style::default().fg(theme.text_primary),
+        ),
+        Span::styled(" >", Style::default().fg(theme.accent_user)),
+    ])
+    .alignment(Alignment::Center);
+    Paragraph::new(line).render(inner, buf);
+}
+
+/// Render a single-line API configuration field and return its terminal cursor.
+fn render_configuration_input_box(
+    area: Rect,
+    buf: &mut Buffer,
+    theme: &Theme,
+    input: &str,
+    cursor_byte: usize,
+    focused: bool,
+    masked: bool,
+    placeholder: &str,
+) -> Option<(u16, u16)> {
+    render_configuration_input_box_with_label(
+        area,
+        buf,
+        theme,
+        input,
+        cursor_byte,
+        focused,
+        masked,
+        placeholder,
+        None,
+    )
+}
+
+fn render_configuration_input_box_with_label(
+    area: Rect,
+    buf: &mut Buffer,
+    theme: &Theme,
+    input: &str,
+    cursor_byte: usize,
+    focused: bool,
+    masked: bool,
+    placeholder: &str,
+    label: Option<&str>,
+) -> Option<(u16, u16)> {
+    let border_color = if focused {
+        theme.accent_user
+    } else {
+        theme.gray_dim
+    };
+    let input_block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(border_color))
+        .padding(Padding {
+            left: 2,
+            right: 1,
+            top: 0,
+            bottom: 0,
+        });
+    let inner = input_block.inner(area);
+    input_block.render(area, buf);
+    render_configuration_box_label(area, buf, theme, label);
+    if inner.height == 0 || inner.width <= 2 {
+        return None;
+    }
+
+    let prompt = crate::glyphs::prompt_arrow();
+    let prompt_width = prompt.width() as u16;
+    let input_width = inner.width.saturating_sub(prompt_width) as usize;
+    let (display, cursor_column) = if input.is_empty() {
+        (placeholder.to_owned(), 0)
+    } else if masked {
+        masked_secret_view(input, cursor_byte, input_width)
+    } else {
+        let buffer = xai_ratatui_textarea::EditBuffer::from_parts(input, cursor_byte);
+        let viewport = buffer.single_line_viewport(input_width);
+        (
+            input[viewport.visible_byte_range].to_owned(),
+            viewport.cursor_display_column,
+        )
+    };
+    let text_style = if input.is_empty() {
+        Style::default().fg(theme.gray_dim)
+    } else if masked {
+        Style::default().fg(theme.accent_user)
+    } else {
+        Style::default().fg(theme.text_primary)
+    };
+    let line = Line::from(vec![
+        Span::styled(prompt, Style::default().fg(theme.accent_user)),
+        Span::styled(display, text_style),
+    ]);
+    buf.set_line(inner.x, inner.y, &line, inner.width);
+    if focused && input_width > 0 {
+        let cursor_x = inner.x + prompt_width + cursor_column as u16;
+        if let Some(cell) = buf.cell_mut((cursor_x, inner.y)) {
+            cell.set_style(Style::default().fg(theme.bg_base).bg(theme.text_primary));
+        }
+        return Some((cursor_x, inner.y));
+    }
+    None
+}
+
+fn render_configuration_box_label(
+    area: Rect,
+    buf: &mut Buffer,
+    theme: &Theme,
+    label: Option<&str>,
+) {
+    let Some(label) = label else {
+        return;
+    };
+    let title = Line::from(Span::styled(
+        format!(" {label} "),
+        Style::default().fg(theme.gray_bright),
+    ));
+    buf.set_line(
+        area.x.saturating_add(2),
+        area.y,
+        &title,
+        area.width.saturating_sub(4),
+    );
 }
 
 /// Render the folder-trust question. Mirrors [`render_welcome_blocked`]'s
@@ -2236,6 +2740,7 @@ fn render_welcome_done(
         } else {
             Some(layout.prompt)
         },
+        api_configuration_backend_rect: None,
         session_picker_hit_areas: picker_close_button,
         import_banner_rect,
         auth_url_rect: None,
@@ -2682,6 +3187,23 @@ fn masked_auth_token_view(input: &str, cursor_byte: usize, width: usize) -> (Str
     )
 }
 
+/// Mask a configuration secret completely while keeping the caret and narrow
+/// terminal viewport aligned with the unmasked input.
+fn masked_secret_view(input: &str, cursor_byte: usize, width: usize) -> (String, usize) {
+    let cursor_text = input.get(..cursor_byte).unwrap_or(input);
+    let display = input
+        .graphemes(true)
+        .map(|_| '\u{2022}')
+        .collect::<String>();
+    let cursor_byte = cursor_text.graphemes(true).count() * '\u{2022}'.len_utf8();
+    let buffer = xai_ratatui_textarea::EditBuffer::from_parts(&display, cursor_byte);
+    let viewport = buffer.single_line_viewport(width);
+    (
+        display[viewport.visible_byte_range].to_owned(),
+        viewport.cursor_display_column,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2731,6 +3253,18 @@ mod tests {
         let masked = build_masked_auth_token(input, input.len()).display;
         assert!(masked.starts_with("••••"));
         assert!(masked.contains("\u{2022}"));
+    }
+
+    #[test]
+    fn masked_secret_hides_the_entire_configuration_value() {
+        let (view, cursor_column) = masked_secret_view("xai-test-secret", 15, 40);
+        assert_eq!(view, "\u{2022}".repeat(15));
+        assert_eq!(cursor_column, 15);
+
+        let (view, cursor_column) = masked_secret_view("xai-test-secret", 8, 5);
+        assert_eq!(view, "•••••");
+        assert!(cursor_column < 5);
+        assert!(!view.contains("xai"));
     }
 
     #[test]
@@ -2815,6 +3349,14 @@ mod tests {
             login_label: None,
             auth_code_input: "",
             auth_code_cursor_byte: 0,
+            api_base_url_input: "https://api.x.ai/v1",
+            api_base_url_cursor_byte: "https://api.x.ai/v1".len(),
+            api_key_input: "",
+            api_key_cursor_byte: 0,
+            api_configuration_backend: ApiBackend::default(),
+            api_configuration_field: ApiConfigurationField::BaseUrl,
+            api_configuration_status: ApiConfigurationStatus::Editing,
+            api_configuration_error: None,
             clipboard_delivery: None,
             show_raw_url: false,
             announcement: None,
@@ -2864,12 +3406,56 @@ mod tests {
     }
 
     fn render_done_text(params: &WelcomeRenderParams<'_>) -> String {
-        let area = Rect::new(0, 0, 100, 40);
+        render_welcome_text(params, Rect::new(0, 0, 100, 40))
+    }
+
+    fn render_welcome_text(params: &WelcomeRenderParams<'_>, area: Rect) -> String {
         let mut buf = Buffer::empty(area);
         let mut prompt = PromptWidget::new();
         let mut picker = PickerState::default();
         render_welcome(area, &mut buf, params, &mut prompt, &mut picker);
         buffer_text(&buf)
+    }
+
+    #[test]
+    fn configuration_required_welcome_shows_api_setup_not_connecting() {
+        let auth = AuthState::ConfigRequired;
+        let trust = TrustState::Done;
+        let params = render_params(&auth, &trust, None);
+        let text = render_done_text(&params);
+
+        assert!(text.contains("Configure Grok API"), "{text}");
+        assert!(text.contains("base_url"), "{text}");
+        assert!(text.contains("https://api.x.ai/v1"), "{text}");
+        assert!(
+            text.contains(&format!(
+                "[model.\"{}\"]",
+                xai_grok_shell::models::default_model()
+            )),
+            "{text}"
+        );
+        assert!(text.contains("api_key"), "{text}");
+        assert!(text.contains("Enter API key..."), "{text}");
+        assert!(text.contains("Enter to apply configuration"), "{text}");
+        assert!(!text.contains("Connecting..."), "{text}");
+        assert!(!text.contains("Login with"), "{text}");
+    }
+
+    #[test]
+    fn configuration_required_welcome_keeps_backend_visible_on_small_terminal() {
+        let auth = AuthState::ConfigRequired;
+        let trust = TrustState::Done;
+        let mut params = render_params(&auth, &trust, None);
+        params.api_base_url_input = "https://proxy.example/v1";
+        params.api_configuration_backend = ApiBackend::Responses;
+        params.api_configuration_field = ApiConfigurationField::ApiBackend;
+        params.api_key_input = "xai-test-secret";
+        let text = render_welcome_text(&params, Rect::new(0, 0, 80, 20));
+
+        assert!(text.contains("base_url"), "{text}");
+        assert!(text.contains("api_key"), "{text}");
+        assert!(text.contains("api_backend"), "{text}");
+        assert!(text.contains("Responses"), "{text}");
     }
 
     #[test]

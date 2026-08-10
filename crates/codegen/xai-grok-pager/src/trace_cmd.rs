@@ -427,7 +427,7 @@ async fn run_upload(
                 "trace_cmd: no upload credentials available"
             );
             anyhow::bail!(
-                "No upload credentials. Run `grok login` or set a deployment key. \
+                "No API key configured. Set api_key in ~/.grok/config.toml. \
                  See {} for upload overrides.",
                 crate::util::display_user_grok_path("docs/user-guide")
             );
@@ -642,18 +642,11 @@ async fn upload_with_retries(
 
 pub async fn resolve_upload_method(agent_config: &AgentConfig) -> Option<UploadMethod> {
     // On login failure, fall back to ambient creds rather than erroring.
-    let auth_token = xai_grok_shell::auth::ensure_authenticated_or_noninteractive(
-        &agent_config.grok_com_config,
-        agent_config.endpoints.has_noninteractive_upload_auth(),
-        Some("Authentication required for trace upload."),
-    )
-    .await
-    .inspect_err(
-        |e| tracing::info!(error = %e, "trace_cmd: auth failed, trying ambient credentials"),
-    )
-    .ok()
-    .flatten()
-    .map(|auth| auth.key);
+    let auth = xai_grok_shell::auth::try_ensure_fresh_auth(&agent_config.grok_com_config).await;
+    if auth.is_none() {
+        tracing::info!("trace_cmd: auth failed, trying ambient credentials");
+    }
+    let auth_token = auth.map(|a| a.key);
 
     let method = agent_config.endpoints.resolve_upload_method(auth_token);
     if method.is_none() {

@@ -648,13 +648,13 @@ pub struct RuntimeResolutionContext<'a> {
 /// environment so it can't inherit the keys Grok uses for its own first-party
 /// requests. Keep in sync with every first-party credential env read across the
 /// crate: `auth::manager` (`GROK_AUTH`/`GROK_AUTH_PATH`), `auth_method`
-/// (`XAI_API_KEY`/legacy), and the credential-bearing `env_string(...)` reads in
+/// (per-model credentials), and the credential-bearing `env_string(...)` reads in
 /// `EndpointsConfig::default`. The `provider_helper_env_scrubs_first_party_credentials`
 /// test pins this against an independent audited literal, so any change here must
 /// be mirrored (and re-audited) there.
 pub(crate) const FIRST_PARTY_CREDENTIAL_ENV_VARS: &[&str] = &[
-    crate::agent::auth_method::XAI_API_KEY_ENV_VAR,
-    crate::agent::auth_method::LEGACY_XAI_API_KEY_ENV_VAR,
+    "XAI_API_KEY",
+    "GROK_CODE_XAI_API_KEY",
     "GROK_AUTH",
     "GROK_AUTH_PATH",
     "GROK_DEPLOYMENT_KEY",
@@ -3794,7 +3794,7 @@ fn default_models(endpoints: &EndpointsConfig) -> IndexMap<String, ModelEntryCon
                 temperature: m.temperature,
                 top_p: m.top_p,
                 max_completion_tokens: m.max_completion_tokens,
-                api_backend: m.api_backend,
+                api_backend: Some(m.api_backend),
                 auth_scheme: None,
                 agent_type: m.agent_type,
                 inference_idle_timeout_secs: m.inference_idle_timeout_secs,
@@ -3841,18 +3841,18 @@ pub struct ModelEntryConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub top_p: Option<f32>,
     /// The API key for this model's provider.
-    /// If not set, falls back to env_key, then XAI_API_KEY.
+    /// If not set, falls back to env_key.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub api_key: Option<String>,
     /// Environment variable name(s) that hold the provider API key.
     /// Accepts a string or an array (first set, non-empty value wins).
-    /// If not set, falls back to XAI_API_KEY.
+    /// If not set, no API key is used for this model.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub env_key: Option<EnvKeys>,
-    /// Which API backend to use for this model.
-    /// Values: "chat_completions" (default), "responses"
+    /// Which API backend to use for this model, when the source specified one.
+    /// An omitted value is resolved to the source's default backend later.
     #[serde(default)]
-    pub api_backend: ApiBackend,
+    pub api_backend: Option<ApiBackend>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_scheme: Option<AuthScheme>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -4243,7 +4243,7 @@ impl ModelInfo {
             max_completion_tokens: entry.max_completion_tokens,
             temperature: entry.temperature,
             top_p: entry.top_p,
-            api_backend: entry.api_backend.clone(),
+            api_backend: entry.api_backend.clone().unwrap_or_default(),
             auth_scheme: entry.auth_scheme.unwrap_or_default(),
             extra_headers: entry.extra_headers.clone(),
             query_params: IndexMap::new(),
@@ -4340,7 +4340,7 @@ impl ModelEntry {
         }
     }
     /// Non-empty `api_key`, else first non-empty resolved `env_key`.
-    /// `None` → fall through to session / global key. Static only: never
+    /// `None` → fall through to session credentials. Static only: never
     /// consults auth-provider tokens.
     pub(crate) fn own_credential(&self) -> Option<String> {
         first_own_credential(self.api_key.as_deref(), self.env_key.as_ref())
@@ -4752,24 +4752,31 @@ pub(crate) fn first_own_credential(
         .map(str::to_owned)
         .or_else(|| env_key.and_then(EnvKeys::resolve_value))
 }
-/// Priority: model api_key/env_key > cached auth-provider token > session
-/// token > XAI_API_KEY.
+/// Priority: model api_key/env_key > cached auth-provider token > session token.
 pub(crate) fn resolve_credentials(
     model: &ModelEntry,
     session_key: Option<&str>,
 ) -> ResolvedCredentials {
     let info = model.info();
+    // Built-in models can have separate session and API-key endpoints. A
+    // user-provided `base_url` clears the inherited `api_base_url`, so this
+    // remains the model's effective endpoint for normal BYOK entries too.
+    let api_key_base_url = model
+        .api_base_url
+        .as_deref()
+        .unwrap_or(&info.base_url)
+        .to_owned();
     let (api_key, base_url, auth_type) = if let Some(key) = model.own_credential() {
         (
             Some(key),
-            info.base_url.clone(),
+            api_key_base_url.clone(),
             xai_chat_state::AuthType::ApiKey,
         )
     } else if let Some(provider) = model.auth_provider.as_ref() {
         debug_assert!(model.effective_auth_provider().is_some());
         (
             provider.cached_token(),
-            info.base_url.clone(),
+            api_key_base_url.clone(),
             xai_chat_state::AuthType::ApiKey,
         )
     } else if let Some(key) = session_key {
@@ -4778,12 +4785,6 @@ pub(crate) fn resolve_credentials(
             info.base_url.clone(),
             xai_chat_state::AuthType::SessionToken,
         )
-    } else if let Ok(key) = crate::agent::auth_method::read_xai_api_key_env() {
-        let url = model
-            .api_base_url
-            .clone()
-            .unwrap_or_else(|| info.base_url.clone());
-        (Some(key), url, xai_chat_state::AuthType::ApiKey)
     } else {
         if let Some(ref env_keys) = model.env_key
             && !env_keys.is_empty()
@@ -4983,7 +4984,6 @@ pub(crate) fn resolve_aux_model_sampling_config(
     }
     let xai_bearer = session_key
         .map(|s| s.to_owned())
-        .or_else(|| crate::agent::auth_method::read_xai_api_key_env().ok())
         .or_else(|| endpoints.deployment_key.clone());
     if let Some(bearer) = xai_bearer {
         let entry = ModelEntry {
@@ -6695,25 +6695,6 @@ reasoning_effort = "low"
     }
     #[test]
     #[serial]
-    fn resolve_credentials_empty_env_key_falls_through_to_global_key() {
-        use crate::agent::auth_method::{LEGACY_XAI_API_KEY_ENV_VAR, XAI_API_KEY_ENV_VAR};
-        use xai_chat_state::AuthType;
-        use xai_grok_test_support::EnvGuard;
-        let sentinel = "xai-global-sentinel-key";
-        let primary = "GROK_TEST_EMPTY_ENV_GLOBAL_PRIMARY";
-        let alias = "GROK_TEST_EMPTY_ENV_GLOBAL_ALIAS";
-        let _primary = EnvGuard::set(primary, "");
-        let _alias = EnvGuard::set(alias, "");
-        let _global = EnvGuard::set(XAI_API_KEY_ENV_VAR, sentinel);
-        let _legacy = EnvGuard::unset(LEGACY_XAI_API_KEY_ENV_VAR);
-        let mut model = test_model_entry("m", "https://inference.example/v1", None, None, None);
-        model.env_key = Some(EnvKeys::new([primary, alias]));
-        assert!(!model.has_own_credentials());
-        let creds = resolve_credentials(&model, None);
-        assert_eq!(creds.auth_type, AuthType::ApiKey);
-        assert_eq!(creds.api_key.as_deref(), Some(sentinel));
-    }
-    #[test]
     fn resolve_credentials_empty_api_key_falls_through_to_session() {
         use xai_chat_state::AuthType;
         let model = test_model_entry("m", "https://inference.example/v1", Some(""), None, None);
@@ -7455,7 +7436,7 @@ reasoning_effort = "low"
             top_p: None,
             api_key: None,
             env_key: None,
-            api_backend: ApiBackend::default(),
+            api_backend: None,
             auth_scheme: None,
             extra_headers: IndexMap::new(),
             context_window: NonZeroU64::new(200_000).unwrap(),
@@ -7614,7 +7595,7 @@ reasoning_effort = "low"
             top_p: None,
             api_key: None,
             env_key: None,
-            api_backend: ApiBackend::default(),
+            api_backend: None,
             auth_scheme: None,
             extra_headers: IndexMap::new(),
             context_window: NonZeroU64::new(200_000).unwrap(),
@@ -8065,7 +8046,7 @@ reasoning_effort = "low"
             top_p: None,
             api_key: None,
             env_key: None,
-            api_backend: ApiBackend::default(),
+            api_backend: None,
             auth_scheme: None,
             extra_headers: IndexMap::new(),
             context_window: NonZeroU64::new(200_000).unwrap(),
@@ -8327,19 +8308,37 @@ reasoning_effort = "low"
                 r#"
             [model."{dm}"]
             base_url = "https://inference.example.com/v1"
+            api_key = "configured-api-key"
             "#,
             ),
             None,
         );
         let model = models.get(dm).expect("model should exist");
         let sampling = resolve_sampling(model, Some("session-tok"));
+        assert_eq!(sampling.api_key.as_deref(), Some("configured-api-key"));
         assert_eq!(sampling.base_url, "https://inference.example.com/v1");
-        unsafe { std::env::set_var("XAI_API_KEY", "xai-key") };
+    }
+    #[test]
+    fn e2e_onboarding_override_routes_initial_default_to_chat_api() {
+        let dm = crate::models::default_model();
+        let (_, models) = resolve_models_from_toml(
+            &format!(
+                r#"
+            [model."{dm}"]
+            base_url = "https://api.example/v1"
+            api_key = "onboarding-api-key"
+            api_backend = "chat_completions"
+            "#,
+            ),
+            None,
+        );
+        let model = models
+            .get(dm)
+            .expect("onboarding must configure the initially selected model");
         let sampling = resolve_sampling(model, None);
-        assert_eq!(sampling.base_url, "https://inference.example.com/v1");
-        unsafe { std::env::remove_var("XAI_API_KEY") };
-        let sampling = resolve_sampling(model, None);
-        assert_eq!(sampling.base_url, "https://inference.example.com/v1");
+        assert_eq!(sampling.api_key.as_deref(), Some("onboarding-api-key"));
+        assert_eq!(sampling.base_url, "https://api.example/v1");
+        assert_eq!(sampling.api_backend, ApiBackend::ChatCompletions);
     }
     #[test]
     fn e2e_user_overrides_default_model_with_api_key() {
@@ -8441,18 +8440,23 @@ reasoning_effort = "low"
     #[test]
     #[serial]
     fn e2e_default_model_with_external_api_key_routes_to_api_xai() {
-        let (_, models) = resolve_models_from_toml("", None);
-        let model = models
-            .get(crate::models::default_model())
-            .expect("default model should exist");
-        unsafe { std::env::set_var("XAI_API_KEY", "xai-external-key") };
+        let dm = crate::models::default_model();
+        let (_, models) = resolve_models_from_toml(
+            &format!(
+                r#"
+            [model."{dm}"]
+            api_key = "xai-external-key"
+            "#,
+            ),
+            None,
+        );
+        let model = models.get(dm).expect("default model should exist");
         let sampling = resolve_sampling(model, None);
         assert_eq!(sampling.api_key.as_deref(), Some("xai-external-key"));
         assert_eq!(
             sampling.base_url, "https://api.x.ai/v1",
             "external API key should route to api.x.ai via api_base_url"
         );
-        unsafe { std::env::remove_var("XAI_API_KEY") };
     }
     #[test]
     fn e2e_user_config_overrides_prefetched_model() {
@@ -8489,7 +8493,7 @@ reasoning_effort = "low"
     }
     #[test]
     #[serial]
-    fn e2e_credential_priority_model_key_beats_session_beats_env() {
+    fn e2e_credential_priority_model_key_session_and_env_key() {
         let model_with_key = test_model_entry(
             "test",
             "https://custom.api/v1",
@@ -8497,7 +8501,6 @@ reasoning_effort = "low"
             None,
             None,
         );
-        unsafe { std::env::set_var("XAI_API_KEY", "env-key") };
         let sampling = resolve_sampling(&model_with_key, Some("session-key"));
         assert_eq!(
             sampling.api_key.as_deref(),
@@ -8519,23 +8522,36 @@ reasoning_effort = "low"
         assert_eq!(
             sampling.api_key.as_deref(),
             Some("session-key"),
-            "session token should beat env key when model has no own credentials"
+            "session token should be used when the model has no own credentials"
         );
         assert_eq!(
             sampling.base_url, "https://proxy.api/v1",
             "session auth should use base_url, not api_base_url"
         );
-        let sampling = resolve_sampling(&model_no_key, None);
+
+        let model_with_env_key = test_model_entry(
+            "test",
+            "https://proxy.api/v1",
+            None,
+            Some("GROK_TEST_CREDENTIAL_PRIORITY_ENV"),
+            Some("https://api.x.ai/v1"),
+        );
+        unsafe {
+            std::env::set_var("GROK_TEST_CREDENTIAL_PRIORITY_ENV", "env-key");
+        }
+        let sampling = resolve_sampling(&model_with_env_key, Some("session-key"));
         assert_eq!(
             sampling.api_key.as_deref(),
             Some("env-key"),
-            "env key should be used when no session and no model credentials"
+            "model env_key should beat the session token"
         );
         assert_eq!(
             sampling.base_url, "https://api.x.ai/v1",
-            "env key should route to api_base_url"
+            "API-key auth should use api_base_url"
         );
-        unsafe { std::env::remove_var("XAI_API_KEY") };
+        unsafe {
+            std::env::remove_var("GROK_TEST_CREDENTIAL_PRIORITY_ENV");
+        }
         let sampling = resolve_sampling(&model_no_key, None);
         assert!(
             sampling.api_key.is_none(),
@@ -8682,8 +8698,8 @@ reasoning_effort = "low"
             "model's own api_key must beat session token"
         );
         assert_eq!(
-            sampling.base_url, "https://enterprise-proxy.acme.com/v1",
-            "sampling must route to enterprise proxy"
+            sampling.base_url, "https://enterprise-api.acme.com/v1",
+            "API-key sampling must route to the enterprise API endpoint"
         );
     }
     #[test]

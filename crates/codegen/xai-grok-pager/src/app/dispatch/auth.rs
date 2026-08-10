@@ -325,6 +325,99 @@ pub(super) fn dispatch_submit_auth_code(app: &mut AppView, code: String) -> Vec<
     vec![Effect::SubmitAuthCode { request_seq, code }]
 }
 
+/// Validate and persist the API configuration submitted by the first-run
+/// welcome form. The secret is copied only into the effect payload; the action
+/// itself carries no user-entered data.
+pub(super) fn dispatch_submit_api_configuration(app: &mut AppView) -> Vec<Effect> {
+    if !matches!(app.auth_state, AuthState::ConfigRequired)
+        || !matches!(
+            app.api_configuration_status,
+            crate::app::app_view::ApiConfigurationStatus::Editing
+        )
+    {
+        return vec![];
+    }
+
+    let base_url = app.api_base_url_input.text().trim().to_owned();
+    if base_url.is_empty() {
+        app.api_configuration_field = crate::app::app_view::ApiConfigurationField::BaseUrl;
+        app.api_configuration_error = Some("base_url is required".to_owned());
+        return vec![];
+    }
+    let api_key = app.api_key_input.text().trim().to_owned();
+    if api_key.is_empty() {
+        app.api_configuration_field = crate::app::app_view::ApiConfigurationField::ApiKey;
+        app.api_configuration_error = Some("api_key is required".to_owned());
+        return vec![];
+    }
+
+    app.api_base_url_input.set_text(&base_url);
+    app.api_key_input.set_text(&api_key);
+    app.api_configuration_error = None;
+    app.api_configuration_status = crate::app::app_view::ApiConfigurationStatus::Saving;
+    vec![Effect::PersistApiConfiguration {
+        base_url,
+        api_key: crate::app::actions::SecretString::new(api_key),
+        api_backend: app.api_configuration_backend.clone(),
+    }]
+}
+
+/// Continue the API configuration pipeline after the blocking file write.
+pub(super) fn handle_api_configuration_persisted(
+    app: &mut AppView,
+    result: Result<(), String>,
+) -> Vec<Effect> {
+    if !matches!(app.auth_state, AuthState::ConfigRequired) {
+        return vec![];
+    }
+    match result {
+        Ok(()) => {
+            app.api_configuration_error = None;
+            app.api_configuration_status = crate::app::app_view::ApiConfigurationStatus::Reloading;
+            vec![Effect::ReloadApiConfiguration]
+        }
+        Err(error) => {
+            app.api_configuration_status = crate::app::app_view::ApiConfigurationStatus::Editing;
+            app.api_configuration_error = Some(format!("Couldn't save API configuration: {error}"));
+            vec![]
+        }
+    }
+}
+
+/// Finish the API configuration pipeline after the shell has rebuilt its model
+/// list and static API-key state.
+pub(super) fn handle_api_configuration_reloaded(
+    app: &mut AppView,
+    result: Result<(), String>,
+) -> Vec<Effect> {
+    if !matches!(app.auth_state, AuthState::ConfigRequired) {
+        return vec![];
+    }
+    match result {
+        Ok(()) => {
+            app.auth_state = AuthState::Done;
+            app.api_configuration_status = crate::app::app_view::ApiConfigurationStatus::Editing;
+            app.api_configuration_error = None;
+            app.is_api_key_auth = true;
+            app.usage_visible = false;
+            app.sync_billing_surface_to_agents();
+            app.ensure_voice_for_api_key();
+            app.welcome_prompt_focused = true;
+            if app.session_startup_allowed() {
+                drain_startup_actions(app)
+            } else {
+                vec![]
+            }
+        }
+        Err(error) => {
+            app.api_configuration_status = crate::app::app_view::ApiConfigurationStatus::Editing;
+            app.api_configuration_error =
+                Some(format!("Saved configuration, but reload failed: {error}"));
+            vec![]
+        }
+    }
+}
+
 // TaskResult handlers.
 
 pub(super) fn handle_auth_complete(

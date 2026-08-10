@@ -473,7 +473,11 @@ pub struct ChatCompletionResponse {
 pub struct ChatChoice {
     pub index: u32,
     pub message: ChatResponseMessage,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "crate::serde_helpers::empty_string_as_none"
+    )]
     pub finish_reason: Option<FinishReason>,
 }
 
@@ -590,7 +594,11 @@ pub struct ChatCompletionChunk {
 pub struct ChatChunkChoice {
     pub index: u32,
     pub delta: ChatChunkDelta,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "crate::serde_helpers::empty_string_as_none"
+    )]
     pub finish_reason: Option<FinishReason>,
 }
 
@@ -1216,6 +1224,53 @@ impl From<crate::messages::MessagesRequest> for MessagesRequestWrapper {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn empty_finish_reason_is_treated_as_absent() {
+        let chunk: ChatCompletionChunk = serde_json::from_value(json!({
+            "id": "chunk-1",
+            "object": "chat.completion.chunk",
+            "created": 0,
+            "model": "test-model",
+            "choices": [{
+                "index": 0,
+                "delta": {"content": "hello"},
+                "finish_reason": ""
+            }]
+        }))
+        .expect("empty finish_reason should be accepted");
+        assert_eq!(chunk.choices[0].finish_reason, None);
+
+        let response: ChatCompletionResponse = serde_json::from_value(json!({
+            "id": "completion-1",
+            "object": "chat.completion",
+            "created": 0,
+            "model": "test-model",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "hello"},
+                "finish_reason": ""
+            }]
+        }))
+        .expect("empty finish_reason should be accepted in non-streaming responses");
+        assert_eq!(response.choices[0].finish_reason, None);
+    }
+
+    #[test]
+    fn finish_reason_still_rejects_unknown_non_empty_values() {
+        let result = serde_json::from_value::<ChatCompletionChunk>(json!({
+            "id": "chunk-1",
+            "object": "chat.completion.chunk",
+            "created": 0,
+            "model": "test-model",
+            "choices": [{
+                "index": 0,
+                "delta": {},
+                "finish_reason": "unexpected"
+            }]
+        }));
+        assert!(result.is_err());
+    }
 
     #[test]
     fn reasoning_effort_serde_lowercase_round_trip() {
