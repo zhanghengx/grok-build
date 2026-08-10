@@ -180,7 +180,7 @@ This shows:
 
 - Session title (when set)
 - Shell version
-- Auth method (OAuth vs API key; API-key sessions also suggest `grok login` for SuperGrok)
+- Auth method (API key)
 - Session ID
 - Working directory
 - Model (with a model hash for coding models)

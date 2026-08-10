@@ -189,14 +189,12 @@ pub fn xai_oauth2_issuer() -> &'static str {
 pub fn is_xai_oauth2_issuer(issuer: &str) -> bool {
     issuer == XAI_OAUTH2_ISSUER || issuer == XAI_OAUTH2_LOCAL_ISSUER
 }
-/// auth.json scope key used by the pre-OIDC `grok login --legacy` flow.
+/// auth.json scope key used by the pre-OIDC legacy relay flow.
 /// Matches the key format produced by the original `accounts.x.ai` relay auth.
 pub(crate) const LEGACY_AUTH_SCOPE: &str = "https://accounts.x.ai/sign-in";
 impl GrokComConfig {
-    /// Whether `xai.api_key` auth is disabled. Pinning a team
-    /// (`force_login_team_uuid`) implies this — team membership can't be verified
-    /// from a bare API key, so it must go through IdP login. The
-    /// `GROK_DISABLE_API_KEY_AUTH` env lockdown is sticky: because the env value
+    /// Whether `xai.api_key` auth is disabled by configuration.
+    /// The `GROK_DISABLE_API_KEY_AUTH` env lockdown is sticky: because the env value
     /// seeds `default()` (the merge base), a lower-trust user `config.toml` could
     /// otherwise set `disable_api_key_auth = false` and override it — so the env
     /// is OR-ed in here and cannot be turned back off by a user layer. Trusted
@@ -206,10 +204,9 @@ impl GrokComConfig {
             || self.force_login_team_uuid.is_some()
             || env_lockdown_forced()
     }
-    /// When `preferred_method = api_key`, automatic OIDC paths (devbox mint,
-    /// interactive browser login, external auth provider) must not run — the
-    /// pin is fail-closed. Explicit `grok login --devbox` / `--api-key` bypass
-    /// this by not consulting automatic flow helpers.
+    /// Retained for infrastructure compatibility. In API-key-only mode, automatic
+    /// OIDC paths are not used; per-model `api_key` / `env_key` in config.toml is
+    /// the only auth method.
     pub(crate) fn blocks_automatic_oidc(&self) -> bool {
         matches!(self.preferred_method, Some(PreferredAuthMethod::ApiKey))
     }

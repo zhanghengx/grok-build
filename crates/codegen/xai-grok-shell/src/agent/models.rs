@@ -16,7 +16,7 @@ use crate::auth::{AuthManager, GrokAuth, GrokComConfig};
 use crate::remote::{FetchModelsResult, fetch_models_blocking};
 use crate::sampling::SamplerConfig as SamplingConfig;
 use globset::{Glob, GlobSet, GlobSetBuilder};
-use xai_grok_sampling_types::{ReasoningEffort, ReasoningEffortOption};
+use xai_grok_sampling_types::{ApiBackend, ReasoningEffort, ReasoningEffortOption};
 
 // ── Auth method for model fetching ──────────────────────────────────────────
 
@@ -38,8 +38,6 @@ impl ModelFetchAuth {
             Self::Session
         } else if endpoints.deployment_key.is_some() {
             Self::Deployment
-        } else if crate::agent::auth_method::has_xai_api_key_env() {
-            Self::ApiKey
         } else {
             Self::Session
         }
@@ -1139,6 +1137,147 @@ impl ModelsManager {
         });
     }
 
+    /// Resolve the model list: waits for or requests a catalog fetch.
+    pub async fn list_models(&self, strategy: RefreshStrategy) {
+        if strategy != RefreshStrategy::Offline && self.current_model_has_endpoint() {
+            // A model-scoped endpoint is authoritative for this configuration.
+            // Do not populate the picker from the global proxy and then leave
+            // the configured endpoint's model list unused.
+            self.refresh_current_model_endpoint().await;
+            return;
+        }
+        match strategy {
+            RefreshStrategy::Offline => {
+                self.wait_for_first_catalog().await;
+            }
+            RefreshStrategy::OnlineIfUncached => {
+                if !self.inner.catalog.read().has_fetched_real_catalog {
+                    self.fetch_and_apply().await;
+                }
+            }
+            RefreshStrategy::Online => {
+                self.fetch_and_apply().await;
+            }
+        }
+    }
+
+    fn current_model_has_endpoint(&self) -> bool {
+        let current = self.current_model_id();
+        let cfg = self.inner.cfg.read().clone();
+        let catalog = self.inner.catalog.read();
+        let Some((key, entry)) = catalog
+            .models
+            .get(current.0.as_ref())
+            .map(|entry| (current.0.as_ref(), entry))
+            .or_else(|| {
+                catalog
+                    .models
+                    .iter()
+                    .find(|(_, entry)| entry.info.model == current.0.as_ref())
+                    .map(|(key, entry)| (key.as_str(), entry))
+            })
+        else {
+            return false;
+        };
+        let configured_endpoint = cfg.config_models.get(key).is_some_and(|model| {
+            model.base_url.is_some()
+                || model
+                    .model_provider
+                    .as_deref()
+                    .and_then(|provider| cfg.model_providers.get(provider))
+                    .is_some_and(|provider| provider.base_url.is_some())
+        });
+        configured_endpoint && entry.has_own_credentials()
+    }
+
+    /// Refresh the catalog from the current model's own OpenAI-compatible
+    /// `/models` endpoint. The request is skipped unless the model has a
+    /// model-owned credential, so a Grok session token cannot cross an
+    /// arbitrary `base_url` boundary.
+    pub(crate) async fn refresh_current_model_endpoint(&self) -> bool {
+        let Some(request) = self.model_endpoint_request().await else {
+            return false;
+        };
+        let cfg = self.inner.cfg.read().clone();
+        let endpoint = self.inner.endpoint.clone();
+        let models = match tokio::time::timeout(
+            crate::http::STARTUP_FETCH_TIMEOUT,
+            endpoint.fetch_model_endpoint(request),
+        )
+        .await
+        {
+            Ok(models) => models,
+            Err(_) => {
+                tracing::warn!("model-specific catalog fetch timed out");
+                None
+            }
+        };
+        let generation = self.inner.catalog.read().generation;
+        if !self.apply_refresh_result_fenced(&cfg, models, None, generation) {
+            return false;
+        }
+        tracing::info!("model-specific catalog refreshed");
+        self.notify_models_updated();
+        true
+    }
+
+    async fn model_endpoint_request(&self) -> Option<ModelEndpointRequest> {
+        if !self.current_model_has_endpoint() {
+            return None;
+        }
+        let current = self.current_model_id();
+        let entry = {
+            let catalog = self.inner.catalog.read();
+            catalog
+                .models
+                .get(current.0.as_ref())
+                .or_else(|| {
+                    catalog
+                        .models
+                        .values()
+                        .find(|entry| entry.info.model == current.0.as_ref())
+                })
+                .cloned()
+        }?;
+
+        let provider = entry.effective_auth_provider().cloned();
+        if let Some(provider) = &provider {
+            match provider.ensure_fresh_token(None).await {
+                crate::auth::ProviderRefreshOutcome::Unusable
+                | crate::auth::ProviderRefreshOutcome::MintFailed => return None,
+                crate::auth::ProviderRefreshOutcome::Unchanged
+                | crate::auth::ProviderRefreshOutcome::Rotated(_) => {}
+            }
+        }
+
+        let credentials = resolve_credentials(&entry, None);
+        let api_key = credentials.api_key?;
+        if !entry.has_own_credentials() {
+            return None;
+        }
+        let configured_api_key = entry
+            .api_key
+            .as_deref()
+            .filter(|key| !key.trim().is_empty())
+            .map(str::to_owned);
+        let configured_env_key = (configured_api_key.is_none())
+            .then(|| entry.env_key.clone())
+            .flatten();
+
+        Some(ModelEndpointRequest {
+            base_url: entry.info.base_url,
+            api_key,
+            api_backend: entry.info.api_backend,
+            auth_scheme: credentials.auth_scheme,
+            configured_api_key,
+            configured_env_key,
+            auth_provider: provider,
+            extra_headers: entry.info.extra_headers.clone(),
+            query_params: entry.info.query_params.clone(),
+            env_http_headers: entry.info.env_http_headers.clone(),
+        })
+    }
+
     async fn fetch_and_apply(&self) {
         self.fetch_and_apply_inner(crate::util::config::resolve_remote_fetch_enabled())
             .await
@@ -1344,6 +1483,19 @@ impl ModelsManager {
             self.set_current_model_id_internal(new_id);
         }
     }
+}
+
+// ── Refresh strategy ────────────────────────────────────────────────────────
+
+/// How to resolve the model list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefreshStrategy {
+    /// Always fetch from network, ignore cache.
+    Online,
+    /// Only use cached data, never fetch.
+    Offline,
+    /// Use cache if fresh, otherwise fetch.
+    OnlineIfUncached,
 }
 
 mod cache;

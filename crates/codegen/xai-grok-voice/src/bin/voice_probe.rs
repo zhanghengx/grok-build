@@ -43,7 +43,9 @@ async fn run() -> anyhow::Result<()> {
         .ok()
         .and_then(StaticVoiceAuth::shared)
         .ok_or_else(|| {
-            anyhow::anyhow!("set XAI_API_KEY (standalone probe has no login session)")
+            anyhow::anyhow!(
+                "configure api_key in config.toml (standalone probe has no login session)"
+            )
         })?;
 
     let config = load_config(args.config_path.as_deref());

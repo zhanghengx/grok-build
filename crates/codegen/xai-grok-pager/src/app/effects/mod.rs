@@ -2047,6 +2047,25 @@ pub(crate) fn execute(
                     }
                 });
         }
+        Effect::PersistApiConfiguration {
+            base_url,
+            api_key,
+            api_backend,
+        } => {
+            tasks.spawn(async move {
+                let result = tokio::task::spawn_blocking(move || {
+                    crate::config_toml_edit::set_model_configuration(
+                        &base_url,
+                        api_key.as_str(),
+                        api_backend,
+                    )
+                })
+                .await
+                .map_err(|error| format!("configuration write task failed: {error}"))
+                .and_then(|result| result.map_err(|error| error.to_string()));
+                TaskResult::ApiConfigurationPersisted { result }
+            });
+        }
         Effect::Authenticate {
             request_seq,
             method_id,
@@ -2146,6 +2165,21 @@ pub(crate) fn execute(
                         }
                     }
                 });
+        }
+        Effect::ReloadApiConfiguration => {
+            let tx = acp_tx.clone();
+            tasks.spawn(async move {
+                let request = acp::ExtRequest::new(
+                    "x.ai/internal/reload_models",
+                    serde_json::value::to_raw_value(&serde_json::json!({}))
+                        .expect("serialize model reload params")
+                        .into(),
+                );
+                let result = acp_send(request, &tx).await.map(|_| ()).map_err(|_| {
+                    "shell rejected API configuration reload".to_owned()
+                });
+                TaskResult::ApiConfigurationReloaded { result }
+            });
         }
         Effect::FetchMcpsList { agent_id, session_id, cache } => {
             let tx = acp_tx.clone();
@@ -3181,7 +3215,7 @@ pub(crate) fn execute(
         }
         Effect::ShowSessionInfo { agent_id, session_id, show_resolved_model, nonce } => {
             let is_api_key_auth = session_flags.is_api_key_auth;
-            let api_key_env_set = xai_grok_shell::agent::auth_method::has_xai_api_key_env();
+            let api_key_env_set = false;
             let tx = acp_tx.clone();
             tasks
                 .spawn(async move {
@@ -4562,7 +4596,7 @@ fn format_auth_lines(is_api_key_auth: bool, api_key_env_set: bool) -> String {
             "  Auth method: API key\n"
         };
         return format!(
-            "{method}  Run `grok login` to use your SuperGrok subscription instead.\n"
+            "{method}  Configure api_key in config.toml to use your SuperGrok subscription instead.\n"
         );
     }
     String::from("  Auth method: OAuth\n")

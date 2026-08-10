@@ -26,9 +26,6 @@ impl AuthStatus {
     /// [`crate::agent::auth_method::should_advertise_xai_api_key`] so
     /// `disable_api_key_auth` is honored.
     pub fn resolve(agent_config: &AgentConfig) -> Self {
-        if crate::agent::auth_method::has_xai_api_key_env() {
-            return Self::ApiKey;
-        }
         if agent_config.create_auth_manager().current().is_some() {
             let origin = &agent_config.grok_com_config.grok_ws_origin;
             let host = origin
@@ -109,7 +106,7 @@ fn parse_models_list_response(raw: &str) -> Result<acp::SessionModelState> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::auth_method::{LEGACY_XAI_API_KEY_ENV_VAR, XAI_API_KEY_ENV_VAR};
+    // XAI_API_KEY/GROK_CODE_XAI_API_KEY env vars are unset to ensure a clean test slate.
     use crate::agent::config::Config;
     use crate::auth::{AuthMode, GrokAuth};
     use serial_test::serial;
@@ -123,8 +120,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let auth_path = dir.path().join("no-auth.json");
         let guards = [
-            EnvGuard::unset(XAI_API_KEY_ENV_VAR),
-            EnvGuard::unset(LEGACY_XAI_API_KEY_ENV_VAR),
+            EnvGuard::unset("XAI_API_KEY"),
+            EnvGuard::unset("GROK_CODE_XAI_API_KEY"),
             EnvGuard::unset("GROK_AUTH"),
             EnvGuard::set("GROK_AUTH_PATH", auth_path.to_str().unwrap()),
             EnvGuard::unset("GROK_DEPLOYMENT_KEY"),
@@ -150,22 +147,6 @@ mod tests {
     fn config_from_toml(toml_src: &str) -> Config {
         let toml: toml::Value = toml::from_str(toml_src).unwrap();
         Config::new_from_toml_cfg(&toml).expect("config should parse")
-    }
-
-    #[test]
-    #[serial]
-    fn resolve_api_key_env() {
-        let (_dir, _g) = isolate_auth_sources();
-        let _key = EnvGuard::set(XAI_API_KEY_ENV_VAR, "xai-test-key");
-        assert_eq!(AuthStatus::resolve(&Config::default()), AuthStatus::ApiKey);
-    }
-
-    #[test]
-    #[serial]
-    fn resolve_legacy_api_key_env() {
-        let (_dir, _g) = isolate_auth_sources();
-        let _key = EnvGuard::set(LEGACY_XAI_API_KEY_ENV_VAR, "legacy-key");
-        assert_eq!(AuthStatus::resolve(&Config::default()), AuthStatus::ApiKey);
     }
 
     #[test]
@@ -270,16 +251,6 @@ mod tests {
             AuthStatus::resolve(&Config::default()),
             AuthStatus::NotAuthenticated
         );
-    }
-
-    #[test]
-    #[serial]
-    fn resolve_priority_api_key_over_byok_and_deployment() {
-        let (_dir, _g) = isolate_auth_sources();
-        let _key = EnvGuard::set(XAI_API_KEY_ENV_VAR, "xai-test-key");
-        let dm = crate::models::default_model();
-        let cfg = config_from_toml(&byok_and_deployment_toml(dm));
-        assert_eq!(AuthStatus::resolve(&cfg), AuthStatus::ApiKey);
     }
 
     #[test]

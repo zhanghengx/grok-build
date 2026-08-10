@@ -13739,6 +13739,7 @@ dependencies = [
  "xai-grok-shell",
  "xai-grok-version",
  "xai-ratatui-inline",
+ "xai-ratatui-textarea",
  "xai-token-estimation",
 ]
 

@@ -1176,16 +1176,16 @@ pub enum RetryState {
 }
 
 /// Whether a terminal retry failure is a recoverable authentication error
-/// (expired/invalid credentials, 401) that the user can fix by signing in
+/// (invalid API key, 401) that the user can fix by updating their configuration
 /// again. Drives the actionable re-auth banner.
 ///
 /// `legacy_auth` is intentionally excluded: those failures carry their own
-/// detailed migration guidance (`grok update` / `grok logout` / `grok login`)
-/// in the message, so we surface that verbatim instead of the generic prompt.
+/// detailed migration guidance (configure api_key or env_key in config.toml) in the
+/// message, so we surface that verbatim instead of the generic prompt.
 ///
 /// `auth_transient` is excluded for the opposite reason: the shell emits it
 /// only when the failure self-heals (see `AuthManager::requires_manual_reauth`)
-/// and the message already says it recovers on its own — no `/login` banner.
+/// and the message already says it recovers on its own — no re-auth banner.
 pub fn is_reauthable_failure(error_type: Option<&str>, message: &str) -> bool {
     if matches!(error_type, Some("legacy_auth") | Some("auth_transient")) {
         return false;

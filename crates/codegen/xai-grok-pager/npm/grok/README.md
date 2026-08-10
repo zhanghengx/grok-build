@@ -29,7 +29,7 @@ grok -p "Explain this codebase"
 On first launch, Grok opens your browser to authenticate. For CI or headless environments, use an API key from [console.x.ai](https://console.x.ai):
 
 ```bash
-export XAI_API_KEY="xai-..."
+Configure api_key in config.toml
 ```
 
 ## Update

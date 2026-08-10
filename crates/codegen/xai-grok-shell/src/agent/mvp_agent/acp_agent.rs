@@ -235,7 +235,6 @@ impl acp::Agent for MvpAgent {
             ),
         );
         if !self.cfg.borrow().grok_com_config.api_key_auth_disabled()
-            && auth_method::read_xai_api_key_env().is_err()
             && let Some(api_key) = crate::auth::read_api_key(
                 &crate::util::grok_home::grok_home(),
             )
@@ -277,10 +276,11 @@ impl acp::Agent for MvpAgent {
             .models()
             .values()
             .any(crate::agent::config::ModelEntry::has_own_credentials);
+        let has_env_key = std::env::var("XAI_API_KEY").is_ok();
         let first_party_env_ok = if crate::auth::should_probe_first_party_env_key(
             disable_api_key_auth,
             has_byok,
-            auth_method::has_xai_api_key_env(),
+            has_env_key,
             preferred_method_early.is_some(),
         ) {
             crate::auth::first_party_env_key_allows_advertise(
@@ -565,20 +565,7 @@ impl acp::Agent for MvpAgent {
                 }
                 let mut sampling_config = self.sampling_config.borrow_mut();
                 if sampling_config.api_key.is_none() {
-                    if let Ok(api_key) = auth_method::read_xai_api_key_env() {
-                        sampling_config.api_key = Some(api_key.clone());
-                        if let Err(e) = crate::auth::store_api_key(
-                            &crate::util::grok_home::grok_home(),
-                            &api_key,
-                        ) {
-                            tracing::warn!("failed to persist API key to auth.json: {e}");
-                            xai_grok_telemetry::unified_log::warn(
-                                "failed to persist API key to auth.json",
-                                None,
-                                Some(serde_json::json!({ "error": e.to_string() })),
-                            );
-                        }
-                    } else if !self
+                    if !self
                         .models_manager
                         .models()
                         .values()
@@ -588,7 +575,7 @@ impl acp::Agent for MvpAgent {
                         return Err(
                             acp::Error::auth_required()
                                 .data(
-                                    "Set XAI_API_KEY or add api_key/env_key to config.toml.",
+                                    "Configure api_key or env_key in config.toml.",
                                 ),
                         );
                     }
@@ -2255,7 +2242,7 @@ impl acp::Agent for MvpAgent {
                 crate::extensions::auth_gate::require_xai_auth(
                     &self.auth_manager,
                     "Authentication required",
-                    "Run `grok login` to authenticate.",
+                    "Configure api_key or env_key in ~/.grok/config.toml.",
                 )?;
                 let params: serde_json::Value = serde_json::from_str(args.params.get())
                     .map_err(|e| acp::Error::invalid_params().data(e.to_string()))?;
@@ -2287,7 +2274,7 @@ impl acp::Agent for MvpAgent {
                 crate::extensions::auth_gate::require_xai_auth(
                     &self.auth_manager,
                     "Authentication required",
-                    "Run `grok login` to authenticate.",
+                    "Configure api_key or env_key in ~/.grok/config.toml.",
                 )?;
                 let sandbox_client = crate::remote::SandboxClient::new(
                     self.cli_chat_proxy_base_url(),
@@ -2312,7 +2299,7 @@ impl acp::Agent for MvpAgent {
                 crate::extensions::auth_gate::require_xai_auth(
                     &self.auth_manager,
                     "Authentication required",
-                    "Run `grok login` to authenticate.",
+                    "Configure api_key or env_key in ~/.grok/config.toml.",
                 )?;
                 let params: serde_json::Value = serde_json::from_str(args.params.get())
                     .map_err(|e| acp::Error::invalid_params().data(e.to_string()))?;
@@ -2369,7 +2356,7 @@ impl acp::Agent for MvpAgent {
                 crate::extensions::auth_gate::require_xai_auth(
                     &self.auth_manager,
                     "Authentication required",
-                    "Run `grok login` to authenticate.",
+                    "Configure api_key or env_key in ~/.grok/config.toml.",
                 )?;
                 let params: serde_json::Value = serde_json::from_str(args.params.get())
                     .map_err(|e| acp::Error::invalid_params().data(e.to_string()))?;
@@ -2429,7 +2416,7 @@ impl acp::Agent for MvpAgent {
                 crate::extensions::auth_gate::require_xai_auth(
                     &self.auth_manager,
                     "Authentication required",
-                    "Run `grok login` to authenticate.",
+                    "Configure api_key or env_key in ~/.grok/config.toml.",
                 )?;
                 let params: serde_json::Value = serde_json::from_str(args.params.get())
                     .map_err(|e| acp::Error::invalid_params().data(e.to_string()))?;

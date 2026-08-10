@@ -149,6 +149,39 @@ impl MvpAgent {
     pub(super) fn set_auth_method(&self, id: acp::AuthMethodId) {
         self.auth_method_id.store(Some(std::sync::Arc::new(id)));
     }
+    /// Select API-key auth after a model config reload when initialization had
+    /// no credentials yet. Never replace a method selected by initialization or
+    /// a later authenticate request.
+    pub(crate) fn ensure_api_key_auth_method_from_models(&self) -> bool {
+        if self.auth_method_id.load().is_some()
+            || self.cfg.borrow().grok_com_config.api_key_auth_disabled()
+            || self.cfg.borrow().grok_com_config.preferred_method
+                == Some(PreferredAuthMethod::Oidc)
+        {
+            return false;
+        }
+        let has_model_credentials = self
+            .models_manager
+            .models()
+            .values()
+            .any(ModelEntry::has_own_credentials);
+        if !has_model_credentials {
+            return false;
+        }
+        let previous = self.auth_method_id.compare_and_swap(
+            &None::<std::sync::Arc<acp::AuthMethodId>>,
+            Some(std::sync::Arc::new(acp::AuthMethodId::new(
+                crate::agent::auth_method::XAI_API_KEY_METHOD_ID,
+            ))),
+        );
+        if previous.is_some() {
+            return false;
+        }
+        tracing::info!(
+            "auth: selected xai.api_key after model config reload"
+        );
+        true
+    }
     /// Publish model-owned credentials for voice/tools static fallthrough.
     /// Only [`ModelEntry::own_credential`] — not `sampling_config.api_key` (may be a session JWT).
     pub(crate) fn sync_process_static_api_key(&self, preferred_model_id: Option<&str>) {
@@ -2387,7 +2420,7 @@ impl MvpAgent {
         if relay_sync_enabled {
             tracing::info!("[grok] Relay sync: ENABLED");
         } else if tui_mode && relay_config_enabled && !has_xai_auth {
-            tracing::info!("[grok] Relay sync: DISABLED (no auth - run 'grok login' first)");
+            tracing::info!("[grok] Relay sync: DISABLED (no auth - configure api_key in config.toml first)");
         } else if tui_mode && !relay_config_enabled {
             tracing::debug!("Relay sync: DISABLED (not configured in config.toml or env)");
         } else {

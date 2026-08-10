@@ -724,6 +724,11 @@ pub(crate) fn models_list_url(
 ) -> String {
     ListModelsEndpoint::from_endpoints(endpoints, fetch_auth).url
 }
+
+/// Build the `/models` URL for a model-specific OpenAI-compatible endpoint.
+pub(crate) fn model_models_url(base_url: &str) -> String {
+    format!("{}/models", base_url.trim_end_matches('/'))
+}
 impl ListModelsEndpoint {
     fn from_endpoints(
         endpoints: &crate::agent::config::EndpointsConfig,
@@ -765,16 +770,12 @@ pub(crate) fn fetch_models_blocking(
     let mut request = client.get(&source.url);
     match source.auth {
         EndpointAuth::ApiKey => {
-            let api_key = crate::agent::auth_method::read_xai_api_key_env()
-                .or_else(|_| {
-                    auth.map(|a| a.key.clone())
-                        .ok_or(std::env::VarError::NotPresent)
-                })
-                .map_err(|_| {
-                    BackendError::Auth(
-                        "No API key for custom models endpoint. Set XAI_API_KEY.".into(),
-                    )
-                })?;
+            let api_key = auth.map(|a| a.key.clone()).ok_or_else(|| {
+                BackendError::Auth(
+                    "No API key for custom models endpoint. Configure api_key in config.toml."
+                        .into(),
+                )
+            })?;
             request = request.header("Authorization", format!("Bearer {}", api_key));
         }
         EndpointAuth::Session => {
@@ -827,6 +828,98 @@ pub(crate) fn fetch_models_blocking(
     }
     Ok(FetchModelsResult { models, etag })
 }
+
+/// Fetch `/models` from the endpoint configured on one model.
+///
+/// This path deliberately accepts only the model's resolved credential. It
+/// never receives or falls back to a Grok session token, because the endpoint
+/// may be operated by a third party.
+pub(crate) fn fetch_model_models_blocking(
+    base_url: &str,
+    api_key: &str,
+    auth_scheme: xai_grok_sampler::AuthScheme,
+    extra_headers: &IndexMap<String, String>,
+    query_params: &IndexMap<String, String>,
+    env_http_headers: &IndexMap<String, String>,
+) -> Result<FetchModelsResult, BackendError> {
+    if base_url.trim().is_empty() {
+        return Err(BackendError::Auth(
+            "Model endpoint base_url must not be empty".into(),
+        ));
+    }
+    if api_key.trim().is_empty() {
+        return Err(BackendError::Auth(
+            "Model endpoint credential must not be empty".into(),
+        ));
+    }
+
+    let client = crate::http::shared_startup_blocking_client();
+    let url = model_models_url(base_url);
+    tracing::info!("Fetching models from model endpoint {}", url);
+    let mut request = client.get(&url);
+    request = match auth_scheme {
+        xai_grok_sampler::AuthScheme::Bearer => {
+            request.header("Authorization", format!("Bearer {api_key}"))
+        }
+        xai_grok_sampler::AuthScheme::XApiKey => request.header("x-api-key", api_key),
+    };
+    for (name, value) in extra_headers {
+        request = request.header(name.as_str(), value.as_str());
+    }
+    if !query_params.is_empty() {
+        request = request.query(query_params);
+    }
+    for (name, env_var) in env_http_headers {
+        let Some(value) = std::env::var(env_var)
+            .ok()
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty())
+        else {
+            continue;
+        };
+        request = request.header(name.as_str(), value);
+    }
+
+    let response = request.send()?;
+    parse_models_response(response, &url, base_url)
+}
+
+fn parse_models_response(
+    response: reqwest::blocking::Response,
+    source_url: &str,
+    default_base_url: &str,
+) -> Result<FetchModelsResult, BackendError> {
+    if !response.status().is_success() {
+        let status = response.status().as_u16();
+        let body = response.text().unwrap_or_default();
+        tracing::warn!("Failed to fetch models: {} - {}", status, body);
+        return Err(BackendError::RequestFailed { status, body });
+    }
+    let etag = response
+        .headers()
+        .get("etag")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+    let models_response: ModelsResponse = response.json()?;
+    tracing::info!(
+        "Fetched {} models from {}",
+        models_response.data.len(),
+        source_url
+    );
+    let mut models = Vec::with_capacity(models_response.data.len());
+    for (idx, value) in models_response.data.into_iter().enumerate() {
+        match parse_remote_model_value(&value, default_base_url) {
+            Some(model) => models.push(model),
+            None => {
+                tracing::warn!(
+                    "Skipping model at index {}: missing required field ('model' or 'context_window') or invalid types",
+                    idx
+                )
+            }
+        }
+    }
+    Ok(FetchModelsResult { models, etag })
+}
 /// Parse a single model entry from the /models-v2 response.
 /// Used by both initial model fetch and session-resume metadata refresh.
 pub(crate) fn parse_remote_model_value(
@@ -860,13 +953,17 @@ pub(crate) fn parse_remote_model_value(
         .unwrap_or_else(crate::agent::config::default_agent_type);
     let api_backend = get_string(obj, "apiBackend")
         .or_else(|| get_string(obj, "api_backend"))
-        .and_then(|s| match s.as_str() {
-            "responses" => Some(crate::sampling::ApiBackend::Responses),
-            "chat_completions" => Some(crate::sampling::ApiBackend::ChatCompletions),
-            "messages" => Some(crate::sampling::ApiBackend::Messages),
-            _ => None,
+        .map(|s| match s.as_str() {
+            "responses" => crate::sampling::ApiBackend::Responses,
+            "chat_completions" => crate::sampling::ApiBackend::ChatCompletions,
+            "messages" => crate::sampling::ApiBackend::Messages,
+            _ => crate::sampling::ApiBackend::default(),
         })
-        .unwrap_or_default();
+        .or_else(|| {
+            obj.get("apiBackend")
+                .or_else(|| obj.get("api_backend"))
+                .map(|_| crate::sampling::ApiBackend::default())
+        });
     Some(crate::agent::config::ModelEntryConfig {
         id,
         model,
@@ -1515,6 +1612,26 @@ mod tests {
         assert_eq!(result.name.as_deref(), Some("Display Name"));
     }
     #[test]
+    fn parse_remote_model_value_preserves_api_backend_presence() {
+        let explicit = serde_json::json!({
+            "model": "chat-model",
+            "context_window": 131072,
+            "api_backend": "chat_completions",
+        });
+        let explicit = parse_remote_model_value(&explicit, "https://default.url").unwrap();
+        assert_eq!(
+            explicit.api_backend,
+            Some(crate::sampling::ApiBackend::ChatCompletions)
+        );
+
+        let omitted = serde_json::json!({
+            "model": "inherited-model",
+            "context_window": 131072,
+        });
+        let omitted = parse_remote_model_value(&omitted, "https://default.url").unwrap();
+        assert_eq!(omitted.api_backend, None);
+    }
+    #[test]
     fn parse_reads_reasoning_effort_fields() {
         use xai_grok_sampling_types::ReasoningEffort;
         let value = serde_json::json!({
@@ -1988,6 +2105,96 @@ mod tests {
         let ep = ListModelsEndpoint::from_endpoints(&custom, ModelFetchAuth::Session);
         assert_eq!(ep.url, "https://models.acme.com/v1/models");
         assert_eq!(ep.auth, EndpointAuth::ApiKey);
+    }
+
+    #[test]
+    fn model_models_url_trims_trailing_slashes() {
+        assert_eq!(
+            model_models_url("https://provider.example/v1///"),
+            "https://provider.example/v1/models"
+        );
+    }
+
+    #[tokio::test]
+    async fn model_models_fetch_uses_only_the_model_credential() {
+        use axum::routing::get;
+
+        #[derive(Clone)]
+        struct ModelEndpointServerState {
+            seen: Arc<Mutex<Vec<(String, Option<String>, Option<String>, Option<String>)>>>,
+        }
+
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let state = ModelEndpointServerState { seen: seen.clone() };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!(
+            "http://127.0.0.1:{}/v1/",
+            listener.local_addr().unwrap().port()
+        );
+        let app = Router::new()
+            .route(
+                "/v1/models",
+                get(
+                    |State(state): State<ModelEndpointServerState>, headers: HeaderMap| async move {
+                        state.seen.lock().unwrap().push((
+                            headers
+                                .get("authorization")
+                                .and_then(|value| value.to_str().ok())
+                                .unwrap_or_default()
+                                .to_owned(),
+                            headers
+                                .get("x-tenant")
+                                .and_then(|value| value.to_str().ok())
+                                .map(str::to_owned),
+                            headers
+                                .get("x-from-env")
+                                .and_then(|value| value.to_str().ok())
+                                .map(str::to_owned),
+                            headers
+                                .get("x-api-key")
+                                .and_then(|value| value.to_str().ok())
+                                .map(str::to_owned),
+                        ));
+                        axum::Json(serde_json::json!({
+                            "data": [{"id": "provider-model", "context_window": 1234}]
+                        }))
+                    },
+                ),
+            )
+            .with_state(state);
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let mut extra_headers = IndexMap::new();
+        extra_headers.insert("x-tenant".to_owned(), "tenant-a".to_owned());
+        let mut env_http_headers = IndexMap::new();
+        env_http_headers.insert("x-from-env".to_owned(), "GROK_TEST_MODEL_HEADER".to_owned());
+        unsafe { std::env::set_var("GROK_TEST_MODEL_HEADER", "env-a") };
+        let result = tokio::task::spawn_blocking({
+            let base = base.clone();
+            move || {
+                fetch_model_models_blocking(
+                    &base,
+                    "model-api-key",
+                    xai_grok_sampler::AuthScheme::Bearer,
+                    &extra_headers,
+                    &IndexMap::new(),
+                    &env_http_headers,
+                )
+            }
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        unsafe { std::env::remove_var("GROK_TEST_MODEL_HEADER") };
+        server.abort();
+
+        assert_eq!(result.models[0].model, "provider-model");
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].0, "Bearer model-api-key");
+        assert_eq!(seen[0].1.as_deref(), Some("tenant-a"));
+        assert_eq!(seen[0].2.as_deref(), Some("env-a"));
+        assert_eq!(seen[0].3, None);
     }
     /// REGRESSION: `grok setup` must send the deployment key to
     /// the proxy, never the inference endpoint.

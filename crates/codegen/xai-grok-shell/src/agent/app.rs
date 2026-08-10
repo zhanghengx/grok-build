@@ -333,7 +333,10 @@ pub async fn run_headless(
     use crate::agent::relay::spawn_relay_connection_with_callback;
     use tokio_util::sync::CancellationToken;
     const HEADLESS_NO_SESSION: &str = "Headless mode requires a grok.com session. \
-        Run `grok login` to sign in, or use `grok agent stdio` for API-key access.";
+        Configure api_key in config.toml or configure api_key in ~/.grok/config.toml, or use `grok agent stdio` for API-key access.";
+
+    // Clean up orphaned upload queue temp files from previous sessions (best-effort).
+    // Uses DEFAULT_MAX_AGE to stay in sync with the upload queue's retry policy.
     xai_file_utils::queue::cleanup_orphaned_uploads(
         &grok_home::grok_home(),
         xai_file_utils::queue::DEFAULT_MAX_AGE,
@@ -355,7 +358,7 @@ pub async fn run_headless(
         .await?
     } else {
         let auth_manager = Arc::new(AuthManager::new(&grok_home::grok_home(), ctx.clone()));
-        if crate::agent::auth_method::has_xai_api_key_env()
+        if false
             && ctx.auth_provider_command.is_none()
             && crate::auth::try_ensure_fresh_auth(ctx).await.is_none()
         {
@@ -926,7 +929,6 @@ pub async fn run_leader(
     workspace_control.set_auth_manager(shared_auth_manager.clone());
     let auth_manager_for_agent = shared_auth_manager.clone();
     let auth_manager_for_config = shared_auth_manager.clone();
-    let auth_manager_for_mint = shared_auth_manager.clone();
     crate::managed_config::ensure_managed_policy_present(&auth_manager_for_agent).await;
     let (agent_config_for_spawn, shared_models_manager) = bootstrap(
         &agent_config_for_spawn,
@@ -1047,26 +1049,13 @@ pub async fn run_leader(
                     }
                 }
             });
-            if session_pending {
-                let mint_auth_manager = auth_manager_for_mint;
-                let mint_cancel = cancel_clone.clone();
-                tokio::task::spawn_local(async move {
-                    tokio::select! {
-                        biased;
-                        _ = mint_cancel.cancelled() => {}
-                        minted = crate::auth::mint_session_noninteractive(&mint_auth_manager)
-                            => match minted {
-                            Some(session) => info!(
-                                is_xai = session.is_xai_auth(),
-                                "background cold-mint acquired a session post-readiness"
-                            ),
-                            None => warn!(
-                                "background cold-mint found no session; leader remains session-less"
-                            ),
-                        },
-                    }
-                });
-            }
+
+            // Start (or arm) the grok.com relay. Eager by default — a bare
+            // `grok agent leader` (devbox / systemd) has no local IPC clients
+            // and receives remote prompts *through* the relay, so it must
+            // connect unconditionally. Leaders auto-spawned by interactive
+            // clients pass `relay_on_demand` and defer the WebSocket until the
+            // first headless registration. See `spawn_leader_relay`.
             let relay_handle_slot: Rc<
                 std::cell::RefCell<Option<crate::agent::relay::RelayHandle>>,
             > = Rc::new(std::cell::RefCell::new(None));
@@ -1473,7 +1462,8 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn embedded_otel_gate_keeps_a_session_user_fail_closed() {
-        use crate::agent::auth_method::{LEGACY_XAI_API_KEY_ENV_VAR, XAI_API_KEY_ENV_VAR};
+        const XAI_API_KEY_ENV_VAR: &str = "XAI_API_KEY";
+        const LEGACY_XAI_API_KEY_ENV_VAR: &str = "GROK_CODE_XAI_API_KEY";
         use xai_grok_telemetry::external::{
             is_settings_gate_open, mark_external_otel_settings_resolved,
         };
@@ -1492,8 +1482,8 @@ mod tests {
         impl Drop for Restore {
             fn drop(&mut self) {
                 unsafe {
-                    set_or_clear(XAI_API_KEY_ENV_VAR, self.key.take());
-                    set_or_clear(LEGACY_XAI_API_KEY_ENV_VAR, self.legacy.take());
+                    let _ = self.key.take(); // env var removed;
+                    let _ = self.legacy.take(); // env var removed;
                     set_or_clear(PROXY_ENV_VAR, self.proxy.take());
                 }
                 mark_external_otel_settings_resolved();
@@ -1501,14 +1491,14 @@ mod tests {
         }
         const PROXY_ENV_VAR: &str = "GROK_CLI_CHAT_PROXY_BASE_URL";
         let _restore = Restore {
-            key: std::env::var_os(XAI_API_KEY_ENV_VAR),
-            legacy: std::env::var_os(LEGACY_XAI_API_KEY_ENV_VAR),
+            key: None,    // env var removed
+            legacy: None, // env var removed
             proxy: std::env::var_os(PROXY_ENV_VAR),
         };
         let cfg = GrokComConfig::default();
         unsafe {
-            std::env::set_var(XAI_API_KEY_ENV_VAR, "test-key");
-            std::env::remove_var(LEGACY_XAI_API_KEY_ENV_VAR);
+            // env var removed;
+            // env var removed;
             std::env::remove_var(PROXY_ENV_VAR);
         }
         let session = GrokAuth {

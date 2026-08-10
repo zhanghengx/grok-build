@@ -444,7 +444,7 @@ fn harness_pair(id: &str) -> Vec<xai_grok_sampling_types::conversation::Conversa
 /// advance every harness turn would clobber the same GCS path.
 #[tokio::test(flavor = "current_thread")]
 async fn upload_harness_trace_turns_numbers_siblings_and_persists_counter() {
-    let agent = build_minimal_agent_for_tests();
+    let agent = build_agent_with_byok_model();
     {
         let mut cfg = agent.cfg.borrow_mut();
         cfg.features.telemetry = Some(crate::agent::config::TelemetryMode::Enabled);
@@ -534,7 +534,7 @@ async fn upload_harness_trace_turns_numbers_siblings_and_persists_counter() {
 /// the upload function's uploads-disabled branch.
 #[tokio::test(flavor = "current_thread")]
 async fn upload_harness_trace_turns_uploads_disabled_does_not_burn_counter() {
-    let agent = build_minimal_agent_for_tests();
+    let agent = build_agent_with_byok_model();
     let sid = acp::SessionId::new("harness-disabled-sess");
     let info = crate::session::info::Info {
         id: sid.clone(),
@@ -565,7 +565,7 @@ async fn upload_harness_trace_turns_build_per_turn_manifest() {
     use crate::upload::manifest::{
         ArtifactResult, ArtifactStatus, build_manifest, record_artifact, resolve_upload_method,
     };
-    let agent = build_minimal_agent_for_tests();
+    let agent = build_agent_with_byok_model();
     {
         let mut cfg = agent.cfg.borrow_mut();
         cfg.features.telemetry = Some(crate::agent::config::TelemetryMode::Enabled);
@@ -1293,7 +1293,7 @@ async fn set_session_model_does_not_cross_contaminate() {
 async fn model_state_prefers_session_reasoning_effort_over_global() {
     use crate::agent::config::{EndpointsConfig, ModelEntry};
     use xai_grok_sampling_types::{REASONING_EFFORT_META_KEY, ReasoningEffort};
-    let agent = build_minimal_agent_for_tests();
+    let agent = build_agent_with_byok_model();
     let mut entry = ModelEntry::fallback("effort-model", &EndpointsConfig::default());
     entry.info.supports_reasoning_effort = true;
     agent
@@ -1337,7 +1337,7 @@ async fn model_state_prefers_session_reasoning_effort_over_global() {
 async fn session_config_options_resolves_routing_slug_to_catalog_model() {
     use crate::agent::config::{EndpointsConfig, ModelEntry};
     use xai_grok_sampling_types::ReasoningEffort;
-    let agent = build_minimal_agent_for_tests();
+    let agent = build_agent_with_byok_model();
     let mut entry = ModelEntry::fallback("catalog-key-model", &EndpointsConfig::default());
     entry.info.model = "routing-slug".to_string();
     entry.info.supports_reasoning_effort = true;
@@ -1829,7 +1829,7 @@ async fn mcp_list_gateway_off_disables_cached_catalog() {
 /// `search_tool`.
 #[tokio::test(flavor = "current_thread")]
 async fn refresh_mcp_search_index_broadcasts_to_sessions() {
-    let agent = build_minimal_agent_for_tests();
+    let agent = build_agent_with_byok_model();
     let sid = acp::SessionId::new("sess-search-index");
     let (handle, _tx, mut cmd_rx) = make_live_session_handle(&sid, None);
     agent.insert_resident(&sid, handle);
@@ -1862,7 +1862,7 @@ fn session_usage_request(session_id: &str) -> acp::ExtRequest {
 }
 #[tokio::test(flavor = "current_thread")]
 async fn session_usage_unknown_session_is_resource_not_found() {
-    let agent = build_minimal_agent_for_tests();
+    let agent = build_agent_with_byok_model();
     let err = crate::extensions::usage::handle(&agent, &session_usage_request("no-such-session"))
         .await
         .expect_err("unknown session");
@@ -1873,7 +1873,7 @@ async fn session_usage_unknown_session_is_resource_not_found() {
 }
 #[tokio::test(flavor = "current_thread")]
 async fn session_usage_dead_chat_state_actor_fails_closed() {
-    let agent = build_minimal_agent_for_tests();
+    let agent = build_agent_with_byok_model();
     let sid = acp::SessionId::new("usage-dead-actor-sess");
     let mut handle = make_test_handle("test-model", false, None);
     handle.info.id = sid.clone();
@@ -1888,7 +1888,7 @@ async fn session_usage_dead_chat_state_actor_fails_closed() {
 /// client describing `/loop` fires can never contradict what the fires do.
 #[tokio::test(flavor = "current_thread")]
 async fn session_meta_publishes_the_sessions_pinned_scheduler_background_loops() {
-    let agent = build_minimal_agent_for_tests();
+    let agent = build_agent_with_byok_model();
     let sid = acp::SessionId::new("loop-mode-sess");
     let mut handle = make_test_handle("test-model", false, None);
     handle.info.id = sid.clone();
@@ -1979,7 +1979,7 @@ mod subagent_spawn_context_tests;
 /// (the caller then surfaces "unknown session id" exactly as before).
 #[tokio::test]
 async fn wait_for_in_flight_load_returns_immediately_when_idle() {
-    let agent = build_minimal_agent_for_tests();
+    let agent = build_agent_with_byok_model();
     let sid = acp::SessionId::new("sess-none");
     tokio::time::timeout(
         std::time::Duration::from_millis(200),
@@ -2059,7 +2059,7 @@ async fn wait_for_in_flight_load_wakes_on_failed_load() {
 /// newer in-flight load).
 #[tokio::test]
 async fn concurrent_load_guards_do_not_clobber_each_other() {
-    let agent = build_minimal_agent_for_tests();
+    let agent = build_agent_with_byok_model();
     let sid = acp::SessionId::new("sess-concurrent");
     let guard_one = agent.begin_session_load(&sid);
     let guard_two = agent.begin_session_load(&sid);
@@ -2081,7 +2081,7 @@ async fn concurrent_load_guards_do_not_clobber_each_other() {
 #[tokio::test]
 async fn resident_activity_reports_needs_input_when_pending() {
     use crate::agent::roster::RosterActivity;
-    let agent = build_minimal_agent_for_tests();
+    let agent = build_agent_with_byok_model();
     let sid = acp::SessionId::new("sess-pending");
     let handle = make_test_handle("grok-3", false, None);
     let pending = handle.pending_interactions.clone();
@@ -2579,7 +2579,7 @@ async fn auth_type_session_based_no_current_returns_session_token() {
         crate::agent::auth_method::GROK_COM_METHOD_ID,
         crate::agent::auth_method::OIDC_METHOD_ID,
     ] {
-        let agent = build_minimal_agent_for_tests();
+        let agent = build_agent_with_byok_model();
         agent.set_auth_method(acp::AuthMethodId::new(method_id));
         assert!(
             agent.auth_manager.current().is_none(),
@@ -2601,7 +2601,7 @@ async fn auth_type_session_based_no_current_returns_session_token() {
 /// (image_gen / video_gen base_url) that don't apply to BYOK keys.
 #[tokio::test(flavor = "current_thread")]
 async fn auth_type_xai_api_key_no_current_returns_api_key() {
-    let agent = build_minimal_agent_for_tests();
+    let agent = build_agent_with_byok_model();
     agent.set_auth_method(acp::AuthMethodId::new(
         crate::agent::auth_method::XAI_API_KEY_METHOD_ID,
     ));
@@ -2619,7 +2619,7 @@ async fn auth_type_xai_api_key_no_current_returns_api_key() {
 #[tokio::test(flavor = "current_thread")]
 async fn auth_type_session_based_with_current_returns_session_token() {
     use crate::auth::GrokAuth;
-    let agent = build_minimal_agent_for_tests();
+    let agent = build_agent_with_byok_model();
     agent.set_auth_method(acp::AuthMethodId::new(
         crate::agent::auth_method::OIDC_METHOD_ID,
     ));
@@ -2634,7 +2634,7 @@ async fn auth_type_session_based_with_current_returns_session_token() {
 /// through cli-chat-proxy before a method has been chosen.
 #[tokio::test(flavor = "current_thread")]
 async fn auth_type_no_method_id_no_current_returns_api_key() {
-    let agent = build_minimal_agent_for_tests();
+    let agent = build_agent_with_byok_model();
     assert!(agent.auth_method_id.load().is_none());
     assert!(agent.auth_manager.current().is_none());
     assert_eq!(agent.auth_type(), xai_chat_state::AuthType::ApiKey,);
@@ -2647,11 +2647,68 @@ async fn auth_type_no_method_id_no_current_returns_api_key() {
 #[tokio::test(flavor = "current_thread")]
 async fn auth_type_no_method_id_with_current_returns_session_token() {
     use crate::auth::GrokAuth;
-    let agent = build_minimal_agent_for_tests();
+    let agent = build_agent_with_byok_model();
     agent.auth_manager.hot_swap(GrokAuth::test_default());
     assert!(agent.auth_method_id.load().is_none());
     assert!(agent.auth_manager.current().is_some());
     assert_eq!(agent.auth_type(), xai_chat_state::AuthType::SessionToken,);
+}
+/// A config reload can introduce the first model-owned API key after startup.
+/// The shared method id must be populated before the next `session/new`.
+#[tokio::test(flavor = "current_thread")]
+async fn config_reload_auth_method_selects_api_key_for_new_model_credentials() {
+    let agent = build_agent_with_byok_model();
+    assert!(agent.auth_method_id.load().is_none());
+
+    assert!(agent.ensure_api_key_auth_method_from_models());
+    assert_eq!(
+        agent
+            .auth_method_id
+            .load()
+            .as_deref()
+            .map(|id| id.0.as_ref()),
+        Some(crate::agent::auth_method::XAI_API_KEY_METHOD_ID),
+    );
+}
+/// A config reload must not replace an auth method selected by initialization
+/// or a later authenticate request.
+#[tokio::test(flavor = "current_thread")]
+async fn config_reload_auth_method_preserves_existing_selection() {
+    let agent = build_agent_with_byok_model();
+    agent.set_auth_method(acp::AuthMethodId::new(
+        crate::agent::auth_method::CACHED_TOKEN_AUTH_METHOD_ID,
+    ));
+
+    assert!(!agent.ensure_api_key_auth_method_from_models());
+    assert_eq!(
+        agent
+            .auth_method_id
+            .load()
+            .as_deref()
+            .map(|id| id.0.as_ref()),
+        Some(crate::agent::auth_method::CACHED_TOKEN_AUTH_METHOD_ID),
+    );
+}
+/// The enterprise kill switch must prevent the reload fallback from selecting
+/// API-key auth even when model credentials are present.
+#[tokio::test(flavor = "current_thread")]
+async fn config_reload_auth_method_respects_api_key_kill_switch() {
+    let agent = build_agent_with_byok_model();
+    agent.cfg.borrow_mut().grok_com_config.disable_api_key_auth = Some(true);
+
+    assert!(!agent.ensure_api_key_auth_method_from_models());
+    assert!(agent.auth_method_id.load().is_none());
+}
+/// A pinned OIDC deployment must remain interactive/session-based even when a
+/// model config reload adds static credentials.
+#[tokio::test(flavor = "current_thread")]
+async fn config_reload_auth_method_respects_oidc_pin() {
+    let agent = build_agent_with_byok_model();
+    agent.cfg.borrow_mut().grok_com_config.preferred_method =
+        Some(crate::auth::PreferredAuthMethod::Oidc);
+
+    assert!(!agent.ensure_api_key_auth_method_from_models());
+    assert!(agent.auth_method_id.load().is_none());
 }
 /// Minimal agent whose `grok_com_config` engages the api-key kill switch
 /// (`disable_api_key_auth = true`), mirroring a forced-IdP deployment.
@@ -2667,37 +2724,53 @@ fn build_agent_with_api_key_auth_disabled() -> MvpAgent {
     cfg.grok_com_config.disable_api_key_auth = Some(true);
     MvpAgent::new(gateway, &cfg, auth_manager, None).expect("valid test config")
 }
-/// Deployment-key / managed-config user: `XAI_API_KEY` resolves and the kill
+fn build_agent_with_byok_model() -> MvpAgent {
+    use crate::agent::config::Config as AgentConfig;
+    use crate::auth::{AuthManager, GrokComConfig};
+    let temp_dir = tempfile::tempdir().unwrap();
+    let auth_manager =
+        std::sync::Arc::new(AuthManager::new(temp_dir.path(), GrokComConfig::default()));
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let gateway = GatewaySender::new(tx);
+    let dm = crate::models::default_model();
+    let toml: toml::Value = toml::from_str(&format!(
+        r#"[model."{dm}"]
+        model = "{dm}"
+        api_key = "sk-byok-test"
+        "#
+    )).unwrap();
+    let cfg = AgentConfig::new_from_toml_cfg(&toml).expect("config should parse");
+    MvpAgent::new(gateway, &cfg, auth_manager, None).expect("valid test config")
+}
+/// Per-model BYOK user: api_key resolves and the kill
 /// switch is off, so a dead `cached_token` MUST fall through to `xai.api_key`
 /// (no browser). This is the exact regression the fallthrough fixes.
 #[tokio::test(flavor = "current_thread")]
 #[serial_test::serial]
 async fn cached_token_fallthrough_prefers_api_key_for_deployment_key() {
-    use crate::agent::auth_method::{XAI_API_KEY_ENV_VAR, XAI_API_KEY_METHOD_ID};
+    use crate::agent::auth_method::XAI_API_KEY_METHOD_ID;
     use xai_grok_test_support::EnvGuard;
     let _lockdown = EnvGuard::unset("GROK_DISABLE_API_KEY_AUTH");
-    let _key = EnvGuard::set(XAI_API_KEY_ENV_VAR, "test-deployment-key");
-    let agent = build_minimal_agent_for_tests();
+    let agent = build_agent_with_byok_model();
     assert_eq!(
         agent
             .cached_token_fallthrough_method_id()
             .as_ref()
             .map(|id| id.0.as_ref()),
         Some(XAI_API_KEY_METHOD_ID),
-        "deployment-key user (XAI_API_KEY set, no kill switch) must fall \
+        "BYOK user (api_key set, no kill switch) must fall \
          through to xai.api_key on a dead cached_token -- not interactive login",
     );
 }
-/// Forced-IdP deployment: even with `XAI_API_KEY` present, the admin kill
+/// Forced-IdP deployment: the admin kill
 /// switch keeps the fallthrough on interactive `grok.com` (api-key auth is
 /// neither advertised nor an eligible fallthrough).
 #[tokio::test(flavor = "current_thread")]
 #[serial_test::serial]
 async fn cached_token_fallthrough_respects_kill_switch() {
-    use crate::agent::auth_method::{GROK_COM_METHOD_ID, XAI_API_KEY_ENV_VAR};
+    use crate::agent::auth_method::GROK_COM_METHOD_ID;
     use xai_grok_test_support::EnvGuard;
     let _lockdown = EnvGuard::unset("GROK_DISABLE_API_KEY_AUTH");
-    let _key = EnvGuard::set(XAI_API_KEY_ENV_VAR, "test-deployment-key");
     let agent = build_agent_with_api_key_auth_disabled();
     assert_eq!(
         agent
@@ -2706,7 +2779,7 @@ async fn cached_token_fallthrough_respects_kill_switch() {
             .map(|id| id.0.as_ref()),
         Some(GROK_COM_METHOD_ID),
         "disable_api_key_auth must keep the cached_token fallthrough on \
-         interactive grok.com so XAI_API_KEY can't bypass forced IdP login",
+         interactive grok.com so API key auth can't bypass forced IdP login",
     );
 }
 /// No advertiseable credentials at all (no env key, no kill switch): the user
@@ -2715,13 +2788,14 @@ async fn cached_token_fallthrough_respects_kill_switch() {
 #[serial_test::serial]
 async fn cached_token_fallthrough_falls_to_grok_com_without_credentials() {
     use crate::agent::auth_method::{
-        GROK_COM_METHOD_ID, LEGACY_XAI_API_KEY_ENV_VAR, XAI_API_KEY_ENV_VAR,
+        GROK_COM_METHOD_ID,
+        // Constants removed; use string literals directly.
     };
     use xai_grok_test_support::EnvGuard;
     let _lockdown = EnvGuard::unset("GROK_DISABLE_API_KEY_AUTH");
-    let _new = EnvGuard::unset(XAI_API_KEY_ENV_VAR);
-    let _legacy = EnvGuard::unset(LEGACY_XAI_API_KEY_ENV_VAR);
-    let agent = build_minimal_agent_for_tests();
+    let _new = EnvGuard::unset("XAI_API_KEY");
+    let _legacy = EnvGuard::unset("GROK_CODE_XAI_API_KEY");
+    let agent = build_agent_with_byok_model();
     assert_eq!(
         agent
             .cached_token_fallthrough_method_id()
@@ -2758,7 +2832,7 @@ async fn prepare_video_gen_config_disabled_when_zdr_flag_set() {
             read_only: None,
         }
     }
-    let agent = build_minimal_agent_for_tests();
+    let agent = build_agent_with_byok_model();
     agent.sampling_config.borrow_mut().api_key = Some("test-key".to_string());
     assert!(matches!(
         agent.prepare_video_gen_config(),
@@ -2795,7 +2869,7 @@ async fn prepare_video_gen_config_disabled_when_zdr_flag_set() {
 #[tokio::test(flavor = "current_thread")]
 async fn prepare_video_gen_config_respects_feature_flag() {
     use xai_grok_tools::implementations::grok_build::video_gen::VideoGenConfig;
-    let agent = build_minimal_agent_for_tests();
+    let agent = build_agent_with_byok_model();
     agent.sampling_config.borrow_mut().api_key = Some("test-key".to_string());
     assert!(matches!(
         agent.prepare_video_gen_config(),
@@ -2814,7 +2888,7 @@ async fn prepare_video_gen_config_respects_feature_flag() {
 #[tokio::test(flavor = "current_thread")]
 async fn prepare_image_gen_config_fails_open_without_auth() {
     use xai_grok_tools::implementations::grok_build::image_gen::ImageGenConfig;
-    let agent = build_minimal_agent_for_tests();
+    let agent = build_agent_with_byok_model();
     agent.sampling_config.borrow_mut().api_key = Some("test-key".to_string());
     let ImageGenConfig::Enabled {
         tier_restricted, ..
@@ -2834,7 +2908,7 @@ async fn prepare_image_gen_config_fails_open_without_auth() {
 #[tokio::test(flavor = "current_thread")]
 async fn prepare_image_gen_config_sends_client_identifier_header() {
     use xai_grok_tools::implementations::grok_build::image_gen::ImageGenConfig;
-    let agent = build_minimal_agent_for_tests();
+    let agent = build_agent_with_byok_model();
     agent.sampling_config.borrow_mut().api_key = Some("test-key".to_string());
     let ImageGenConfig::Enabled { extra_headers, .. } = agent.prepare_image_gen_config() else {
         panic!("expected Enabled");
@@ -2852,7 +2926,7 @@ async fn prepare_image_gen_config_sends_client_identifier_header() {
 #[tokio::test(flavor = "current_thread")]
 async fn prepare_video_gen_config_sends_client_identifier_header() {
     use xai_grok_tools::implementations::grok_build::video_gen::VideoGenConfig;
-    let agent = build_minimal_agent_for_tests();
+    let agent = build_agent_with_byok_model();
     agent.sampling_config.borrow_mut().api_key = Some("test-key".to_string());
     let VideoGenConfig::Enabled { extra_headers, .. } = agent.prepare_video_gen_config() else {
         panic!("expected Enabled");
@@ -3071,7 +3145,7 @@ async fn diagnostic_upload_sent_for_normal_user() {
 #[tokio::test]
 async fn diagnostic_upload_skipped_without_credentials() {
     let (stub_url, count) = spawn_counting_storage_stub().await;
-    let agent = build_minimal_agent_for_tests();
+    let agent = build_agent_with_byok_model();
     enable_trace_upload_config(&agent);
     agent.cfg.borrow_mut().endpoints.trace_upload_url = Some(stub_url);
     let uploader = agent
@@ -3377,7 +3451,7 @@ fn resolve_local_workspace_missing_server_id_fails_closed() {
 #[test]
 fn local_workspace_reap_guard_and_shutdown_clear_map() {
     run_local_for_bridge_test(|| async {
-        let agent = build_minimal_agent_for_tests();
+        let agent = build_agent_with_byok_model();
         let sid = gateway_bridge_test_session_id();
         {
             let mut guard = agent.new_local_workspace_reap_guard(sid.clone(), true);
@@ -3401,7 +3475,7 @@ fn refresh_sessions_from_supervisor_overrides_server_id() {
     use crate::gateway_bridge::ComputerSession;
     use crate::gateway_bridge::local_workspace_supervisor::test_start_ready_own;
     run_local_for_bridge_test(|| async {
-        let agent = build_minimal_agent_for_tests();
+        let agent = build_agent_with_byok_model();
         let sid = gateway_bridge_test_session_id();
         let original = Some(vec![ComputerSession::ExistingWorkspace {
             server_id: "lw-stale".into(),
@@ -3436,7 +3510,7 @@ fn start_own_registers_and_stamps_server_id() {
         stamp_server_id_into_meta, test_start_ready_own,
     };
     run_local_for_bridge_test(|| async {
-        let agent = build_minimal_agent_for_tests();
+        let agent = build_agent_with_byok_model();
         let sid = gateway_bridge_test_session_id();
         let (_dir, handle) = test_start_ready_own().await;
         let server_id = handle.server_id.clone();
@@ -3477,7 +3551,7 @@ fn start_own_registers_and_stamps_server_id() {
 fn reap_guard_drop_removes_registered_supervisor() {
     use crate::gateway_bridge::local_workspace_supervisor::test_start_ready_own;
     run_local_for_bridge_test(|| async {
-        let agent = build_minimal_agent_for_tests();
+        let agent = build_agent_with_byok_model();
         let sid = gateway_bridge_test_session_id();
         let (_dir, handle) = test_start_ready_own().await;
         agent.register_local_workspace_supervisor(sid.clone(), handle);
@@ -3514,7 +3588,7 @@ fn reap_guard_drop_removes_registered_supervisor() {
 fn shutdown_generation_invalidates_stale_restart() {
     use crate::gateway_bridge::local_workspace_supervisor::test_start_ready_own;
     run_local_for_bridge_test(|| async {
-        let agent = build_minimal_agent_for_tests();
+        let agent = build_agent_with_byok_model();
         let sid = gateway_bridge_test_session_id();
         let (_dir, handle) = test_start_ready_own().await;
         agent.register_local_workspace_supervisor(sid.clone(), handle);
@@ -3584,7 +3658,7 @@ fn chat_session_spawn_options_matches_thin_profile() {
 /// so no other test reaches the release.
 #[tokio::test]
 async fn remove_session_releases_workspace_binding_and_side_maps() {
-    let agent = build_minimal_agent_for_tests();
+    let agent = build_agent_with_byok_model();
     let sid = acp::SessionId::new("test-session-workspace-release");
     let ops = xai_grok_workspace::WorkspaceOps::for_test();
     let toolset =
@@ -3630,7 +3704,7 @@ fn ext_method_rewind_uses_local_dispatch_without_bridge() {
     use acp::Agent as _;
     let _env = crate::env::EnvVarGuard::remove(crate::env::GROK_DISABLE_CUSTOM_BRIDGE_ENV);
     run_local_for_bridge_test(|| async {
-        let agent = build_minimal_agent_for_tests();
+        let agent = build_agent_with_byok_model();
         let params = serde_json::json!({ "sessionId": "sess-local" });
         let err = agent
             .ext_method(acp::ExtRequest::new(
@@ -3647,7 +3721,7 @@ fn cancel_does_not_forward_to_bridge_in_local_mode() {
     use crate::session::SessionCommand;
     use acp::Agent as _;
     run_local_for_bridge_test(|| async {
-        let agent = build_minimal_agent_for_tests();
+        let agent = build_agent_with_byok_model();
         let sid = acp::SessionId::new("sess-cancel-local");
         let (handle, _tx, mut cmd_rx) = make_live_session_handle(&sid, None);
         agent.insert_resident(&sid, handle);
@@ -3675,7 +3749,7 @@ fn cancel_never_overtakes_in_flight_prompt_intake() {
     use crate::session::SessionCommand;
     use acp::Agent as _;
     run_local_for_bridge_test(|| async {
-        let agent = build_minimal_agent_for_tests();
+        let agent = build_agent_with_byok_model();
         let sid = acp::SessionId::new("sess-cancel-intake-race");
         let (handle, _tx, mut cmd_rx) = make_live_session_handle(&sid, None);
         agent.insert_resident(&sid, handle);
@@ -4061,7 +4135,7 @@ async fn ext_notification_queue_edit_survives_dropped_actor_mailbox() {
 #[test]
 fn disconnect_keeps_live_session_resident_without_finalize() {
     run_local_for_bridge_test(|| async {
-        let agent = build_minimal_agent_for_tests();
+        let agent = build_agent_with_byok_model();
         let sid = acp::SessionId::new("sess-live");
         let (_cmd_tx, mut cmd_rx) = {
             let (handle, tx, rx) = make_live_session_handle(&sid, Some("turn-1"));
@@ -4111,7 +4185,7 @@ fn disconnect_keeps_live_session_resident_without_finalize() {
 #[test]
 fn disconnect_keeps_resident_on_poisoned_lock() {
     run_local_for_bridge_test(|| async {
-        let agent = build_minimal_agent_for_tests();
+        let agent = build_agent_with_byok_model();
         let sid = acp::SessionId::new("sess-poison");
         let (handle, _tx, _rx) = make_live_session_handle(&sid, None);
         let poison_target = handle.current_prompt_id.clone();
@@ -4147,7 +4221,7 @@ fn disconnect_keeps_resident_on_poisoned_lock() {
 #[test]
 fn remove_session_keeps_a_running_thread_tracked() {
     run_local_for_bridge_test(|| async {
-        let agent = build_minimal_agent_for_tests();
+        let agent = build_agent_with_byok_model();
         let sid = acp::SessionId::new("sess-wedged");
         let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
         agent.session_registry.set_thread(
@@ -4189,7 +4263,7 @@ fn remove_session_keeps_a_running_thread_tracked() {
 #[test]
 fn disconnect_unloads_idle_session_without_finalize() {
     run_local_for_bridge_test(|| async {
-        let agent = build_minimal_agent_for_tests();
+        let agent = build_agent_with_byok_model();
         let sid = acp::SessionId::new("sess-idle");
         let (handle, _cmd_tx, cmd_rx) = make_live_session_handle(&sid, None);
         agent.insert_resident(&sid, handle);
@@ -4263,7 +4337,7 @@ fn disconnect_unloads_idle_session_without_finalize() {
 #[test]
 fn disconnect_keeps_resident_when_actor_reports_busy() {
     run_local_for_bridge_test(|| async {
-        let agent = build_minimal_agent_for_tests();
+        let agent = build_agent_with_byok_model();
         let sid = acp::SessionId::new("sess-busy");
         let (handle, _cmd_tx, cmd_rx) = make_live_session_handle(&sid, None);
         agent.insert_resident(&sid, handle);
@@ -4296,7 +4370,7 @@ fn disconnect_keeps_resident_when_actor_reports_busy() {
 #[test]
 fn disconnect_keeps_resident_when_plan_approval_parked() {
     run_local_for_bridge_test(|| async {
-        let agent = build_minimal_agent_for_tests();
+        let agent = build_agent_with_byok_model();
         let sid = acp::SessionId::new("sess-plan-parked");
         let (handle, _cmd_tx, cmd_rx) = make_live_session_handle(&sid, None);
         handle.pending_interactions.lock().unwrap().insert(
@@ -4335,7 +4409,7 @@ fn disconnect_keeps_resident_when_plan_approval_parked() {
 #[test]
 fn disconnect_mixed_batch_keeps_busy_unloads_idle() {
     run_local_for_bridge_test(|| async {
-        let agent = build_minimal_agent_for_tests();
+        let agent = build_agent_with_byok_model();
         let sid_busy = acp::SessionId::new("sess-batch-busy");
         let sid_idle = acp::SessionId::new("sess-batch-idle");
         let (busy_handle, _busy_tx, busy_rx) = make_live_session_handle(&sid_busy, None);
@@ -4392,7 +4466,7 @@ fn disconnect_mixed_batch_keeps_busy_unloads_idle() {
 #[test]
 fn session_live_state_map_is_bounded_across_cycles() {
     run_local_for_bridge_test(|| async {
-        let agent = build_minimal_agent_for_tests();
+        let agent = build_agent_with_byok_model();
         for i in 0..50 {
             let sid = acp::SessionId::new(format!("sess-cycle-{i}"));
             let (handle, _tx, _rx) = make_live_session_handle(&sid, Some("turn"));
@@ -4416,7 +4490,7 @@ fn session_live_state_map_is_bounded_across_cycles() {
 #[test]
 fn explicit_close_finalizes_the_replica() {
     run_local_for_bridge_test(|| async {
-        let agent = build_minimal_agent_for_tests();
+        let agent = build_agent_with_byok_model();
         let sid = acp::SessionId::new("sess-close");
         let (handle, _tx, mut cmd_rx) = make_live_session_handle(&sid, Some("turn-1"));
         agent.insert_resident(&sid, handle);
@@ -4489,7 +4563,7 @@ fn explicit_close_finalizes_the_replica() {
 #[test]
 fn supervisor_reaps_panicked_resident_actor() {
     run_local_for_bridge_test(|| async {
-        let agent = build_minimal_agent_for_tests();
+        let agent = build_agent_with_byok_model();
         let sid = acp::SessionId::new("sess-panic");
         let (handle, _tx, _rx) = make_live_session_handle(&sid, Some("turn-1"));
         agent.insert_resident(&sid, handle);
@@ -4561,7 +4635,7 @@ async fn storage_mode_self_corrects_to_writeback_when_settings_arrive() {
 #[test]
 fn spawn_settings_reapply_coalesces_while_in_flight() {
     run_local_for_bridge_test(|| async {
-        let agent = build_minimal_agent_for_tests();
+        let agent = build_agent_with_byok_model();
         assert_eq!(agent.settings_reapply_spawn_count.get(), 0);
         agent.spawn_settings_reapply();
         agent.spawn_settings_reapply();
@@ -4579,7 +4653,7 @@ fn spawn_settings_reapply_coalesces_while_in_flight() {
 #[test]
 fn spawn_settings_reapply_clears_flag_after_completion() {
     run_local_for_bridge_test(|| async {
-        let agent = build_minimal_agent_for_tests();
+        let agent = build_agent_with_byok_model();
         agent.spawn_settings_reapply();
         assert_eq!(agent.settings_reapply_spawn_count.get(), 1);
         assert!(agent.settings_reapply_in_flight.get());
@@ -4609,7 +4683,7 @@ fn spawn_settings_reapply_clears_flag_after_completion() {
 #[test]
 fn post_auth_settings_not_coalesced_by_in_flight_reapply() {
     run_local_for_bridge_test(|| async {
-        let agent = build_minimal_agent_for_tests();
+        let agent = build_agent_with_byok_model();
         agent.spawn_settings_reapply();
         assert!(agent.settings_reapply_in_flight.get());
         agent.spawn_post_auth_settings(crate::auth::GrokAuth::test_default());
@@ -4933,7 +5007,7 @@ async fn settings_not_cached_when_identity_logs_out_during_fetch() {
 #[test]
 fn ensure_session_supervisor_is_idempotent() {
     run_local_for_bridge_test(|| async {
-        let agent = build_minimal_agent_for_tests();
+        let agent = build_agent_with_byok_model();
         assert_eq!(agent.supervisor_spawn_count.get(), 0);
         agent.ensure_session_supervisor();
         agent.ensure_session_supervisor();
@@ -4952,7 +5026,7 @@ fn ensure_session_supervisor_is_idempotent() {
 #[test]
 fn reload_after_terminal_removal_starts_clean() {
     run_local_for_bridge_test(|| async {
-        let agent = build_minimal_agent_for_tests();
+        let agent = build_agent_with_byok_model();
         let sid = acp::SessionId::new("sess-reload");
         let (handle, _tx, _rx) = make_live_session_handle(&sid, Some("turn-1"));
         agent.insert_resident(&sid, handle);
@@ -5600,7 +5674,7 @@ fn test_now() -> chrono::DateTime<chrono::Utc> {
 /// re-election (`AppView.announcements_last_gen` is never reset).
 #[tokio::test]
 async fn announcements_gen_seeds_from_epoch_and_strictly_increases() {
-    let agent = build_minimal_agent_for_tests();
+    let agent = build_agent_with_byok_model();
     let epoch_before = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -5779,7 +5853,7 @@ fn announcements_push_gate_emits_on_expiry_crossing() {
 /// startup, auth, and `/new`).
 #[tokio::test]
 async fn polled_announcements_apply_touches_announcements_only() {
-    let agent = build_minimal_agent_for_tests();
+    let agent = build_agent_with_byok_model();
     let mut stored = settings_with(Some(vec![ann("old")]));
     stored.tips = Some(vec!["stored-tip".to_string()]);
     stored.allow_access = Some(true);
@@ -5817,7 +5891,7 @@ async fn polled_announcements_apply_touches_announcements_only() {
 /// depend on absence staying observable.
 #[tokio::test]
 async fn polled_announcements_apply_never_fabricates_settings() {
-    let agent = build_minimal_agent_for_tests();
+    let agent = build_agent_with_byok_model();
     agent.cfg.borrow_mut().remote_settings = None;
     agent.apply_polled_announcements(settings_with(Some(vec![ann("a")])), None);
     assert!(
@@ -5830,7 +5904,7 @@ async fn polled_announcements_apply_never_fabricates_settings() {
 /// (the next tick reconciles).
 #[tokio::test]
 async fn polled_announcements_apply_skips_when_writer_landed_mid_fetch() {
-    let agent = build_minimal_agent_for_tests();
+    let agent = build_agent_with_byok_model();
     let pre_fetch = Some(vec![ann("old")]);
     agent.cfg.borrow_mut().remote_settings = Some(settings_with(Some(vec![ann("mid-fetch")])));
     agent.apply_polled_announcements(settings_with(Some(vec![ann("stale-poll")])), pre_fetch);

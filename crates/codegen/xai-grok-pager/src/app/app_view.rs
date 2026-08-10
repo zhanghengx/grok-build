@@ -24,6 +24,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use xai_acp_lib::AcpAgentTx;
+use xai_grok_shell::sampling::ApiBackend;
 /// State for the "New Worktree" popup dialog on the welcome screen.
 #[derive(Debug, Default)]
 pub struct NewWorktreeDialogState {
@@ -393,6 +394,10 @@ pub struct CardDetail {
 pub enum AuthState {
     /// No login required (API key, cached token, or already authenticated).
     Done,
+    /// No usable API connection is configured. The API-key-only build cannot
+    /// recover this state with an interactive login, so the welcome screen
+    /// shows the required `base_url` and `api_key` configuration instead.
+    ConfigRequired,
     /// Login required -- show login menu on welcome screen.
     /// `error` is set after a failed auth attempt so the user sees what went wrong.
     Pending { error: Option<String> },
@@ -408,6 +413,25 @@ pub enum AuthState {
         mode: AuthMode,
     },
 }
+
+/// Field currently receiving input on the API configuration screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApiConfigurationField {
+    BaseUrl,
+    ApiKey,
+    ApiBackend,
+}
+
+/// Progress state for the API configuration save/reload pipeline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApiConfigurationStatus {
+    Editing,
+    Saving,
+    Reloading,
+}
+
+/// Default endpoint shown on the first-run API configuration screen.
+pub const DEFAULT_API_BASE_URL: &str = "https://api.x.ai/v1";
 /// How the auth flow presents itself to the user.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthMode {
@@ -848,6 +872,8 @@ pub struct AppView {
     pub(super) last_cache_evict_at: Option<Instant>,
     /// Hit-test rect for welcome prompt input (populated during render).
     pub welcome_prompt_rect: Option<ratatui::layout::Rect>,
+    /// Hit-test rect for the first-run API backend selector.
+    pub welcome_api_configuration_backend_rect: Option<ratatui::layout::Rect>,
     /// Hit-test rect for the auth URL (click-to-open during Authenticating).
     pub welcome_auth_url_rect: Option<ratatui::layout::Rect>,
     /// Whether the mouse pointer was last over the auth URL (for OSC 22 cursor shape).
@@ -1071,6 +1097,18 @@ pub struct AppView {
     pub auth_start_mode: AuthMode,
     /// Text buffer for manual auth token paste (loopback mode).
     pub(crate) auth_code_input: LineEditor,
+    /// Base URL input for the API-key-only first-run configuration screen.
+    pub(crate) api_base_url_input: LineEditor,
+    /// API key input for the API-key-only first-run configuration screen.
+    pub(crate) api_key_input: LineEditor,
+    /// API backend selected on the API-key-only first-run configuration screen.
+    pub(crate) api_configuration_backend: ApiBackend,
+    /// Focused field on the API configuration screen.
+    pub(crate) api_configuration_field: ApiConfigurationField,
+    /// Current save/reload phase for the API configuration screen.
+    pub(crate) api_configuration_status: ApiConfigurationStatus,
+    /// Validation or persistence error shown on the API configuration screen.
+    pub(crate) api_configuration_error: Option<String>,
     /// Monotonically increasing sequence number for auth requests.
     pub next_auth_request_seq: u64,
     /// Abort handle for the in-flight `PollAuthUrl` task (with its request_seq).
@@ -1234,6 +1272,46 @@ fn privacy_banner_reshow_elapsed(acked_at: &str, reshow_days: Option<u64>) -> bo
     chrono::Utc::now() >= next
 }
 impl AppView {
+    /// Current base URL shown by the API configuration form.
+    pub fn api_configuration_base_url(&self) -> &str {
+        self.api_base_url_input.text()
+    }
+
+    /// Cursor byte offset in the API base URL input.
+    pub fn api_configuration_base_url_cursor(&self) -> usize {
+        self.api_base_url_input.cursor_byte()
+    }
+
+    /// Current API key shown by the API configuration form.
+    pub fn api_configuration_api_key(&self) -> &str {
+        self.api_key_input.text()
+    }
+
+    /// Cursor byte offset in the API key input.
+    pub fn api_configuration_api_key_cursor(&self) -> usize {
+        self.api_key_input.cursor_byte()
+    }
+
+    /// Current API backend selected by the API configuration form.
+    pub fn api_configuration_backend(&self) -> ApiBackend {
+        self.api_configuration_backend.clone()
+    }
+
+    /// Current field focus on the API configuration form.
+    pub fn api_configuration_field(&self) -> ApiConfigurationField {
+        self.api_configuration_field
+    }
+
+    /// Current save/reload phase on the API configuration form.
+    pub fn api_configuration_status(&self) -> ApiConfigurationStatus {
+        self.api_configuration_status
+    }
+
+    /// Current validation or persistence error on the API configuration form.
+    pub fn api_configuration_error(&self) -> Option<&str> {
+        self.api_configuration_error.as_deref()
+    }
+
     /// Finishes startup if this view still holds the obligation; does nothing after.
     pub(crate) fn finish_startup(&mut self, outcome: xai_grok_telemetry::startup::StartupOutcome) {
         xai_grok_telemetry::startup::PendingStartup::finish_held(
@@ -1475,6 +1553,7 @@ impl AppView {
             last_scroll_pos: None,
             last_cache_evict_at: None,
             welcome_prompt_rect: None,
+            welcome_api_configuration_backend_rect: None,
             welcome_auth_url_rect: None,
             welcome_on_auth_url: false,
             welcome_on_changelog_cta: false,
@@ -1563,6 +1642,16 @@ impl AppView {
             login_method_id: None,
             auth_start_mode: AuthMode::Pending,
             auth_code_input: LineEditor::default(),
+            api_base_url_input: {
+                let mut input = LineEditor::default();
+                input.set_text(DEFAULT_API_BASE_URL);
+                input
+            },
+            api_key_input: LineEditor::default(),
+            api_configuration_backend: ApiBackend::default(),
+            api_configuration_field: ApiConfigurationField::BaseUrl,
+            api_configuration_status: ApiConfigurationStatus::Editing,
+            api_configuration_error: None,
             next_auth_request_seq: 1,
             auth_url_poll_handle: None,
             deferred_startup: Default::default(),
@@ -2519,6 +2608,12 @@ impl AppView {
                     cwd: &self.cwd,
                     mid_session_login: self.auth_return_view.is_some(),
                     auth_code_input: &mut self.auth_code_input,
+                    api_base_url_input: &mut self.api_base_url_input,
+                    api_key_input: &mut self.api_key_input,
+                    api_configuration_backend: &mut self.api_configuration_backend,
+                    api_configuration_field: &mut self.api_configuration_field,
+                    api_configuration_status: &self.api_configuration_status,
+                    api_configuration_error: &mut self.api_configuration_error,
                     prompt: &mut self.welcome_prompt,
                     prompt_focused: &mut self.welcome_prompt_focused,
                     new_worktree_dialog: &mut self.new_worktree_dialog,
@@ -2535,6 +2630,9 @@ impl AppView {
                             }
                     },
                     prompt_rect: self.welcome_prompt_rect.as_ref(),
+                    api_configuration_backend_rect: self
+                        .welcome_api_configuration_backend_rect
+                        .as_ref(),
                     import_banner_rect: self.welcome_import_banner_rect.as_ref(),
                     auth_url_rect: self.welcome_auth_url_rect.as_ref(),
                     auth_fallback_rect: self.welcome_auth_fallback_rect.as_ref(),
@@ -3139,6 +3237,12 @@ struct WelcomeInputCtx<'a> {
     /// login and return to the session rather than quitting the app.
     mid_session_login: bool,
     auth_code_input: &'a mut LineEditor,
+    api_base_url_input: &'a mut LineEditor,
+    api_key_input: &'a mut LineEditor,
+    api_configuration_backend: &'a mut ApiBackend,
+    api_configuration_field: &'a mut ApiConfigurationField,
+    api_configuration_status: &'a ApiConfigurationStatus,
+    api_configuration_error: &'a mut Option<String>,
     prompt: &'a mut PromptWidget,
     prompt_focused: &'a mut bool,
     new_worktree_dialog: &'a mut Option<NewWorktreeDialogState>,
@@ -3146,6 +3250,7 @@ struct WelcomeInputCtx<'a> {
     menu_rects: &'a [ratatui::layout::Rect],
     menu_count: usize,
     prompt_rect: Option<&'a ratatui::layout::Rect>,
+    api_configuration_backend_rect: Option<&'a ratatui::layout::Rect>,
     import_banner_rect: Option<&'a ratatui::layout::Rect>,
     auth_url_rect: Option<&'a ratatui::layout::Rect>,
     auth_fallback_rect: Option<&'a ratatui::layout::Rect>,
@@ -3227,6 +3332,192 @@ struct WelcomeInputCtx<'a> {
     #[cfg(feature = "local-workspace")]
     session_picker_open: bool,
 }
+
+/// Handle the first-run API configuration form before normal welcome input
+/// routing can interpret Enter or text as session actions.
+fn handle_api_configuration_input(ev: &Event, ctx: &mut WelcomeInputCtx<'_>) -> InputOutcome {
+    let is_quit = |key: &crossterm::event::KeyEvent| {
+        key!(Esc).matches(key)
+            || key!('c', CONTROL).matches(key)
+            || key!('d', CONTROL).matches(key)
+            || key!('q', CONTROL).matches(key)
+    };
+
+    if let Event::Mouse(mouse) = ev {
+        if matches!(
+            mouse.kind,
+            crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left)
+        ) {
+            if matches!(
+                ctx.api_configuration_status,
+                ApiConfigurationStatus::Editing
+            ) && let Some(rect) = ctx.api_configuration_backend_rect
+                && rect.contains(ratatui::layout::Position::new(mouse.column, mouse.row))
+            {
+                *ctx.api_configuration_field = ApiConfigurationField::ApiBackend;
+                if mouse.column <= rect.x.saturating_add(3) {
+                    cycle_api_configuration_backend(ctx.api_configuration_backend, false);
+                } else if mouse.column >= rect.x.saturating_add(rect.width.saturating_sub(4)) {
+                    cycle_api_configuration_backend(ctx.api_configuration_backend, true);
+                }
+                *ctx.api_configuration_error = None;
+                return InputOutcome::Changed;
+            }
+            for rect in ctx.menu_rects {
+                if rect.contains(ratatui::layout::Position::new(mouse.column, mouse.row)) {
+                    return InputOutcome::Action(Action::QuitConfirmed);
+                }
+            }
+        }
+        return InputOutcome::Unchanged;
+    }
+
+    if let Event::Key(key) = ev {
+        if key.kind == KeyEventKind::Release {
+            return InputOutcome::Unchanged;
+        }
+        if is_quit(key) {
+            return InputOutcome::Action(Action::QuitConfirmed);
+        }
+        if !matches!(
+            ctx.api_configuration_status,
+            ApiConfigurationStatus::Editing
+        ) {
+            return InputOutcome::Unchanged;
+        }
+
+        if key.code == KeyCode::Tab {
+            *ctx.api_configuration_field = match *ctx.api_configuration_field {
+                ApiConfigurationField::BaseUrl => ApiConfigurationField::ApiKey,
+                ApiConfigurationField::ApiKey => ApiConfigurationField::ApiBackend,
+                ApiConfigurationField::ApiBackend => ApiConfigurationField::BaseUrl,
+            };
+            return InputOutcome::Changed;
+        }
+        if key.code == KeyCode::BackTab {
+            *ctx.api_configuration_field = match *ctx.api_configuration_field {
+                ApiConfigurationField::BaseUrl => ApiConfigurationField::ApiBackend,
+                ApiConfigurationField::ApiKey => ApiConfigurationField::BaseUrl,
+                ApiConfigurationField::ApiBackend => ApiConfigurationField::ApiKey,
+            };
+            return InputOutcome::Changed;
+        }
+        if key.modifiers.is_empty() && key.code == KeyCode::Up {
+            *ctx.api_configuration_field = match *ctx.api_configuration_field {
+                ApiConfigurationField::BaseUrl => ApiConfigurationField::ApiBackend,
+                ApiConfigurationField::ApiKey => ApiConfigurationField::BaseUrl,
+                ApiConfigurationField::ApiBackend => ApiConfigurationField::ApiKey,
+            };
+            return InputOutcome::Changed;
+        }
+        if key.modifiers.is_empty() && key.code == KeyCode::Down {
+            *ctx.api_configuration_field = match *ctx.api_configuration_field {
+                ApiConfigurationField::BaseUrl => ApiConfigurationField::ApiKey,
+                ApiConfigurationField::ApiKey => ApiConfigurationField::ApiBackend,
+                ApiConfigurationField::ApiBackend => ApiConfigurationField::BaseUrl,
+            };
+            return InputOutcome::Changed;
+        }
+        if key.code == KeyCode::Enter && key.modifiers.is_empty() {
+            return match *ctx.api_configuration_field {
+                ApiConfigurationField::BaseUrl => {
+                    *ctx.api_configuration_field = ApiConfigurationField::ApiKey;
+                    InputOutcome::Changed
+                }
+                ApiConfigurationField::ApiKey => {
+                    *ctx.api_configuration_field = ApiConfigurationField::ApiBackend;
+                    InputOutcome::Changed
+                }
+                ApiConfigurationField::ApiBackend => {
+                    InputOutcome::Action(Action::SubmitApiConfiguration)
+                }
+            };
+        }
+
+        if *ctx.api_configuration_field == ApiConfigurationField::ApiBackend {
+            if key.modifiers.is_empty() && matches!(key.code, KeyCode::Left | KeyCode::Right) {
+                cycle_api_configuration_backend(
+                    ctx.api_configuration_backend,
+                    key.code == KeyCode::Right,
+                );
+                *ctx.api_configuration_error = None;
+                return InputOutcome::Changed;
+            }
+            return InputOutcome::Unchanged;
+        }
+
+        let input = match *ctx.api_configuration_field {
+            ApiConfigurationField::BaseUrl => &mut *ctx.api_base_url_input,
+            ApiConfigurationField::ApiKey => &mut *ctx.api_key_input,
+            ApiConfigurationField::ApiBackend => unreachable!("backend handled above"),
+        };
+        let outcome = if crate::input::key::is_paste_key(key) {
+            crate::clipboard::system_clipboard_get()
+                .map_or(LineEditOutcome::Unhandled, |text| input.insert_paste(&text))
+        } else if key.modifiers.intersects(
+            crossterm::event::KeyModifiers::CONTROL
+                | crossterm::event::KeyModifiers::ALT
+                | crossterm::event::KeyModifiers::SUPER,
+        ) && !crate::input::key::is_altgr(key.modifiers)
+        {
+            LineEditOutcome::Unhandled
+        } else {
+            input.handle_key(key)
+        };
+        return match outcome {
+            LineEditOutcome::TextChanged
+            | LineEditOutcome::CursorChanged
+            | LineEditOutcome::HandledNoChange => {
+                if !matches!(outcome, LineEditOutcome::HandledNoChange) {
+                    *ctx.api_configuration_error = None;
+                }
+                InputOutcome::Changed
+            }
+            LineEditOutcome::Unhandled => InputOutcome::Unchanged,
+        };
+    }
+
+    if let Event::Paste(text) = ev {
+        if !matches!(
+            ctx.api_configuration_status,
+            ApiConfigurationStatus::Editing
+        ) {
+            return InputOutcome::Unchanged;
+        }
+        let input = match *ctx.api_configuration_field {
+            ApiConfigurationField::BaseUrl => &mut *ctx.api_base_url_input,
+            ApiConfigurationField::ApiKey => &mut *ctx.api_key_input,
+            ApiConfigurationField::ApiBackend => return InputOutcome::Unchanged,
+        };
+        let outcome = input.insert_paste(text);
+        if !matches!(outcome, LineEditOutcome::HandledNoChange) {
+            *ctx.api_configuration_error = None;
+        }
+        return match outcome {
+            LineEditOutcome::TextChanged
+            | LineEditOutcome::CursorChanged
+            | LineEditOutcome::HandledNoChange => InputOutcome::Changed,
+            LineEditOutcome::Unhandled => InputOutcome::Unchanged,
+        };
+    }
+
+    if matches!(ev, Event::Resize(_, _)) {
+        return InputOutcome::Changed;
+    }
+    InputOutcome::Unchanged
+}
+
+fn cycle_api_configuration_backend(backend: &mut ApiBackend, forward: bool) {
+    *backend = match (backend.clone(), forward) {
+        (ApiBackend::ChatCompletions, true) => ApiBackend::Responses,
+        (ApiBackend::Responses, true) => ApiBackend::Messages,
+        (ApiBackend::Messages, true) => ApiBackend::ChatCompletions,
+        (ApiBackend::ChatCompletions, false) => ApiBackend::Messages,
+        (ApiBackend::Responses, false) => ApiBackend::ChatCompletions,
+        (ApiBackend::Messages, false) => ApiBackend::Responses,
+    };
+}
+
 /// Welcome view input -- auth-state-aware routing.
 fn handle_welcome_input(ev: &Event, ctx: &mut WelcomeInputCtx<'_>) -> InputOutcome {
     if let Some(modal) = ctx.import_claude_modal.as_mut() {
@@ -3365,6 +3656,9 @@ fn handle_welcome_input(ev: &Event, ctx: &mut WelcomeInputCtx<'_>) -> InputOutco
             return InputOutcome::Changed;
         }
         return InputOutcome::Unchanged;
+    }
+    if matches!(ctx.auth_state, AuthState::ConfigRequired) {
+        return handle_api_configuration_input(ev, ctx);
     }
     #[cfg(feature = "local-workspace")]
     if *ctx.workspace_mode_ack_pending
@@ -3789,6 +4083,14 @@ fn handle_welcome_input(ev: &Event, ctx: &mut WelcomeInputCtx<'_>) -> InputOutco
                     return InputOutcome::Action(Action::Quit);
                 }
             }
+            AuthState::ConfigRequired => {
+                if key!('q').matches(key)
+                    || key!('c', CONTROL).matches(key)
+                    || key!('d', CONTROL).matches(key)
+                {
+                    return InputOutcome::Action(Action::QuitConfirmed);
+                }
+            }
             AuthState::Pending { .. } => {
                 if key!('q').matches(key)
                     || key!('c', CONTROL).matches(key)
@@ -3896,6 +4198,9 @@ fn handle_welcome_input(ev: &Event, ctx: &mut WelcomeInputCtx<'_>) -> InputOutco
                         && mouse.row >= rect.y
                         && mouse.row < rect.y + rect.height
                     {
+                        if matches!(ctx.auth_state, AuthState::ConfigRequired) {
+                            return dispatch_configuration_required_menu_action(i);
+                        }
                         if matches!(ctx.auth_state, AuthState::Pending { .. }) {
                             return dispatch_pending_menu_action(i);
                         }
@@ -4142,6 +4447,14 @@ fn dispatch_pending_menu_action(index: usize) -> InputOutcome {
     match index {
         0 => InputOutcome::Action(Action::Login),
         1 => InputOutcome::Action(Action::Quit),
+        _ => InputOutcome::Unchanged,
+    }
+}
+/// Dispatch an action for the API configuration-required welcome screen.
+/// Menu layout: 0 = Quit.
+fn dispatch_configuration_required_menu_action(index: usize) -> InputOutcome {
+    match index {
+        0 => InputOutcome::Action(Action::Quit),
         _ => InputOutcome::Unchanged,
     }
 }
@@ -4547,6 +4860,14 @@ impl AppView {
                             login_label: self.login_label.as_deref(),
                             auth_code_input: self.auth_code_input.text(),
                             auth_code_cursor_byte: self.auth_code_input.cursor_byte(),
+                            api_base_url_input: self.api_base_url_input.text(),
+                            api_base_url_cursor_byte: self.api_base_url_input.cursor_byte(),
+                            api_key_input: self.api_key_input.text(),
+                            api_key_cursor_byte: self.api_key_input.cursor_byte(),
+                            api_configuration_backend: self.api_configuration_backend.clone(),
+                            api_configuration_field: self.api_configuration_field,
+                            api_configuration_status: self.api_configuration_status,
+                            api_configuration_error: self.api_configuration_error.as_deref(),
                             clipboard_delivery: self.auth_clipboard_delivery,
                             show_raw_url: self.auth_show_raw_url,
                             announcement: hero_announcement,
@@ -4614,6 +4935,8 @@ impl AppView {
                         self.welcome_menu_rects = result.menu_rects;
                         self.welcome_show_changelog_action = result.changelog_action_present;
                         self.welcome_prompt_rect = result.prompt_rect;
+                        self.welcome_api_configuration_backend_rect =
+                            result.api_configuration_backend_rect;
                         self.welcome_import_banner_rect = result.import_banner_rect;
                         self.welcome_auth_url_rect = result.auth_url_rect;
                         self.welcome_auth_fallback_rect = result.auth_fallback_rect;
@@ -6036,6 +6359,16 @@ pub(crate) mod tests {
             login_method_id: None,
             auth_start_mode: AuthMode::Pending,
             auth_code_input: LineEditor::default(),
+            api_base_url_input: {
+                let mut input = LineEditor::default();
+                input.set_text(DEFAULT_API_BASE_URL);
+                input
+            },
+            api_key_input: LineEditor::default(),
+            api_configuration_backend: ApiBackend::default(),
+            api_configuration_field: ApiConfigurationField::BaseUrl,
+            api_configuration_status: ApiConfigurationStatus::Editing,
+            api_configuration_error: None,
             next_auth_request_seq: 1,
             auth_url_poll_handle: None,
             deferred_startup: Default::default(),
@@ -6086,6 +6419,7 @@ pub(crate) mod tests {
             last_scroll_pos: None,
             last_cache_evict_at: None,
             welcome_prompt_rect: None,
+            welcome_api_configuration_backend_rect: None,
             welcome_auth_url_rect: None,
             welcome_on_auth_url: false,
             welcome_on_changelog_cta: false,
@@ -6415,6 +6749,103 @@ pub(crate) mod tests {
     }
     fn key_event(code: KeyCode, mods: KeyModifiers) -> Event {
         Event::Key(KeyEvent::new(code, mods))
+    }
+
+    #[test]
+    fn api_configuration_input_switches_fields_and_submits_without_swallowing_q() {
+        let mut app = test_app();
+        app.auth_state = AuthState::ConfigRequired;
+        app.api_key_input.set_text("");
+
+        assert!(matches!(
+            app.handle_input(&key_event(KeyCode::Tab, KeyModifiers::NONE)),
+            InputOutcome::Changed
+        ));
+        assert_eq!(app.api_configuration_field, ApiConfigurationField::ApiKey);
+        assert!(matches!(
+            app.handle_input(&key_event(KeyCode::Char('q'), KeyModifiers::NONE)),
+            InputOutcome::Changed
+        ));
+        assert_eq!(app.api_key_input.text(), "q");
+
+        assert!(matches!(
+            app.handle_input(&Event::Paste("xai-secret".into())),
+            InputOutcome::Changed
+        ));
+        assert_eq!(app.api_key_input.text(), "qxai-secret");
+
+        assert!(matches!(
+            app.handle_input(&key_event(KeyCode::BackTab, KeyModifiers::NONE)),
+            InputOutcome::Changed
+        ));
+        assert_eq!(app.api_configuration_field, ApiConfigurationField::BaseUrl);
+        assert!(matches!(
+            app.handle_input(&key_event(KeyCode::Enter, KeyModifiers::NONE)),
+            InputOutcome::Changed
+        ));
+        assert_eq!(app.api_configuration_field, ApiConfigurationField::ApiKey);
+        assert!(matches!(
+            app.handle_input(&key_event(KeyCode::Enter, KeyModifiers::NONE)),
+            InputOutcome::Changed
+        ));
+        assert_eq!(
+            app.api_configuration_field,
+            ApiConfigurationField::ApiBackend
+        );
+        assert!(matches!(
+            app.handle_input(&key_event(KeyCode::Right, KeyModifiers::NONE)),
+            InputOutcome::Changed
+        ));
+        assert_eq!(
+            app.api_configuration_backend,
+            ApiBackend::Responses,
+            "backend selector should advance from the default"
+        );
+
+        assert!(matches!(
+            app.handle_input(&key_event(KeyCode::Enter, KeyModifiers::NONE)),
+            InputOutcome::Action(Action::SubmitApiConfiguration)
+        ));
+    }
+
+    #[test]
+    fn api_configuration_backend_click_focuses_and_cycles_selector() {
+        let mut app = test_app();
+        app.auth_state = AuthState::ConfigRequired;
+        app.welcome_api_configuration_backend_rect =
+            Some(ratatui::layout::Rect::new(10, 12, 30, 3));
+
+        let left_click = left_mouse(MouseEventKind::Down(MouseButton::Left), 11, 13);
+        assert!(matches!(
+            app.handle_input(&left_click),
+            InputOutcome::Changed
+        ));
+        assert_eq!(
+            app.api_configuration_field,
+            ApiConfigurationField::ApiBackend
+        );
+        assert_eq!(app.api_configuration_backend, ApiBackend::Messages);
+
+        let right_click = left_mouse(MouseEventKind::Down(MouseButton::Left), 39, 13);
+        assert!(matches!(
+            app.handle_input(&right_click),
+            InputOutcome::Changed
+        ));
+        assert_eq!(app.api_configuration_backend, ApiBackend::ChatCompletions);
+    }
+
+    #[test]
+    fn api_configuration_input_does_not_edit_while_saving() {
+        let mut app = test_app();
+        app.auth_state = AuthState::ConfigRequired;
+        app.api_configuration_status = ApiConfigurationStatus::Saving;
+        let before = app.api_base_url_input.text().to_owned();
+
+        assert!(matches!(
+            app.handle_input(&key_event(KeyCode::Char('x'), KeyModifiers::NONE)),
+            InputOutcome::Unchanged
+        ));
+        assert_eq!(app.api_base_url_input.text(), before);
     }
     /// Build a registry pinned to the non-VSCode bindings so tests are
     /// deterministic regardless of the host terminal.
@@ -8212,6 +8643,23 @@ pub(crate) mod tests {
         let outcome = app.handle_input(&ctrl_c());
         assert!(matches!(outcome, InputOutcome::Action(Action::Quit)));
         assert!(app.pending_action.is_none());
+    }
+    #[test]
+    fn welcome_configuration_required_keeps_editing_without_login() {
+        let mut app = test_app();
+        app.auth_state = AuthState::ConfigRequired;
+        app.welcome_prompt_focused = false;
+
+        let login = app.handle_input(&key_event(KeyCode::Char('l'), KeyModifiers::NONE));
+        assert!(matches!(login, InputOutcome::Changed));
+        assert!(app.api_base_url_input.text().ends_with('l'));
+
+        let input = app.handle_input(&key_event(KeyCode::Char('q'), KeyModifiers::NONE));
+        assert!(matches!(input, InputOutcome::Changed));
+        assert!(app.api_base_url_input.text().ends_with("lq"));
+
+        let quit = app.handle_input(&key_event(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(matches!(quit, InputOutcome::Action(Action::Quit)));
     }
     #[test]
     fn welcome_authenticating_ctrl_c_quits_instantly() {

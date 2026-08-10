@@ -41,9 +41,7 @@ pub enum ManagedConfigError {
         "The deployment key was rejected. Confirm that GROK_DEPLOYMENT_KEY is set correctly and hasn't expired."
     )]
     DeploymentKeyRejected,
-    #[error(
-        "Your team sign-in was rejected. It may have expired or lack access. Run `grok login` to sign in again."
-    )]
+    #[error("Your API key was rejected. Verify your api_key or env_key in ~/.grok/config.toml.")]
     TeamAuthRejected,
     #[error("The server returned an unexpected error (HTTP {status}). Try again in a few minutes.")]
     ServerError { status: u16 },
