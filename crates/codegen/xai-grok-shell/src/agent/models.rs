@@ -512,6 +512,9 @@ impl ModelsManager {
             self.inner
                 .model_switch_watch
                 .send_modify(|generation| *generation += 1);
+            // A different model owns a different `/models` endpoint, so a
+            // previously loaded model-scoped catalog is stale for it.
+            self.inner.catalog.write().model_endpoint_catalog_loaded = false;
         }
     }
 
@@ -1218,6 +1221,17 @@ impl ModelsManager {
     /// model-owned credential, so a Grok session token cannot cross an
     /// arbitrary `base_url` boundary.
     pub(crate) async fn refresh_current_model_endpoint(&self) -> bool {
+        self.refresh_current_model_endpoint_inner(
+            crate::util::config::resolve_remote_fetch_enabled(),
+        )
+        .await
+    }
+
+    async fn refresh_current_model_endpoint_inner(&self, remote_fetch_enabled: bool) -> bool {
+        if !remote_fetch_enabled {
+            tracing::info!("model-specific catalog refresh skipped: remote_fetch disabled");
+            return false;
+        }
         let Some(request) = self.model_endpoint_request().await else {
             return false;
         };
@@ -1265,13 +1279,10 @@ impl ModelsManager {
         }?;
 
         let provider = entry.effective_auth_provider().cloned();
-        if let Some(provider) = &provider {
-            match provider.ensure_fresh_token(None).await {
-                crate::auth::ProviderRefreshOutcome::Unusable
-                | crate::auth::ProviderRefreshOutcome::MintFailed => return None,
-                crate::auth::ProviderRefreshOutcome::Unchanged
-                | crate::auth::ProviderRefreshOutcome::Rotated(_) => {}
-            }
+        if let Some(provider) = &provider
+            && !Self::bounded_auth_provider_refresh(provider.ensure_fresh_token(None)).await
+        {
+            return None;
         }
 
         let credentials = resolve_credentials(&entry, None);
@@ -1300,6 +1311,32 @@ impl ModelsManager {
             query_params: entry.info.query_params.clone(),
             env_http_headers: entry.info.env_http_headers.clone(),
         })
+    }
+
+    /// Bounds a model auth-provider token refresh to
+    /// `STARTUP_AUTH_REFRESH_TIMEOUT` so a wedged helper can't stall
+    /// initialization for minutes (its own default timeout is 30s with a
+    /// 600s ceiling). `false` when the provider is unusable, the mint failed,
+    /// or the refresh exceeded the bound. Split out so the timeout contract is
+    /// unit-testable without a live provider command.
+    async fn bounded_auth_provider_refresh<F>(fut: F) -> bool
+    where
+        F: std::future::Future<Output = crate::auth::ProviderRefreshOutcome>,
+    {
+        match tokio::time::timeout(crate::http::STARTUP_AUTH_REFRESH_TIMEOUT, fut).await {
+            Ok(outcome) => !matches!(
+                outcome,
+                crate::auth::ProviderRefreshOutcome::Unusable
+                    | crate::auth::ProviderRefreshOutcome::MintFailed
+            ),
+            Err(_) => {
+                tracing::warn!(
+                    timeout_secs = crate::http::STARTUP_AUTH_REFRESH_TIMEOUT.as_secs(),
+                    "model-specific catalog: auth provider refresh timed out"
+                );
+                false
+            }
+        }
     }
 
     async fn fetch_and_apply(&self) {

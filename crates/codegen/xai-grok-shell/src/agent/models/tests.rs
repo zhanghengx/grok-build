@@ -1411,6 +1411,98 @@ async fn model_endpoint_without_model_credential_is_not_requested() {
     assert_eq!(calls.load(Ordering::SeqCst), 0);
 }
 
+#[tokio::test]
+async fn model_endpoint_refresh_respects_remote_fetch_gate() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct CountingEndpoint {
+        calls: Arc<AtomicUsize>,
+    }
+    impl ModelsEndpoint for CountingEndpoint {
+        fn fetch_models(
+            &self,
+            _endpoints: config::EndpointsConfig,
+            _auth: Option<GrokAuth>,
+            _fetch_auth: ModelFetchAuth,
+        ) -> ModelsFetchFuture {
+            Box::pin(async { None })
+        }
+
+        fn fetch_model_endpoint(&self, _request: ModelEndpointRequest) -> ModelsFetchFuture {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { None })
+        }
+    }
+
+    let cfg = config_from_toml(
+        r#"
+            [model.endpoint-model]
+            base_url = "https://provider.example/v1"
+            api_key = "model-api-key"
+            "#,
+    );
+    let tmp = tempfile::TempDir::new().unwrap();
+    let auth_manager = Arc::new(AuthManager::new(tmp.path(), GrokComConfig::default()));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mgr = ModelsManagerBuilder::new(
+        None,
+        resolve_model_catalog(&cfg, None),
+        acp::ModelId::new("endpoint-model"),
+        auth_manager,
+        cfg,
+    )
+    .endpoint(Arc::new(CountingEndpoint {
+        calls: calls.clone(),
+    }))
+    .cache(test_cache_manager(tmp.path()))
+    .build();
+
+    assert!(
+        !mgr.refresh_current_model_endpoint_inner(false).await,
+        "a model-owned catalog must not refresh when remote_fetch is disabled"
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "no model-endpoint fetch may be issued under the remote_fetch gate"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn bounded_auth_provider_refresh_times_out() {
+    use crate::auth::ProviderRefreshOutcome;
+
+    let started = tokio::time::Instant::now();
+    let result = ModelsManager::bounded_auth_provider_refresh(std::future::pending::<
+        ProviderRefreshOutcome,
+    >())
+    .await;
+    assert!(
+        !result,
+        "a hung provider refresh must degrade to no request instead of blocking"
+    );
+    assert!(
+        started.elapsed() >= crate::http::STARTUP_AUTH_REFRESH_TIMEOUT,
+        "must wait the full bound before giving up",
+    );
+}
+
+#[test]
+fn switching_current_model_invalidates_endpoint_catalog_cache() {
+    let mgr = test_manager();
+    {
+        let mut cat = mgr.inner.catalog.write();
+        cat.model_endpoint_catalog_loaded = true;
+    }
+
+    mgr.set_current_model_id(acp::ModelId::new("other-model"));
+
+    assert!(
+        !mgr.inner.catalog.read().model_endpoint_catalog_loaded,
+        "a model switch must invalidate the previous model's endpoint catalog",
+    );
+}
+
 // ── auth-change refresh: has_fetched_real_catalog flag ─────────────
 
 #[test]
