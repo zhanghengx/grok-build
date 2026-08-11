@@ -112,6 +112,8 @@ struct CatalogState {
     etag: Option<String>,
     /// Gates whether the apply path reselects the default (first real catalog)
     has_fetched_real_catalog: bool,
+    /// True once the configured model's own `/models` endpoint populated the catalog.
+    model_endpoint_catalog_loaded: bool,
     /// `allowed_models` matched nothing; the prompt path blocks instead.
     allowlist_excludes_all: bool,
     /// Bumped on identity change; a fetch captured before it must not apply.
@@ -408,6 +410,7 @@ impl ModelsManager {
                 cat.allowlist_excludes_all = allowlist_matches_nothing(&new_config, &new_catalog);
             }
             cat.models = new_catalog;
+            cat.model_endpoint_catalog_loaded = false;
         }
 
         let preferred_changed = new_preferred != old_preferred && new_preferred.is_some();
@@ -1139,11 +1142,23 @@ impl ModelsManager {
 
     /// Resolve the model list: waits for or requests a catalog fetch.
     pub async fn list_models(&self, strategy: RefreshStrategy) {
-        if strategy != RefreshStrategy::Offline && self.current_model_has_endpoint() {
+        if self.current_model_has_endpoint() {
             // A model-scoped endpoint is authoritative for this configuration.
             // Do not populate the picker from the global proxy and then leave
             // the configured endpoint's model list unused.
-            self.refresh_current_model_endpoint().await;
+            match strategy {
+                RefreshStrategy::Offline => {
+                    self.wait_for_first_catalog().await;
+                }
+                RefreshStrategy::OnlineIfUncached => {
+                    if !self.inner.catalog.read().model_endpoint_catalog_loaded {
+                        self.refresh_current_model_endpoint().await;
+                    }
+                }
+                RefreshStrategy::Online => {
+                    self.refresh_current_model_endpoint().await;
+                }
+            }
             return;
         }
         match strategy {
@@ -1190,6 +1205,14 @@ impl ModelsManager {
         configured_endpoint && entry.has_own_credentials()
     }
 
+    /// Load the configured model's own `/models` catalog once at startup.
+    pub(crate) async fn ensure_current_model_endpoint_catalog(&self) {
+        if self.inner.catalog.read().model_endpoint_catalog_loaded {
+            return;
+        }
+        self.refresh_current_model_endpoint().await;
+    }
+
     /// Refresh the catalog from the current model's own OpenAI-compatible
     /// `/models` endpoint. The request is skipped unless the model has a
     /// model-owned credential, so a Grok session token cannot cross an
@@ -1216,6 +1239,7 @@ impl ModelsManager {
         if !self.apply_refresh_result_fenced(&cfg, models, None, generation) {
             return false;
         }
+        self.inner.catalog.write().model_endpoint_catalog_loaded = true;
         tracing::info!("model-specific catalog refreshed");
         self.notify_models_updated();
         true
@@ -1359,6 +1383,7 @@ impl ModelsManager {
             }
             let first_real_catalog = !cat.has_fetched_real_catalog;
             cat.has_fetched_real_catalog = true;
+            cat.model_endpoint_catalog_loaded = false;
             cat.prefetched = Some(models);
             cat.models = resolve_model_catalog(cfg, cat.prefetched.clone());
             cat.etag = new_etag;

@@ -1294,6 +1294,74 @@ async fn model_endpoint_refresh_uses_model_key_and_updates_catalog() {
 }
 
 #[tokio::test]
+async fn list_models_online_if_uncached_fetches_configured_model_endpoint_once() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct CountingEndpoint {
+        calls: Arc<AtomicUsize>,
+        catalog: IndexMap<String, ModelEntry>,
+    }
+    impl ModelsEndpoint for CountingEndpoint {
+        fn fetch_models(
+            &self,
+            _endpoints: config::EndpointsConfig,
+            _auth: Option<GrokAuth>,
+            _fetch_auth: ModelFetchAuth,
+        ) -> ModelsFetchFuture {
+            Box::pin(async { None })
+        }
+
+        fn fetch_model_endpoint(&self, _request: ModelEndpointRequest) -> ModelsFetchFuture {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let catalog = self.catalog.clone();
+            Box::pin(async move { Some(catalog) })
+        }
+    }
+
+    let cfg = config_from_toml(
+        r#"
+            [model.endpoint-model]
+            base_url = "https://provider.example/v1"
+            api_key = "model-api-key"
+            "#,
+    );
+    let tmp = tempfile::TempDir::new().unwrap();
+    let auth_manager = Arc::new(AuthManager::new(tmp.path(), GrokComConfig::default()));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mgr = ModelsManagerBuilder::new(
+        None,
+        resolve_model_catalog(&cfg, None),
+        acp::ModelId::new("endpoint-model"),
+        auth_manager,
+        cfg,
+    )
+    .endpoint(Arc::new(CountingEndpoint {
+        calls: calls.clone(),
+        catalog: make_prefetched(&["endpoint-model", "provider-model"]),
+    }))
+    .cache(test_cache_manager(tmp.path()))
+    .build();
+
+    mgr.list_models(RefreshStrategy::OnlineIfUncached).await;
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "a cold configured endpoint must be fetched for the model picker"
+    );
+    assert!(
+        mgr.models().contains_key("provider-model"),
+        "the configured endpoint's catalog must replace the bundled default"
+    );
+
+    mgr.list_models(RefreshStrategy::OnlineIfUncached).await;
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "an already-fetched model endpoint must not be fetched again"
+    );
+}
+
+#[tokio::test]
 async fn model_endpoint_without_model_credential_is_not_requested() {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -1935,8 +2003,9 @@ fn resolve_api_key_used_when_no_session() {
     let endpoints = config::EndpointsConfig::default();
     assert_eq!(
         ModelFetchAuth::resolve(&endpoints, false),
-        ModelFetchAuth::ApiKey,
-        "API key should be used when no cached session exists",
+        ModelFetchAuth::Session,
+        "ambient XAI_API_KEY alone must not redirect the catalog endpoint; \
+         model-owned api_key/env_key config controls model catalog auth",
     );
 }
 

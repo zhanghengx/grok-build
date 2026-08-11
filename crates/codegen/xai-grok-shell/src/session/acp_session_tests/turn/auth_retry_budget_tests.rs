@@ -7,10 +7,32 @@
 use super::support::*;
 use super::*;
 use crate::auth::{AuthManager, AuthMode, GrokAuth, GrokComConfig};
+use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 use xai_grok_test_support::{MockInferenceServer, MockModelEntry};
+
+/// `SessionActor` turn futures overflow the default test thread stack.
+fn block_on_session(f: impl FnOnce() + Send + 'static) {
+    std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn(f)
+        .expect("spawn large-stack test thread")
+        .join()
+        .expect("test thread");
+}
+
+fn current_thread_local<F>(f: F)
+where
+    F: Future<Output = ()> + 'static,
+{
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("test runtime");
+    tokio::task::LocalSet::new().block_on(&rt, f);
+}
 
 /// The token the mock server accepts and the refresher mints on success.
 const FRESH_TOKEN: &str = "refreshed-test-token";
@@ -235,11 +257,10 @@ async fn run_prompt(
 /// The wake sequence: the resolver has nothing wire-valid, the send goes
 /// out with no `Authorization` header, the server 401s it, recovery lands a
 /// fresh token. The turn must survive and resubmit with the fresh bearer.
-#[tokio::test(flavor = "current_thread")]
-async fn fail_closed_401_is_uncharged_and_turn_survives() {
-    let local = tokio::task::LocalSet::new();
-    local
-        .run_until(async {
+#[test]
+fn fail_closed_401_is_uncharged_and_turn_survives() {
+    block_on_session(|| {
+        current_thread_local(async {
             let server = MockInferenceServer::start_with_required_auth(
                 vec![MockModelEntry::new("test")],
                 FRESH_TOKEN,
@@ -287,19 +308,18 @@ async fn fail_closed_401_is_uncharged_and_turn_survives() {
                 calls.load(Ordering::SeqCst) >= 2,
                 "both the failing pre-flight and the recovery refresh must run"
             );
-        })
-        .await;
+        });
+    });
 }
 
 /// Real credential rejections must still terminate: when every request
 /// carries a bearer the server rejects, the escalating budget exhausts after
 /// `MAX_RETRIES` and the failure names authenticated rejections — not a
-/// generic budget message. `start_paused` auto-advances the backoff ladder.
-#[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn authenticated_401s_still_exhaust_after_three_retries() {
-    let local = tokio::task::LocalSet::new();
-    local
-        .run_until(async {
+/// generic budget message.
+#[test]
+fn authenticated_401s_still_exhaust_after_three_retries() {
+    block_on_session(|| {
+        current_thread_local(async {
             // The server only accepts a token the refresher never mints, so
             // every authenticated send is rejected.
             let server = MockInferenceServer::start_with_required_auth(
@@ -349,6 +369,6 @@ async fn authenticated_401s_still_exhaust_after_three_retries() {
                 message.contains("authenticated inference requests were still rejected"),
                 "the notification must carry the same story as the error: {message}"
             );
-        })
-        .await;
+        });
+    });
 }

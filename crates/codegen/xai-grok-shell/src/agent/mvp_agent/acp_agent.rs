@@ -439,6 +439,9 @@ impl acp::Agent for MvpAgent {
         }
         self.spawn_announcements_refresh();
         self.spawn_heap_profile_monitor();
+        if !crate::agent::chat_modes::process_chat_mode_enabled() {
+            self.models_manager.ensure_current_model_endpoint_catalog().await;
+        }
         let init_model_state = if crate::agent::chat_modes::process_chat_mode_enabled() {
             self.chat_modes.model_state().await
         } else {
