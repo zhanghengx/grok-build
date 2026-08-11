@@ -104,6 +104,20 @@ enum CatalogProgress {
     Ready,
 }
 
+/// Which catalog a fetch result belongs to. A model-owned endpoint catalog is
+/// authoritative for the configured model, so a later global result must not
+/// replace it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CatalogSource {
+    Global,
+    ModelEndpoint,
+}
+impl Default for CatalogSource {
+    fn default() -> Self {
+        CatalogSource::Global
+    }
+}
+
 /// Catalog fields written together under one lock, so readers never see a torn mix.
 #[derive(Default)]
 struct CatalogState {
@@ -114,6 +128,9 @@ struct CatalogState {
     has_fetched_real_catalog: bool,
     /// True once the configured model's own `/models` endpoint populated the catalog.
     model_endpoint_catalog_loaded: bool,
+    /// Which source populated the catalog; a global result must not replace
+    /// an authoritative model endpoint catalog.
+    catalog_source: CatalogSource,
     /// `allowed_models` matched nothing; the prompt path blocks instead.
     allowlist_excludes_all: bool,
     /// Bumped on identity change; a fetch captured before it must not apply.
@@ -411,6 +428,7 @@ impl ModelsManager {
             }
             cat.models = new_catalog;
             cat.model_endpoint_catalog_loaded = false;
+            cat.catalog_source = CatalogSource::Global;
         }
 
         let preferred_changed = new_preferred != old_preferred && new_preferred.is_some();
@@ -514,7 +532,11 @@ impl ModelsManager {
                 .send_modify(|generation| *generation += 1);
             // A different model owns a different `/models` endpoint, so a
             // previously loaded model-scoped catalog is stale for it.
-            self.inner.catalog.write().model_endpoint_catalog_loaded = false;
+            {
+                let mut cat = self.inner.catalog.write();
+                cat.model_endpoint_catalog_loaded = false;
+                cat.catalog_source = CatalogSource::Global;
+            }
         }
     }
 
@@ -1135,7 +1157,14 @@ impl ModelsManager {
                     None
                 }
             };
-            if !mgr.apply_refresh_result_fenced(&cfg, new_prefetched, new_etag, generation) {
+            if !mgr.apply_refresh_result_fenced(
+                &cfg,
+                new_prefetched,
+                new_etag,
+                generation,
+                None,
+                CatalogSource::Global,
+            ) {
                 return;
             }
             tracing::info!("models manager refreshed");
@@ -1232,6 +1261,10 @@ impl ModelsManager {
             tracing::info!("model-specific catalog refresh skipped: remote_fetch disabled");
             return false;
         }
+        // Capture the model identity before the request: `model_endpoint_request`
+        // awaits a provider refresh, during which the current model can change.
+        // A stale model-A result must not mark model B as loaded.
+        let switch_generation = self.model_switch_generation();
         let Some(request) = self.model_endpoint_request().await else {
             return false;
         };
@@ -1250,10 +1283,16 @@ impl ModelsManager {
             }
         };
         let generation = self.inner.catalog.read().generation;
-        if !self.apply_refresh_result_fenced(&cfg, models, None, generation) {
+        if !self.apply_refresh_result_fenced(
+            &cfg,
+            models,
+            None,
+            generation,
+            Some(switch_generation),
+            CatalogSource::ModelEndpoint,
+        ) {
             return false;
         }
-        self.inner.catalog.write().model_endpoint_catalog_loaded = true;
         tracing::info!("model-specific catalog refreshed");
         self.notify_models_updated();
         true
@@ -1379,7 +1418,14 @@ impl ModelsManager {
                 None
             }
         };
-        let success = self.apply_refresh_result_fenced(&cfg, new_prefetched, None, generation);
+        let success = self.apply_refresh_result_fenced(
+            &cfg,
+            new_prefetched,
+            None,
+            generation,
+            None,
+            CatalogSource::Global,
+        );
         if success {
             xai_grok_telemetry::unified_log::info(
                 "model catalog: fetch succeeded",
@@ -1398,17 +1444,20 @@ impl ModelsManager {
         models: IndexMap<String, ModelEntry>,
         new_etag: Option<String>,
     ) {
-        let _ = self.apply_catalog_fenced(cfg, models, new_etag, None);
+        let _ = self.apply_catalog_fenced(cfg, models, new_etag, None, None, CatalogSource::Global);
     }
 
-    /// Discards a result captured before an identity change; returns
-    /// whether the catalog applied.
+    /// Discards a result captured before an identity change, or a global
+    /// result that would replace an authoritative model endpoint catalog;
+    /// returns whether the catalog applied.
     fn apply_catalog_fenced(
         &self,
         cfg: &config::Config,
         models: IndexMap<String, ModelEntry>,
         new_etag: Option<String>,
         generation: Option<u64>,
+        switch_generation: Option<u64>,
+        source: CatalogSource,
     ) -> bool {
         let (first_real_catalog, excludes_all) = {
             let mut cat = self.inner.catalog.write();
@@ -1418,9 +1467,25 @@ impl ModelsManager {
                 tracing::info!("model catalog result discarded: identity changed during fetch");
                 return false;
             }
+            if let Some(switch_generation) = switch_generation
+                && self.model_switch_generation() != switch_generation
+            {
+                tracing::info!(
+                    "model catalog result discarded: current model changed during fetch"
+                );
+                return false;
+            }
+            if source == CatalogSource::Global && cat.catalog_source == CatalogSource::ModelEndpoint
+            {
+                tracing::info!(
+                    "global model catalog result discarded: model endpoint catalog is authoritative"
+                );
+                return false;
+            }
             let first_real_catalog = !cat.has_fetched_real_catalog;
             cat.has_fetched_real_catalog = true;
-            cat.model_endpoint_catalog_loaded = false;
+            cat.catalog_source = source;
+            cat.model_endpoint_catalog_loaded = source == CatalogSource::ModelEndpoint;
             cat.prefetched = Some(models);
             cat.models = resolve_model_catalog(cfg, cat.prefetched.clone());
             cat.etag = new_etag;
@@ -1455,7 +1520,14 @@ impl ModelsManager {
         new_etag: Option<String>,
     ) -> bool {
         let generation = self.inner.catalog.read().generation;
-        self.apply_refresh_result_fenced(config, new_prefetched, new_etag, generation)
+        self.apply_refresh_result_fenced(
+            config,
+            new_prefetched,
+            new_etag,
+            generation,
+            None,
+            CatalogSource::Global,
+        )
     }
 
     fn apply_refresh_result_fenced(
@@ -1464,6 +1536,8 @@ impl ModelsManager {
         new_prefetched: Option<IndexMap<String, ModelEntry>>,
         new_etag: Option<String>,
         generation: u64,
+        switch_generation: Option<u64>,
+        source: CatalogSource,
     ) -> bool {
         let Some(new_prefetched) = new_prefetched else {
             tracing::warn!("model refresh failed, leaving existing models unchanged");
@@ -1489,7 +1563,14 @@ impl ModelsManager {
             );
             return false;
         };
-        self.apply_catalog_fenced(config, new_prefetched, new_etag, Some(generation))
+        self.apply_catalog_fenced(
+            config,
+            new_prefetched,
+            new_etag,
+            Some(generation),
+            switch_generation,
+            source,
+        )
     }
 
     pub fn allowlist_excludes_all(&self) -> bool {

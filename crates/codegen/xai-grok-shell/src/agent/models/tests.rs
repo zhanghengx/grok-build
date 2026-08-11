@@ -525,11 +525,20 @@ fn stale_fetch_result_is_discarded_after_identity_change() {
         Some(make_prefetched(&["stale-model"])),
         None,
         stale_generation,
+        None,
+        CatalogSource::Global,
     ));
     assert!(!mgr.models().contains_key("stale-model"));
     assert!(!mgr.has_fetched_real_catalog());
 
-    assert!(!mgr.apply_refresh_result_fenced(&cfg, None, None, stale_generation));
+    assert!(!mgr.apply_refresh_result_fenced(
+        &cfg,
+        None,
+        None,
+        stale_generation,
+        None,
+        CatalogSource::Global,
+    ));
     assert_eq!(
         *mgr.inner.catalog_progress.borrow(),
         CatalogProgress::Pending,
@@ -538,6 +547,121 @@ fn stale_fetch_result_is_discarded_after_identity_change() {
 
     assert!(mgr.apply_refresh_result(&cfg, Some(make_prefetched(&["new-model"])), None));
     assert!(mgr.models().contains_key("new-model"));
+}
+
+#[test]
+fn global_refresh_cannot_replace_model_endpoint_catalog() {
+    let mgr = test_manager();
+    let cfg = config::Config::default();
+    {
+        let mut cat = mgr.inner.catalog.write();
+        cat.catalog_source = CatalogSource::ModelEndpoint;
+        cat.model_endpoint_catalog_loaded = true;
+        cat.prefetched = Some(make_prefetched(&["endpoint-model"]));
+        cat.models = resolve_model_catalog(&cfg, cat.prefetched.clone());
+    }
+
+    let generation = mgr.inner.catalog.read().generation;
+    assert!(!mgr.apply_refresh_result_fenced(
+        &cfg,
+        Some(make_prefetched(&["global-model"])),
+        None,
+        generation,
+        None,
+        CatalogSource::Global,
+    ));
+    assert!(
+        mgr.models().contains_key("endpoint-model"),
+        "the endpoint catalog must remain authoritative",
+    );
+    assert!(
+        !mgr.models().contains_key("global-model"),
+        "a later global result must not replace the endpoint catalog",
+    );
+    assert!(mgr.inner.catalog.read().model_endpoint_catalog_loaded);
+}
+
+#[tokio::test]
+async fn stale_endpoint_refresh_is_discarded_after_model_switch() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct SlowModelEndpoint {
+        started: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+        calls: Arc<AtomicUsize>,
+    }
+    impl ModelsEndpoint for SlowModelEndpoint {
+        fn fetch_models(
+            &self,
+            _endpoints: config::EndpointsConfig,
+            _auth: Option<GrokAuth>,
+            _fetch_auth: ModelFetchAuth,
+        ) -> ModelsFetchFuture {
+            Box::pin(async { None })
+        }
+        fn fetch_model_endpoint(&self, _request: ModelEndpointRequest) -> ModelsFetchFuture {
+            let started = self.started.clone();
+            let release = self.release.clone();
+            let catalog = make_prefetched(&["old-endpoint-model"]);
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            started.notify_one();
+            Box::pin(async move {
+                release.notified().await;
+                Some(catalog)
+            })
+        }
+    }
+
+    let cfg = config_from_toml(
+        r#"
+            [model.endpoint-model]
+            base_url = "https://provider.example/v1"
+            api_key = "model-api-key"
+            "#,
+    );
+    let tmp = tempfile::TempDir::new().unwrap();
+    let auth_manager = Arc::new(AuthManager::new(tmp.path(), GrokComConfig::default()));
+    let started = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mgr = ModelsManagerBuilder::new(
+        None,
+        resolve_model_catalog(&cfg, None),
+        acp::ModelId::new("endpoint-model"),
+        auth_manager,
+        cfg,
+    )
+    .endpoint(Arc::new(SlowModelEndpoint {
+        started: started.clone(),
+        release: release.clone(),
+        calls: calls.clone(),
+    }))
+    .cache(test_cache_manager(tmp.path()))
+    .build();
+
+    let mgr_ref = mgr.clone();
+    let task =
+        tokio::spawn(async move { mgr_ref.refresh_current_model_endpoint_inner(true).await });
+    started.notified().await;
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "the endpoint fetch must start"
+    );
+
+    // Switch models while the fetch is in flight, then let it return.
+    mgr.set_current_model_id(acp::ModelId::new("other-model"));
+    release.notify_one();
+
+    assert!(
+        !task.await.unwrap(),
+        "a stale endpoint result must be discarded after the model switch",
+    );
+    assert!(
+        !mgr.inner.catalog.read().model_endpoint_catalog_loaded,
+        "a stale endpoint result must not mark the new model loaded",
+    );
+    assert!(!mgr.models().contains_key("old-endpoint-model"));
 }
 
 fn config_from_toml(toml: &str) -> config::Config {

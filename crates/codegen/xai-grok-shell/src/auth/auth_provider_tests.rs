@@ -520,6 +520,52 @@ async fn provider_command_times_out() {
 }
 
 #[tokio::test]
+async fn run_capped_cancellation_kills_provider_process_group() {
+    use std::time::Duration;
+
+    let dir = tempfile::tempdir().unwrap();
+    let started = dir.path().join("started");
+    let survived = dir.path().join("survived");
+    let script = format!(
+        "touch {}; (sleep 1; touch {}) & wait",
+        started.display(),
+        survived.display()
+    );
+    let mut cmd = crate::util::subprocess::shell_c(&script);
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    xai_grok_tools::util::detach_command(&mut cmd);
+
+    let fut = run_capped(&mut cmd, Duration::from_secs(60));
+    let mut fut = Box::pin(fut);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if started.exists() {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "helper never started"
+        );
+        tokio::select! {
+            _ = &mut fut => panic!("helper finished before it reported startup"),
+            _ = tokio::time::sleep(Duration::from_millis(20)) => {}
+        }
+    }
+
+    // Cancellation: drop the mint future, which must tear down the process
+    // group so the background descendant cannot write `survived`.
+    drop(fut);
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!(
+        !survived.exists(),
+        "dropping run_capped must kill the provider's process group (descendant survived)"
+    );
+}
+
+#[tokio::test]
 async fn provider_zero_timeout_clamps_to_one_second() {
     // `timeout_secs = 0` clamps up to the 1s floor, so an instant helper mints
     // rather than failing immediately.

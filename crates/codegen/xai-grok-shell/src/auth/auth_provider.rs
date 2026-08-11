@@ -268,6 +268,24 @@ fn scrub_first_party_credentials(cmd: &mut tokio::process::Command) {
     }
 }
 
+/// Kills the provider's process group when the owning future is dropped
+/// (e.g. an outer startup timeout cancels the mint). On Unix `ProcessGroup`
+/// has no killing `Drop`, so without this a cancelled run would leave shell
+/// descendants holding the `GROK_AUTH_PROVIDER_*` environment.
+struct ProcessGroupKillOnDrop(Option<xai_grok_tools::util::ProcessGroup>);
+impl ProcessGroupKillOnDrop {
+    fn disarm(&mut self) {
+        self.0.take();
+    }
+}
+impl Drop for ProcessGroupKillOnDrop {
+    fn drop(&mut self) {
+        if let Some(group) = self.0.take() {
+            let _ = group.kill();
+        }
+    }
+}
+
 /// Spawn `cmd`, capture stdout/stderr with a byte cap (reading both
 /// concurrently so a full pipe on one can't deadlock the other; a runaway helper
 /// is drained to a sink past the cap so it can't wedge the wait), and bound the
@@ -294,6 +312,11 @@ async fn run_capped(
     if let Err(e) = group.attach(&child) {
         tracing::debug!(error = %e, "auth provider: could not enroll helper process group");
     }
+    // Kill the whole group if this future is dropped before the run finishes,
+    // including when an outer startup bound cancels the mint. `ProcessGroup`
+    // has no killing `Drop` on Unix, so shell descendants could otherwise
+    // survive with the provider-token environment.
+    let mut group_killer = ProcessGroupKillOnDrop(Some(group));
     let stdout = child.stdout.take().expect("stdout is piped");
     let stderr = child.stderr.take().expect("stderr is piped");
     let mut out_buf = Vec::new();
@@ -320,10 +343,12 @@ async fn run_capped(
     let status = match tokio::time::timeout(timeout, capture).await {
         Ok(res) => res?,
         Err(_elapsed) => {
-            let _ = group.kill();
+            // The kill-on-drop guard also tears the group down on this bail.
             anyhow::bail!("command timed out after {}s", timeout.as_secs());
         }
     };
+    // The command completed: disarm the cancellation cleanup.
+    group_killer.disarm();
     if out_buf.len() as u64 > PROVIDER_STDOUT_CAP_BYTES {
         anyhow::bail!("command wrote more than {PROVIDER_STDOUT_CAP_BYTES} bytes to stdout");
     }
