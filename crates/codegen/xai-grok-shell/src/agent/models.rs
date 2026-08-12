@@ -159,9 +159,27 @@ fn model_endpoint_changed(old: &config::Config, new: &config::Config, owner_key:
                 || old_entry.api_key != new_entry.api_key
                 || old_entry.env_key != new_entry.env_key
                 || old_entry.auth_provider != new_entry.auth_provider
+                || old_entry.api_base_url != new_entry.api_base_url
         }
         _ => true,
     }
+}
+
+/// Whether a config overlay replaced the connection context (URL, credentials,
+/// backend, auth scheme, request metadata) of an endpoint-returned entry.
+/// Metadata-only overlays leave the entry owned by the endpoint catalog that
+/// discovered it.
+fn endpoint_entry_context_differs(raw: &config::ModelEntry, resolved: &config::ModelEntry) -> bool {
+    raw.info.base_url != resolved.info.base_url
+        || raw.info.api_backend != resolved.info.api_backend
+        || raw.info.auth_scheme != resolved.info.auth_scheme
+        || raw.info.extra_headers != resolved.info.extra_headers
+        || raw.info.query_params != resolved.info.query_params
+        || raw.info.env_http_headers != resolved.info.env_http_headers
+        || raw.api_key != resolved.api_key
+        || raw.env_key != resolved.env_key
+        || raw.auth_provider != resolved.auth_provider
+        || raw.api_base_url != resolved.api_base_url
 }
 
 struct Inner {
@@ -422,11 +440,13 @@ impl ModelsManager {
         *self.inner.gateway.write() = Some(gateway);
     }
 
-    /// Swap config, rebuild catalog, and reselect the model.
-    pub(crate) fn apply_config(&self, new_config: config::Config) {
+    /// Swap config, rebuild catalog, and reselect the model. Returns the
+    /// rejection reason when the reload is invalid, so callers can avoid
+    /// publishing a config the manager did not accept.
+    pub(crate) fn apply_config(&self, new_config: config::Config) -> Result<(), String> {
         if let Err(e) = new_config.validate_model_filters() {
             tracing::error!(error = %e, "ignoring config reload: invalid model filters");
-            return;
+            return Err(e);
         }
         let (prefetched, has_real_catalog, catalog_source, catalog_owner) = {
             let cat = self.inner.catalog.read();
@@ -457,7 +477,7 @@ impl ModelsManager {
         let new_catalog = resolve_model_catalog(&new_config, retained_prefetched.clone());
         if retained_real_catalog && let Err(e) = validate_selectable(&new_config, &new_catalog) {
             tracing::error!(error = %e, "ignoring config reload: allowed_models excludes all models");
-            return;
+            return Err(e);
         }
 
         let (old_preferred, old_default_is_campaign) = {
@@ -531,13 +551,18 @@ impl ModelsManager {
         }
 
         self.notify_models_updated();
+        Ok(())
     }
 
     /// [`Self::apply_config`] plus an unconditional default re-resolve, for remote-settings arrival while no session exists.
-    pub(crate) fn apply_config_reselecting_default(&self, new_config: config::Config) {
-        self.apply_config(new_config.clone());
+    pub(crate) fn apply_config_reselecting_default(
+        &self,
+        new_config: config::Config,
+    ) -> Result<(), String> {
+        self.apply_config(new_config.clone())?;
         self.reselect_default_model(&new_config);
         self.notify_models_updated();
+        Ok(())
     }
 
     // ── Accessors ───────────────────────────────────────────────────
@@ -611,18 +636,32 @@ impl ModelsManager {
             let mut cat = self.inner.catalog.write();
             if cat.catalog_source == CatalogSource::ModelEndpoint {
                 // Models returned by the endpoint inherit its connection
-                // context and remain owned by that catalog. A configured or
-                // bundled model absent from the endpoint does not: restore the
-                // config-only catalog so OnlineIfUncached performs the fetch
-                // appropriate for the new model. Ownership is by configured key
-                // or endpoint identity, never the routing slug.
+                // context and remain owned by that catalog, including IDs that
+                // carry a metadata-only `[model.<id>]` overlay. An overlay that
+                // replaces the endpoint context, or a model absent from the
+                // endpoint, does not: restore the config-only catalog so
+                // OnlineIfUncached performs the fetch appropriate for the new
+                // model. Ownership is by configured key or endpoint identity,
+                // never the routing slug.
                 let returned_by_endpoint = cat
                     .prefetched
                     .as_ref()
                     .is_some_and(|models| resolve_catalog_key(models, &id).is_some());
-                let is_configured_model = cfg.config_models.contains_key(id.0.as_ref());
+                let overlay_changes_context = match (
+                    cat.prefetched
+                        .as_ref()
+                        .and_then(|models| resolve_catalog_key(models, &id))
+                        .and_then(|key| {
+                            cat.prefetched.as_ref().and_then(|m| m.get(key.0.as_ref()))
+                        }),
+                    resolve_catalog_key(&cat.models, &id)
+                        .and_then(|key| cat.models.get(key.0.as_ref())),
+                ) {
+                    (Some(raw), Some(resolved)) => endpoint_entry_context_differs(raw, resolved),
+                    _ => true,
+                };
                 let belongs_to_endpoint_catalog = cat.catalog_owner.as_ref() == Some(&id)
-                    || (returned_by_endpoint && !is_configured_model);
+                    || (returned_by_endpoint && !overlay_changes_context);
                 if !belongs_to_endpoint_catalog {
                     let generation = cat.generation + 1;
                     let models = resolve_model_catalog(&cfg, None);
@@ -1446,7 +1485,10 @@ impl ModelsManager {
             .flatten();
 
         Some(ModelEndpointRequest {
-            base_url: entry.info.base_url,
+            // `resolve_credentials` routes API-key auth to `api_base_url` when
+            // a model separates session and API-key endpoints. Use that URL
+            // here so the key is only sent to the operator that owns it.
+            base_url: credentials.base_url,
             api_key,
             api_backend: entry.info.api_backend,
             auth_scheme: credentials.auth_scheme,

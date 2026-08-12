@@ -593,35 +593,31 @@ async fn handle_reload_models(agent: &MvpAgent) -> ExtResult {
     let toml_config = crate::agent::config::Config::new_from_toml_cfg(&disk_config)
         .map_err(|e| acp::Error::internal_error().data(e))?;
 
-    // Merge TOML-derived model fields into the agent's in-memory config so
-    // runtime-only fields (#[serde(skip)]: remote_settings, endpoints, CLI
-    // flags) are preserved. Only model-related TOML fields are refreshed.
-    {
-        let agent_config = agent.cfg.borrow();
-        let overrides = crate::config::ModelOverrideConfig::resolve(
-            agent_config.web_search_model_override.as_deref(),
-            agent_config.session_summary_model_override.as_deref(),
-            &disk_config,
-            agent_config.remote_settings.as_ref(),
-        );
-        drop(agent_config);
-        let mut agent_config = agent.cfg.borrow_mut();
-        agent_config.models = toml_config.models.clone();
-        agent_config.config_models = toml_config.config_models.clone();
-        agent_config.web_search_model = overrides.web_search;
-        agent_config.session_summary_model = overrides.session_summary;
-        agent_config.image_description_model = overrides.image_description;
-        agent_config.prompt_suggest_model_pin = overrides.prompt_suggestion;
-    }
+    // Merge TOML-derived model fields into a proposed config so runtime-only
+    // fields (#[serde(skip)]: remote_settings, endpoints, CLI flags) are
+    // preserved. The agent's config is only published after the manager
+    // accepts the reload.
+    let mut merged_config = agent.cfg.borrow().clone();
+    let overrides = crate::config::ModelOverrideConfig::resolve(
+        merged_config.web_search_model_override.as_deref(),
+        merged_config.session_summary_model_override.as_deref(),
+        &disk_config,
+        merged_config.remote_settings.as_ref(),
+    );
+    merged_config.models = toml_config.models.clone();
+    merged_config.config_models = toml_config.config_models.clone();
+    merged_config.web_search_model = overrides.web_search;
+    merged_config.session_summary_model = overrides.session_summary;
+    merged_config.image_description_model = overrides.image_description;
+    merged_config.prompt_suggest_model_pin = overrides.prompt_suggestion;
     // Recompute the campaign overlay + `pre_campaign_default` (the catalog-miss
     // fallback) so reload matches spawn; `new_from_toml_cfg` reset it to None.
-    {
-        let mut agent_config = agent.cfg.borrow_mut();
-        crate::util::config::sync_campaign_fields(&mut agent_config);
-    }
-    let merged_config = agent.cfg.borrow().clone();
+    crate::util::config::sync_campaign_fields(&mut merged_config);
 
-    agent.models_manager.apply_config(merged_config);
+    if let Err(e) = agent.models_manager.apply_config(merged_config.clone()) {
+        return Err(acp::Error::internal_error().data(format!("rejected model reload: {e}")));
+    }
+    *agent.cfg.borrow_mut() = merged_config;
     agent.sync_process_static_api_key(None);
 
     // A config-only model endpoint is the source of the picker catalog. Fetch

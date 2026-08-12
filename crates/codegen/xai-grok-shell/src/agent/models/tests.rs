@@ -744,7 +744,8 @@ async fn stale_endpoint_refresh_is_discarded_after_endpoint_config_change() {
             api_key = "new-api-key"
             "#,
     );
-    mgr.apply_config(new_cfg);
+    mgr.apply_config(new_cfg)
+        .expect("config reload should apply");
     release_old.notify_one();
 
     assert!(
@@ -1525,6 +1526,62 @@ async fn model_endpoint_refresh_uses_model_key_and_updates_catalog() {
 }
 
 #[tokio::test]
+async fn model_endpoint_refresh_uses_api_key_base_url_when_separated() {
+    use std::sync::Mutex;
+
+    struct ApiKeyCapturingEndpoint {
+        request: Arc<Mutex<Option<ModelEndpointRequest>>>,
+        catalog: IndexMap<String, ModelEntry>,
+    }
+    impl ModelsEndpoint for ApiKeyCapturingEndpoint {
+        fn fetch_models(
+            &self,
+            _endpoints: config::EndpointsConfig,
+            _auth: Option<GrokAuth>,
+            _fetch_auth: ModelFetchAuth,
+        ) -> ModelsFetchFuture {
+            Box::pin(async { None })
+        }
+
+        fn fetch_model_endpoint(&self, request: ModelEndpointRequest) -> ModelsFetchFuture {
+            *self.request.lock().unwrap() = Some(request);
+            let catalog = self.catalog.clone();
+            Box::pin(async move { Some(catalog) })
+        }
+    }
+
+    let cfg = config_from_toml(
+        r#"
+            [model.endpoint-model]
+            base_url = "https://session.example/v1"
+            api_base_url = "https://api-key.example/v1"
+            api_key = "model-api-key"
+            "#,
+    );
+    let tmp = tempfile::TempDir::new().unwrap();
+    let auth_manager = Arc::new(AuthManager::new(tmp.path(), GrokComConfig::default()));
+    let request = Arc::new(Mutex::new(None));
+    let mgr = ModelsManagerBuilder::new(
+        None,
+        resolve_model_catalog(&cfg, None),
+        acp::ModelId::new("endpoint-model"),
+        auth_manager,
+        cfg,
+    )
+    .endpoint(Arc::new(ApiKeyCapturingEndpoint {
+        request: request.clone(),
+        catalog: make_prefetched(&["provider-model"]),
+    }))
+    .cache(test_cache_manager(tmp.path()))
+    .build();
+
+    assert!(mgr.refresh_current_model_endpoint().await);
+    let request = request.lock().unwrap().take().expect("request captured");
+    assert_eq!(request.base_url, "https://api-key.example/v1");
+    assert_eq!(request.api_key, "model-api-key");
+}
+
+#[tokio::test]
 async fn list_models_online_if_uncached_fetches_configured_model_endpoint_once() {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -1743,7 +1800,9 @@ fn switching_current_model_invalidates_endpoint_catalog_cache() {
     .build();
     {
         let mut cat = mgr.inner.catalog.write();
-        cat.prefetched = Some(make_prefetched(&["provider-model", "regular-model"]));
+        // `regular-model` is configured but not returned by the endpoint, so
+        // selecting it must invalidate the endpoint-owned catalog.
+        cat.prefetched = Some(make_prefetched(&["provider-model"]));
         cat.models = resolve_model_catalog(&cfg, cat.prefetched.clone());
         cat.has_fetched_real_catalog = true;
         cat.model_endpoint_catalog_loaded = true;
@@ -1928,7 +1987,8 @@ fn apply_config_preserves_unchanged_endpoint_catalog() {
             api_key = "model-api-key"
             "#,
     );
-    mgr.apply_config(new_cfg);
+    mgr.apply_config(new_cfg)
+        .expect("config reload should apply");
 
     let cat = mgr.inner.catalog.read();
     assert!(
@@ -1983,7 +2043,10 @@ fn apply_config_rejects_invalid_allowlist_for_retained_endpoint_catalog() {
             api_key = "model-api-key"
             "#,
     );
-    mgr.apply_config(new_cfg);
+    assert!(
+        mgr.apply_config(new_cfg).is_err(),
+        "an allowlist that excludes every retained endpoint model must be rejected",
+    );
 
     let cat = mgr.inner.catalog.read();
     assert!(
@@ -1998,6 +2061,176 @@ fn apply_config_rejects_invalid_allowlist_for_retained_endpoint_catalog() {
         "the invalid allowlist reload must not be published",
     );
     drop(cat);
+}
+
+#[test]
+fn switching_to_endpoint_returned_configured_overlay_keeps_endpoint_catalog() {
+    let cfg = config_from_toml(
+        r#"
+            [model.endpoint-model]
+            base_url = "https://provider.example/v1"
+            api_key = "model-api-key"
+
+            [model.provider-model]
+            name = "Configured Overlay"
+            "#,
+    );
+    let tmp = tempfile::TempDir::new().unwrap();
+    let auth_manager = Arc::new(AuthManager::new(tmp.path(), GrokComConfig::default()));
+    let mgr = ModelsManagerBuilder::new(
+        None,
+        resolve_model_catalog(&cfg, None),
+        acp::ModelId::new("endpoint-model"),
+        auth_manager,
+        cfg.clone(),
+    )
+    .cache(test_cache_manager(tmp.path()))
+    .build();
+    let mut prefetched = make_prefetched(&["provider-model", "provider-sibling"]);
+    for entry in prefetched.values_mut() {
+        entry.api_key = Some("endpoint-api-key".to_string());
+    }
+    {
+        let mut cat = mgr.inner.catalog.write();
+        cat.prefetched = Some(prefetched.clone());
+        cat.models = resolve_model_catalog(&cfg, Some(prefetched));
+        cat.has_fetched_real_catalog = true;
+        cat.model_endpoint_catalog_loaded = true;
+        cat.catalog_source = CatalogSource::ModelEndpoint;
+        cat.catalog_owner = Some(acp::ModelId::new("endpoint-model"));
+    }
+
+    mgr.set_current_model_id(acp::ModelId::new("provider-model"));
+
+    let cat = mgr.inner.catalog.read();
+    assert_eq!(cat.catalog_source, CatalogSource::ModelEndpoint);
+    assert!(cat.model_endpoint_catalog_loaded);
+    assert_eq!(
+        cat.catalog_owner.as_ref().map(|o| o.0.as_ref()),
+        Some("endpoint-model")
+    );
+    assert!(
+        cat.models.contains_key("provider-sibling"),
+        "switching to an endpoint-returned overlay must not drop endpoint-discovered siblings",
+    );
+    assert_eq!(
+        cat.models["provider-model"].api_key.as_deref(),
+        Some("endpoint-api-key"),
+        "a metadata-only config overlay must keep the endpoint catalog's inherited credential",
+    );
+    drop(cat);
+    assert_eq!(mgr.current_model_id().0.as_ref(), "provider-model");
+}
+
+#[test]
+fn switching_to_endpoint_returned_overlay_with_own_endpoint_resets_catalog() {
+    let cfg = config_from_toml(
+        r#"
+            [model.endpoint-model]
+            base_url = "https://provider.example/v1"
+            api_key = "model-api-key"
+
+            [model.provider-model]
+            base_url = "https://own.example/v1"
+            api_key = "own-api-key"
+            "#,
+    );
+    let tmp = tempfile::TempDir::new().unwrap();
+    let auth_manager = Arc::new(AuthManager::new(tmp.path(), GrokComConfig::default()));
+    let mgr = ModelsManagerBuilder::new(
+        None,
+        resolve_model_catalog(&cfg, None),
+        acp::ModelId::new("endpoint-model"),
+        auth_manager,
+        cfg.clone(),
+    )
+    .cache(test_cache_manager(tmp.path()))
+    .build();
+    let mut prefetched = make_prefetched(&["provider-model", "provider-sibling"]);
+    for entry in prefetched.values_mut() {
+        entry.api_key = Some("endpoint-api-key".to_string());
+    }
+    {
+        let mut cat = mgr.inner.catalog.write();
+        cat.prefetched = Some(prefetched.clone());
+        cat.models = resolve_model_catalog(&cfg, Some(prefetched));
+        cat.has_fetched_real_catalog = true;
+        cat.model_endpoint_catalog_loaded = true;
+        cat.catalog_source = CatalogSource::ModelEndpoint;
+        cat.catalog_owner = Some(acp::ModelId::new("endpoint-model"));
+    }
+
+    mgr.set_current_model_id(acp::ModelId::new("provider-model"));
+
+    let cat = mgr.inner.catalog.read();
+    assert_eq!(cat.catalog_source, CatalogSource::Global);
+    assert!(!cat.model_endpoint_catalog_loaded);
+    assert!(
+        !cat.models.contains_key("provider-sibling"),
+        "an overlay with its own endpoint context must leave the parent endpoint catalog",
+    );
+    assert_eq!(
+        cat.models["provider-model"].api_key.as_deref(),
+        Some("own-api-key"),
+    );
+    drop(cat);
+}
+
+#[test]
+fn apply_config_reselecting_default_stops_after_rejection() {
+    let old_cfg = config_from_toml(
+        r#"
+            [model.endpoint-model]
+            base_url = "https://provider.example/v1"
+            api_key = "model-api-key"
+            "#,
+    );
+    let tmp = tempfile::TempDir::new().unwrap();
+    let auth_manager = Arc::new(AuthManager::new(tmp.path(), GrokComConfig::default()));
+    let mgr = ModelsManagerBuilder::new(
+        None,
+        resolve_model_catalog(&old_cfg, None),
+        acp::ModelId::new("endpoint-model"),
+        auth_manager,
+        old_cfg.clone(),
+    )
+    .cache(test_cache_manager(tmp.path()))
+    .build();
+    {
+        let mut cat = mgr.inner.catalog.write();
+        cat.prefetched = Some(make_prefetched(&["provider-model"]));
+        cat.models = resolve_model_catalog(&old_cfg, cat.prefetched.clone());
+        cat.has_fetched_real_catalog = true;
+        cat.model_endpoint_catalog_loaded = true;
+        cat.catalog_source = CatalogSource::ModelEndpoint;
+        cat.catalog_owner = Some(acp::ModelId::new("endpoint-model"));
+    }
+
+    let new_cfg = config_from_toml(
+        r#"
+            [models]
+            default = "other-model"
+            allowed_models = ["nomatch-*"]
+            [model.endpoint-model]
+            base_url = "https://provider.example/v1"
+            api_key = "model-api-key"
+            "#,
+    );
+    assert!(
+        mgr.apply_config_reselecting_default(new_cfg).is_err(),
+        "a rejected reload must propagate to the reselecting-default caller",
+    );
+
+    assert_eq!(mgr.current_model_id().0.as_ref(), "endpoint-model");
+    let cat = mgr.inner.catalog.read();
+    assert_eq!(cat.catalog_source, CatalogSource::ModelEndpoint);
+    assert!(cat.model_endpoint_catalog_loaded);
+    assert!(cat.models.contains_key("provider-model"));
+    assert!(!cat.allowlist_excludes_all);
+    assert!(
+        mgr.inner.cfg.read().models.allowed_models.is_none(),
+        "the rejected reload must not be published",
+    );
 }
 
 #[test]
@@ -2036,7 +2269,8 @@ fn apply_config_recomputes_allowlist_gate_for_pending_catalog() {
             allowed_models = ["keep-*"]
             "#,
     );
-    mgr.apply_config(new_cfg);
+    mgr.apply_config(new_cfg)
+        .expect("config reload should apply");
 
     assert!(
         mgr.allowlist_excludes_all(),
@@ -2136,7 +2370,8 @@ fn apply_config_honors_new_preferred_model() {
 
     let mut new_cfg = config::Config::default();
     new_cfg.models.default = Some("grok-3".to_string());
-    mgr.apply_config(new_cfg);
+    mgr.apply_config(new_cfg)
+        .expect("config reload should apply");
 
     assert_eq!(
         mgr.current_model_id().0.as_ref(),
@@ -2156,7 +2391,8 @@ fn apply_config_preserves_current_when_preferred_unchanged() {
     mgr.set_current_model_id(acp::ModelId::new("grok-4"));
 
     let new_cfg = config::Config::default();
-    mgr.apply_config(new_cfg);
+    mgr.apply_config(new_cfg)
+        .expect("config reload should apply");
 
     assert_eq!(
         mgr.current_model_id().0.as_ref(),
@@ -2178,7 +2414,8 @@ fn apply_config_falls_back_when_preferred_not_in_catalog() {
 
     let mut new_cfg = config::Config::default();
     new_cfg.models.default = Some("grok-nonexistent".to_string());
-    mgr.apply_config(new_cfg);
+    mgr.apply_config(new_cfg)
+        .expect("config reload should apply");
 
     let current = mgr.current_model_id();
     let first_available = mgr.available().keys().next().unwrap().clone();
@@ -2197,7 +2434,8 @@ fn apply_config_both_none_preferred_preserves_current() {
     mgr.apply_refresh_result(&cfg, Some(prefetched), None);
     mgr.set_current_model_id(acp::ModelId::new("grok-4"));
     let new_cfg = config::Config::default();
-    mgr.apply_config(new_cfg);
+    mgr.apply_config(new_cfg)
+        .expect("config reload should apply");
 
     assert_eq!(
         mgr.current_model_id().0.as_ref(),
@@ -2219,7 +2457,8 @@ fn apply_config_old_some_new_none_preserves_current() {
     mgr.set_current_model_id(acp::ModelId::new("grok-4"));
 
     let new_cfg = config::Config::default();
-    mgr.apply_config(new_cfg);
+    mgr.apply_config(new_cfg)
+        .expect("config reload should apply");
 
     assert_eq!(
         mgr.current_model_id().0.as_ref(),
@@ -2250,7 +2489,8 @@ fn auth_refresh_then_config_reload_preserves_user_model() {
 
     let mut new_cfg = config::Config::default();
     new_cfg.models.default = Some("grok-4".to_string());
-    mgr.apply_config(new_cfg);
+    mgr.apply_config(new_cfg)
+        .expect("config reload should apply");
     assert_eq!(mgr.current_model_id().0.as_ref(), "grok-4");
 }
 
@@ -2527,7 +2767,8 @@ fn campaign_only_flip_does_not_reselect_live_session() {
     let mut new_cfg = config::Config::default();
     new_cfg.models.default = Some("beta".to_string());
     new_cfg.models.default_is_campaign_driven = true; // campaign overriding
-    mgr.apply_config(new_cfg);
+    mgr.apply_config(new_cfg)
+        .expect("config reload should apply");
     assert_eq!(
         mgr.current_model_id().0.as_ref(),
         "alpha",
@@ -2541,7 +2782,8 @@ fn campaign_only_flip_does_not_reselect_live_session() {
     *mgr2.inner.cfg.write() = cfg2.clone();
     let mut new_cfg2 = config::Config::default();
     new_cfg2.models.default = Some("beta".to_string());
-    mgr2.apply_config(new_cfg2);
+    mgr2.apply_config(new_cfg2)
+        .expect("config reload should apply");
     assert_eq!(
         mgr2.current_model_id().0.as_ref(),
         "beta",
