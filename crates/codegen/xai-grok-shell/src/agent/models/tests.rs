@@ -527,6 +527,7 @@ fn stale_fetch_result_is_discarded_after_identity_change() {
         stale_generation,
         None,
         CatalogSource::Global,
+        None,
     ));
     assert!(!mgr.models().contains_key("stale-model"));
     assert!(!mgr.has_fetched_real_catalog());
@@ -538,6 +539,7 @@ fn stale_fetch_result_is_discarded_after_identity_change() {
         stale_generation,
         None,
         CatalogSource::Global,
+        None,
     ));
     assert_eq!(
         *mgr.inner.catalog_progress.borrow(),
@@ -569,6 +571,7 @@ fn global_refresh_cannot_replace_model_endpoint_catalog() {
         generation,
         None,
         CatalogSource::Global,
+        None,
     ));
     assert!(
         mgr.models().contains_key("endpoint-model"),
@@ -662,6 +665,110 @@ async fn stale_endpoint_refresh_is_discarded_after_model_switch() {
         "a stale endpoint result must not mark the new model loaded",
     );
     assert!(!mgr.models().contains_key("old-endpoint-model"));
+}
+
+#[tokio::test]
+async fn stale_endpoint_refresh_is_discarded_after_endpoint_config_change() {
+    use std::sync::Mutex;
+
+    struct ConfigChangingEndpoint {
+        old_started: Arc<tokio::sync::Notify>,
+        release_old: Arc<tokio::sync::Notify>,
+        requests: Arc<Mutex<Vec<(String, String)>>>,
+    }
+    impl ModelsEndpoint for ConfigChangingEndpoint {
+        fn fetch_models(
+            &self,
+            _endpoints: config::EndpointsConfig,
+            _auth: Option<GrokAuth>,
+            _fetch_auth: ModelFetchAuth,
+        ) -> ModelsFetchFuture {
+            Box::pin(async { None })
+        }
+
+        fn fetch_model_endpoint(&self, request: ModelEndpointRequest) -> ModelsFetchFuture {
+            self.requests
+                .lock()
+                .unwrap()
+                .push((request.base_url.clone(), request.api_key.clone()));
+            if request.base_url == "https://old-provider.example/v1" {
+                let started = self.old_started.clone();
+                let release = self.release_old.clone();
+                Box::pin(async move {
+                    started.notify_one();
+                    release.notified().await;
+                    Some(make_prefetched(&["old-provider-model"]))
+                })
+            } else {
+                Box::pin(async { Some(make_prefetched(&["new-provider-model"])) })
+            }
+        }
+    }
+
+    let old_cfg = config_from_toml(
+        r#"
+            [model.endpoint-model]
+            base_url = "https://old-provider.example/v1"
+            api_key = "old-api-key"
+            "#,
+    );
+    let tmp = tempfile::TempDir::new().unwrap();
+    let auth_manager = Arc::new(AuthManager::new(tmp.path(), GrokComConfig::default()));
+    let old_started = Arc::new(tokio::sync::Notify::new());
+    let release_old = Arc::new(tokio::sync::Notify::new());
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let mgr = ModelsManagerBuilder::new(
+        None,
+        resolve_model_catalog(&old_cfg, None),
+        acp::ModelId::new("endpoint-model"),
+        auth_manager,
+        old_cfg,
+    )
+    .endpoint(Arc::new(ConfigChangingEndpoint {
+        old_started: old_started.clone(),
+        release_old: release_old.clone(),
+        requests: requests.clone(),
+    }))
+    .cache(test_cache_manager(tmp.path()))
+    .build();
+
+    let mgr_ref = mgr.clone();
+    let stale =
+        tokio::spawn(async move { mgr_ref.refresh_current_model_endpoint_inner(true).await });
+    old_started.notified().await;
+
+    let new_cfg = config_from_toml(
+        r#"
+            [model.endpoint-model]
+            base_url = "https://new-provider.example/v1"
+            api_key = "new-api-key"
+            "#,
+    );
+    mgr.apply_config(new_cfg);
+    release_old.notify_one();
+
+    assert!(
+        !stale.await.unwrap(),
+        "a result requested with the old endpoint config must be discarded",
+    );
+    assert!(!mgr.models().contains_key("old-provider-model"));
+    assert!(!mgr.inner.catalog.read().model_endpoint_catalog_loaded);
+
+    assert!(mgr.refresh_current_model_endpoint_inner(true).await);
+    assert!(mgr.models().contains_key("new-provider-model"));
+    assert_eq!(
+        requests.lock().unwrap().as_slice(),
+        [
+            (
+                "https://old-provider.example/v1".to_string(),
+                "old-api-key".to_string(),
+            ),
+            (
+                "https://new-provider.example/v1".to_string(),
+                "new-api-key".to_string(),
+            ),
+        ],
+    );
 }
 
 fn config_from_toml(toml: &str) -> config::Config {
@@ -1613,18 +1720,126 @@ async fn bounded_auth_provider_refresh_times_out() {
 
 #[test]
 fn switching_current_model_invalidates_endpoint_catalog_cache() {
-    let mgr = test_manager();
+    let cfg = config_from_toml(
+        r#"
+            [model.endpoint-model]
+            base_url = "https://provider.example/v1"
+            api_key = "model-api-key"
+
+            [model.regular-model]
+            model = "regular-model"
+            "#,
+    );
+    let tmp = tempfile::TempDir::new().unwrap();
+    let auth_manager = Arc::new(AuthManager::new(tmp.path(), GrokComConfig::default()));
+    let mgr = ModelsManagerBuilder::new(
+        None,
+        resolve_model_catalog(&cfg, None),
+        acp::ModelId::new("endpoint-model"),
+        auth_manager,
+        cfg.clone(),
+    )
+    .cache(test_cache_manager(tmp.path()))
+    .build();
     {
         let mut cat = mgr.inner.catalog.write();
+        cat.prefetched = Some(make_prefetched(&["provider-model", "regular-model"]));
+        cat.models = resolve_model_catalog(&cfg, cat.prefetched.clone());
+        cat.has_fetched_real_catalog = true;
         cat.model_endpoint_catalog_loaded = true;
+        cat.catalog_source = CatalogSource::ModelEndpoint;
+        cat.catalog_owner = Some(acp::ModelId::new("endpoint-model"));
+        cat.etag = Some("endpoint-etag".to_string());
     }
+    let stale_generation = mgr.inner.catalog.read().generation;
 
-    mgr.set_current_model_id(acp::ModelId::new("other-model"));
+    mgr.set_current_model_id(acp::ModelId::new("regular-model"));
+
+    let cat = mgr.inner.catalog.read();
+    assert!(!cat.model_endpoint_catalog_loaded);
+    assert_eq!(cat.catalog_source, CatalogSource::Global);
+    assert!(!cat.has_fetched_real_catalog);
+    assert!(cat.prefetched.is_none());
+    assert!(cat.etag.is_none());
+    assert!(!cat.models.contains_key("provider-model"));
+    assert!(cat.models.contains_key("regular-model"));
+    assert!(cat.generation > stale_generation);
+    drop(cat);
 
     assert!(
-        !mgr.inner.catalog.read().model_endpoint_catalog_loaded,
-        "a model switch must invalidate the previous model's endpoint catalog",
+        !mgr.apply_refresh_result_fenced(
+            &cfg,
+            Some(make_prefetched(&["stale-global-model"])),
+            None,
+            stale_generation,
+            None,
+            CatalogSource::Global,
+            None,
+        ),
+        "a global fetch started before the model transition must stay fenced",
     );
+    assert!(!mgr.models().contains_key("stale-global-model"));
+}
+
+#[tokio::test]
+async fn switching_from_endpoint_catalog_refetches_global_catalog() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct GlobalEndpoint {
+        calls: Arc<AtomicUsize>,
+    }
+    impl ModelsEndpoint for GlobalEndpoint {
+        fn fetch_models(
+            &self,
+            _endpoints: config::EndpointsConfig,
+            _auth: Option<GrokAuth>,
+            _fetch_auth: ModelFetchAuth,
+        ) -> ModelsFetchFuture {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Some(make_prefetched(&["global-model"])) })
+        }
+    }
+
+    let cfg = config_from_toml(
+        r#"
+            [model.endpoint-model]
+            base_url = "https://provider.example/v1"
+            api_key = "model-api-key"
+
+            [model.regular-model]
+            model = "regular-model"
+            "#,
+    );
+    let tmp = tempfile::TempDir::new().unwrap();
+    let auth_manager = Arc::new(AuthManager::new(tmp.path(), GrokComConfig::default()));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mgr = ModelsManagerBuilder::new(
+        None,
+        resolve_model_catalog(&cfg, None),
+        acp::ModelId::new("endpoint-model"),
+        auth_manager,
+        cfg.clone(),
+    )
+    .endpoint(Arc::new(GlobalEndpoint {
+        calls: calls.clone(),
+    }))
+    .cache(test_cache_manager(tmp.path()))
+    .build();
+    {
+        let mut cat = mgr.inner.catalog.write();
+        cat.prefetched = Some(make_prefetched(&["provider-model"]));
+        cat.models = resolve_model_catalog(&cfg, cat.prefetched.clone());
+        cat.has_fetched_real_catalog = true;
+        cat.model_endpoint_catalog_loaded = true;
+        cat.catalog_source = CatalogSource::ModelEndpoint;
+    }
+
+    mgr.set_current_model_id(acp::ModelId::new("regular-model"));
+    mgr.list_models(RefreshStrategy::OnlineIfUncached).await;
+
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert!(mgr.models().contains_key("global-model"));
+    assert!(!mgr.models().contains_key("provider-model"));
 }
 
 // ── auth-change refresh: has_fetched_real_catalog flag ─────────────
