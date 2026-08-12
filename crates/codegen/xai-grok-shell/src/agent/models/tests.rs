@@ -524,7 +524,8 @@ fn stale_fetch_result_is_discarded_after_identity_change() {
         &cfg,
         Some(make_prefetched(&["stale-model"])),
         None,
-        stale_generation,
+        Some(stale_generation),
+        None,
         None,
         CatalogSource::Global,
         None,
@@ -536,7 +537,8 @@ fn stale_fetch_result_is_discarded_after_identity_change() {
         &cfg,
         None,
         None,
-        stale_generation,
+        Some(stale_generation),
+        None,
         None,
         CatalogSource::Global,
         None,
@@ -568,7 +570,8 @@ fn global_refresh_cannot_replace_model_endpoint_catalog() {
         &cfg,
         Some(make_prefetched(&["global-model"])),
         None,
-        generation,
+        Some(generation),
+        None,
         None,
         CatalogSource::Global,
         None,
@@ -769,6 +772,151 @@ async fn stale_endpoint_refresh_is_discarded_after_endpoint_config_change() {
                 "new-api-key".to_string(),
             ),
         ],
+    );
+}
+
+#[tokio::test]
+async fn endpoint_refresh_survives_settings_only_config_publication() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct SlowModelEndpoint {
+        started: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+        calls: Arc<AtomicUsize>,
+    }
+    impl ModelsEndpoint for SlowModelEndpoint {
+        fn fetch_models(
+            &self,
+            _endpoints: config::EndpointsConfig,
+            _auth: Option<GrokAuth>,
+            _fetch_auth: ModelFetchAuth,
+        ) -> ModelsFetchFuture {
+            Box::pin(async { None })
+        }
+        fn fetch_model_endpoint(&self, _request: ModelEndpointRequest) -> ModelsFetchFuture {
+            let started = self.started.clone();
+            let release = self.release.clone();
+            let catalog = make_prefetched(&["provider-model"]);
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            started.notify_one();
+            Box::pin(async move {
+                release.notified().await;
+                Some(catalog)
+            })
+        }
+    }
+
+    let old_cfg = config_from_toml(
+        r#"
+            [model.endpoint-model]
+            base_url = "https://provider.example/v1"
+            api_key = "model-api-key"
+            "#,
+    );
+    let tmp = tempfile::TempDir::new().unwrap();
+    let auth_manager = Arc::new(AuthManager::new(tmp.path(), GrokComConfig::default()));
+    let started = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mgr = ModelsManagerBuilder::new(
+        None,
+        resolve_model_catalog(&old_cfg, None),
+        acp::ModelId::new("endpoint-model"),
+        auth_manager,
+        old_cfg,
+    )
+    .endpoint(Arc::new(SlowModelEndpoint {
+        started: started.clone(),
+        release: release.clone(),
+        calls: calls.clone(),
+    }))
+    .cache(test_cache_manager(tmp.path()))
+    .build();
+
+    let mgr_ref = mgr.clone();
+    let task =
+        tokio::spawn(async move { mgr_ref.refresh_current_model_endpoint_inner(true).await });
+    started.notified().await;
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+    // Settings-only publication: the endpoint connection context is unchanged,
+    // so the in-flight fetch must still be allowed to publish.
+    let settings_cfg = config_from_toml(
+        r#"
+            [models]
+            default = "endpoint-model"
+            [model.endpoint-model]
+            base_url = "https://provider.example/v1"
+            api_key = "model-api-key"
+            "#,
+    );
+    mgr.apply_config(settings_cfg)
+        .expect("settings-only reload should apply");
+    release.notify_one();
+
+    assert!(
+        task.await.unwrap(),
+        "an endpoint fetch in flight during a settings-only publication must still apply",
+    );
+    let cat = mgr.inner.catalog.read();
+    assert!(cat.model_endpoint_catalog_loaded);
+    assert_eq!(cat.catalog_source, CatalogSource::ModelEndpoint);
+    assert!(cat.models.contains_key("provider-model"));
+    drop(cat);
+}
+
+#[test]
+fn current_model_has_endpoint_recognizes_api_base_url_only() {
+    let cfg = config_from_toml(
+        r#"
+            [model.endpoint-model]
+            api_base_url = "https://api-key.example/v1"
+            api_key = "model-api-key"
+            "#,
+    );
+    let tmp = tempfile::TempDir::new().unwrap();
+    let auth_manager = Arc::new(AuthManager::new(tmp.path(), GrokComConfig::default()));
+    let mgr = ModelsManagerBuilder::new(
+        None,
+        resolve_model_catalog(&cfg, None),
+        acp::ModelId::new("endpoint-model"),
+        auth_manager,
+        cfg,
+    )
+    .cache(test_cache_manager(tmp.path()))
+    .build();
+    assert!(
+        mgr.current_model_has_endpoint(),
+        "a model with only api_base_url must still count as endpoint-configured",
+    );
+}
+
+#[test]
+fn current_model_has_endpoint_recognizes_provider_api_base_url() {
+    let cfg = config_from_toml(
+        r#"
+            [model_providers.provider]
+            api_base_url = "https://api-key.example/v1"
+            api_key = "provider-api-key"
+
+            [model.endpoint-model]
+            model_provider = "provider"
+            "#,
+    );
+    let tmp = tempfile::TempDir::new().unwrap();
+    let auth_manager = Arc::new(AuthManager::new(tmp.path(), GrokComConfig::default()));
+    let mgr = ModelsManagerBuilder::new(
+        None,
+        resolve_model_catalog(&cfg, None),
+        acp::ModelId::new("endpoint-model"),
+        auth_manager,
+        cfg,
+    )
+    .cache(test_cache_manager(tmp.path()))
+    .build();
+    assert!(
+        mgr.current_model_has_endpoint(),
+        "a provider api_base_url must count as endpoint-configured",
     );
 }
 
@@ -1830,7 +1978,8 @@ fn switching_current_model_invalidates_endpoint_catalog_cache() {
             &cfg,
             Some(make_prefetched(&["stale-global-model"])),
             None,
-            stale_generation,
+            Some(stale_generation),
+            None,
             None,
             CatalogSource::Global,
             None,

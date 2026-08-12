@@ -137,6 +137,11 @@ struct CatalogState {
     allowlist_excludes_all: bool,
     /// Bumped on identity change; a fetch captured before it must not apply.
     generation: u64,
+    /// Bumped when the current model's endpoint connection context changes or
+    /// the identity is cleared. A model-endpoint fetch captured before it must
+    /// not apply; settings-only publications leave it unchanged so an in-flight
+    /// endpoint refresh can still publish.
+    endpoint_generation: u64,
 }
 
 /// True when the model's endpoint connection context (base URL, credentials,
@@ -467,6 +472,17 @@ impl ModelsManager {
             && !catalog_owner.as_ref().is_some_and(|owner| {
                 !model_endpoint_changed(&old_config, &new_config, owner.0.as_ref())
             });
+        // A settings-only publication must not invalidate an in-flight
+        // model-endpoint fetch, but a change to the endpoint connection
+        // context must. Before the endpoint catalog loads, the current model
+        // id is the fetch's owner.
+        let endpoint_context_changed = {
+            let owner_key = catalog_owner
+                .as_ref()
+                .map(|owner| owner.0.as_ref().to_string())
+                .unwrap_or_else(|| self.inner.current_model_id.read().0.as_ref().to_string());
+            model_endpoint_changed(&old_config, &new_config, &owner_key)
+        };
         let endpoint_catalog_still_valid = endpoint_catalog_active && !endpoint_catalog_invalidated;
         let retained_prefetched = if endpoint_catalog_invalidated {
             None
@@ -500,6 +516,9 @@ impl ModelsManager {
             // Publish the new config before advancing the fence so a refresh
             // that observes this generation can only build a new request.
             cat.generation += 1;
+            if endpoint_context_changed {
+                cat.endpoint_generation += 1;
+            }
             cat.prefetched = retained_prefetched;
             cat.models = new_catalog;
             cat.has_fetched_real_catalog = retained_real_catalog;
@@ -670,6 +689,7 @@ impl ModelsManager {
                         models,
                         allowlist_excludes_all,
                         generation,
+                        endpoint_generation: generation,
                         ..Default::default()
                     };
                     self.inner
@@ -880,6 +900,7 @@ impl ModelsManager {
         {
             let mut cat = self.inner.catalog.write();
             cat.generation += 1;
+            cat.endpoint_generation += 1;
             cat.etag = None;
         }
         let has_session = self.inner.auth_manager.current_or_expired().is_some();
@@ -1166,8 +1187,10 @@ impl ModelsManager {
         {
             let mut cat = self.inner.catalog.write();
             let generation = cat.generation + 1;
+            let endpoint_generation = cat.endpoint_generation + 1;
             *cat = CatalogState::default();
             cat.generation = generation;
+            cat.endpoint_generation = endpoint_generation;
             self.inner
                 .catalog_progress
                 .send_replace(CatalogProgress::Pending);
@@ -1301,7 +1324,8 @@ impl ModelsManager {
                 &cfg,
                 new_prefetched,
                 new_etag,
-                generation,
+                Some(generation),
+                None,
                 None,
                 CatalogSource::Global,
                 None,
@@ -1369,11 +1393,14 @@ impl ModelsManager {
         };
         let configured_endpoint = cfg.config_models.get(key).is_some_and(|model| {
             model.base_url.is_some()
+                || model.api_base_url.is_some()
                 || model
                     .model_provider
                     .as_deref()
                     .and_then(|provider| cfg.model_providers.get(provider))
-                    .is_some_and(|provider| provider.base_url.is_some())
+                    .is_some_and(|provider| {
+                        provider.base_url.is_some() || provider.api_base_url.is_some()
+                    })
         });
         configured_endpoint && entry.has_own_credentials()
     }
@@ -1410,7 +1437,7 @@ impl ModelsManager {
             let current = self.inner.current_model_id.read();
             (current.clone(), self.model_switch_generation())
         };
-        let generation = self.inner.catalog.read().generation;
+        let endpoint_generation = self.inner.catalog.read().endpoint_generation;
         let Some(request) = self.model_endpoint_request().await else {
             return false;
         };
@@ -1432,7 +1459,8 @@ impl ModelsManager {
             &cfg,
             models,
             None,
-            generation,
+            None,
+            Some(endpoint_generation),
             Some(switch_generation),
             CatalogSource::ModelEndpoint,
             Some(catalog_owner),
@@ -1571,7 +1599,8 @@ impl ModelsManager {
             &cfg,
             new_prefetched,
             None,
-            generation,
+            Some(generation),
+            None,
             None,
             CatalogSource::Global,
             None,
@@ -1600,6 +1629,7 @@ impl ModelsManager {
             new_etag,
             None,
             None,
+            None,
             CatalogSource::Global,
             None,
         );
@@ -1614,13 +1644,23 @@ impl ModelsManager {
         models: IndexMap<String, ModelEntry>,
         new_etag: Option<String>,
         generation: Option<u64>,
+        endpoint_generation: Option<u64>,
         switch_generation: Option<u64>,
         source: CatalogSource,
         catalog_owner: Option<acp::ModelId>,
     ) -> bool {
         let (first_real_catalog, excludes_all) = {
             let mut cat = self.inner.catalog.write();
-            if let Some(generation) = generation
+            if source == CatalogSource::ModelEndpoint {
+                if let Some(endpoint_generation) = endpoint_generation
+                    && cat.endpoint_generation != endpoint_generation
+                {
+                    tracing::info!(
+                        "model catalog result discarded: endpoint config changed during fetch"
+                    );
+                    return false;
+                }
+            } else if let Some(generation) = generation
                 && cat.generation != generation
             {
                 tracing::info!("model catalog result discarded: identity changed during fetch");
@@ -1684,7 +1724,8 @@ impl ModelsManager {
             config,
             new_prefetched,
             new_etag,
-            generation,
+            Some(generation),
+            None,
             None,
             CatalogSource::Global,
             None,
@@ -1696,7 +1737,8 @@ impl ModelsManager {
         config: &config::Config,
         new_prefetched: Option<IndexMap<String, ModelEntry>>,
         new_etag: Option<String>,
-        generation: u64,
+        generation: Option<u64>,
+        endpoint_generation: Option<u64>,
         switch_generation: Option<u64>,
         source: CatalogSource,
         catalog_owner: Option<acp::ModelId>,
@@ -1706,7 +1748,11 @@ impl ModelsManager {
             // Lock held across the send: atomic against a racing `clear()`.
             {
                 let cat = self.inner.catalog.read();
-                if cat.generation == generation {
+                let same_identity = match generation {
+                    Some(generation) => cat.generation == generation,
+                    None => endpoint_generation.is_some_and(|g| cat.endpoint_generation == g),
+                };
+                if same_identity {
                     self.inner.catalog_progress.send_if_modified(|p| {
                         let first_failure = *p == CatalogProgress::Pending;
                         if first_failure {
@@ -1729,7 +1775,8 @@ impl ModelsManager {
             config,
             new_prefetched,
             new_etag,
-            Some(generation),
+            generation,
+            endpoint_generation,
             switch_generation,
             source,
             catalog_owner,

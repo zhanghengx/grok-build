@@ -1493,7 +1493,6 @@ impl MvpAgent {
         };
         if let Err(e) = applied {
             tracing::error!(error = %e, "ignoring remote settings reload: rejected model config");
-            return;
         }
         self.sync_collection_config_gate();
         self.emit_settings_update_notification();
