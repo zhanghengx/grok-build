@@ -1842,6 +1842,153 @@ async fn switching_from_endpoint_catalog_refetches_global_catalog() {
     assert!(!mgr.models().contains_key("provider-model"));
 }
 
+#[test]
+fn switching_to_endpoint_returned_slug_keeps_endpoint_catalog() {
+    let cfg = config_from_toml(
+        r#"
+            [model.alias]
+            model = "provider-model"
+            base_url = "https://provider.example/v1"
+            api_key = "model-api-key"
+            "#,
+    );
+    let tmp = tempfile::TempDir::new().unwrap();
+    let auth_manager = Arc::new(AuthManager::new(tmp.path(), GrokComConfig::default()));
+    let mgr = ModelsManagerBuilder::new(
+        None,
+        resolve_model_catalog(&cfg, None),
+        acp::ModelId::new("alias"),
+        auth_manager,
+        cfg.clone(),
+    )
+    .cache(test_cache_manager(tmp.path()))
+    .build();
+    {
+        let mut cat = mgr.inner.catalog.write();
+        cat.prefetched = Some(make_prefetched(&["provider-model"]));
+        cat.models = resolve_model_catalog(&cfg, cat.prefetched.clone());
+        cat.has_fetched_real_catalog = true;
+        cat.model_endpoint_catalog_loaded = true;
+        cat.catalog_source = CatalogSource::ModelEndpoint;
+        cat.catalog_owner = Some(acp::ModelId::new("alias"));
+    }
+
+    mgr.set_current_model_id(acp::ModelId::new("provider-model"));
+
+    let cat = mgr.inner.catalog.read();
+    assert!(
+        cat.model_endpoint_catalog_loaded,
+        "a provider-returned slug that shares the owner's routing slug must stay endpoint-owned",
+    );
+    assert_eq!(cat.catalog_source, CatalogSource::ModelEndpoint);
+    assert_eq!(
+        cat.catalog_owner.as_ref().map(|o| o.0.as_ref()),
+        Some("alias")
+    );
+    assert!(cat.models.contains_key("provider-model"));
+    drop(cat);
+}
+
+#[test]
+fn apply_config_preserves_unchanged_endpoint_catalog() {
+    let old_cfg = config_from_toml(
+        r#"
+            [model.endpoint-model]
+            base_url = "https://provider.example/v1"
+            api_key = "model-api-key"
+            "#,
+    );
+    let tmp = tempfile::TempDir::new().unwrap();
+    let auth_manager = Arc::new(AuthManager::new(tmp.path(), GrokComConfig::default()));
+    let mgr = ModelsManagerBuilder::new(
+        None,
+        resolve_model_catalog(&old_cfg, None),
+        acp::ModelId::new("endpoint-model"),
+        auth_manager,
+        old_cfg.clone(),
+    )
+    .cache(test_cache_manager(tmp.path()))
+    .build();
+    {
+        let mut cat = mgr.inner.catalog.write();
+        cat.prefetched = Some(make_prefetched(&["provider-model"]));
+        cat.models = resolve_model_catalog(&old_cfg, cat.prefetched.clone());
+        cat.has_fetched_real_catalog = true;
+        cat.model_endpoint_catalog_loaded = true;
+        cat.catalog_source = CatalogSource::ModelEndpoint;
+        cat.catalog_owner = Some(acp::ModelId::new("endpoint-model"));
+    }
+
+    let new_cfg = config_from_toml(
+        r#"
+            [models]
+            default = "endpoint-model"
+            [model.endpoint-model]
+            base_url = "https://provider.example/v1"
+            api_key = "model-api-key"
+            "#,
+    );
+    mgr.apply_config(new_cfg);
+
+    let cat = mgr.inner.catalog.read();
+    assert!(
+        cat.model_endpoint_catalog_loaded,
+        "a config publication with an unchanged endpoint must keep the endpoint catalog",
+    );
+    assert_eq!(cat.catalog_source, CatalogSource::ModelEndpoint);
+    assert_eq!(
+        cat.catalog_owner.as_ref().map(|o| o.0.as_ref()),
+        Some("endpoint-model")
+    );
+    assert!(cat.models.contains_key("provider-model"));
+    drop(cat);
+}
+
+#[test]
+fn apply_config_recomputes_allowlist_gate_for_pending_catalog() {
+    let old_cfg = config_from_toml(
+        r#"
+            [model.endpoint-model]
+            base_url = "https://provider.example/v1"
+            api_key = "model-api-key"
+            "#,
+    );
+    let tmp = tempfile::TempDir::new().unwrap();
+    let auth_manager = Arc::new(AuthManager::new(tmp.path(), GrokComConfig::default()));
+    let mgr = ModelsManagerBuilder::new(
+        None,
+        resolve_model_catalog(&old_cfg, None),
+        acp::ModelId::new("endpoint-model"),
+        auth_manager,
+        old_cfg.clone(),
+    )
+    .cache(test_cache_manager(tmp.path()))
+    .build();
+    {
+        let mut cat = mgr.inner.catalog.write();
+        cat.prefetched = Some(make_prefetched(&["keep-1"]));
+        cat.models = resolve_model_catalog(&old_cfg, cat.prefetched.clone());
+        cat.has_fetched_real_catalog = true;
+        cat.model_endpoint_catalog_loaded = true;
+        cat.catalog_source = CatalogSource::ModelEndpoint;
+        cat.catalog_owner = Some(acp::ModelId::new("endpoint-model"));
+    }
+
+    let new_cfg = config_from_toml(
+        r#"
+            [models]
+            allowed_models = ["keep-*"]
+            "#,
+    );
+    mgr.apply_config(new_cfg);
+
+    assert!(
+        mgr.allowlist_excludes_all(),
+        "the pending config-only catalog must stay fail-closed while the endpoint catalog is invalidated",
+    );
+    assert!(!mgr.inner.catalog.read().model_endpoint_catalog_loaded);
+}
+
 // ── auth-change refresh: has_fetched_real_catalog flag ─────────────
 
 #[test]

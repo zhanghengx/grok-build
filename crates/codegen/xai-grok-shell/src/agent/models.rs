@@ -139,6 +139,31 @@ struct CatalogState {
     generation: u64,
 }
 
+/// True when the model's endpoint connection context (base URL, credentials,
+/// backend, auth scheme, request metadata) differs between two config
+/// snapshots. Endpoint-derived catalog entries inherit this context, so they
+/// can be reused across a config publication only while it is unchanged.
+fn model_endpoint_changed(old: &config::Config, new: &config::Config, owner_key: &str) -> bool {
+    let old_models = config::resolve_model_list(old, None);
+    let new_models = config::resolve_model_list(new, None);
+    let old_entry = old_models.get(owner_key);
+    let new_entry = new_models.get(owner_key);
+    match (old_entry, new_entry) {
+        (Some(old_entry), Some(new_entry)) => {
+            old_entry.info.base_url != new_entry.info.base_url
+                || old_entry.info.api_backend != new_entry.info.api_backend
+                || old_entry.info.auth_scheme != new_entry.info.auth_scheme
+                || old_entry.info.extra_headers != new_entry.info.extra_headers
+                || old_entry.info.query_params != new_entry.info.query_params
+                || old_entry.info.env_http_headers != new_entry.info.env_http_headers
+                || old_entry.api_key != new_entry.api_key
+                || old_entry.env_key != new_entry.env_key
+                || old_entry.auth_provider != new_entry.auth_provider
+        }
+        _ => true,
+    }
+}
+
 struct Inner {
     catalog: RwLock<CatalogState>,
     current_model_id: RwLock<acp::ModelId>,
@@ -403,24 +428,37 @@ impl ModelsManager {
             tracing::error!(error = %e, "ignoring config reload: invalid model filters");
             return;
         }
-        let (prefetched, has_real_catalog, catalog_source) = {
+        let (prefetched, has_real_catalog, catalog_source, catalog_owner) = {
             let cat = self.inner.catalog.read();
             (
                 cat.prefetched.clone(),
                 cat.has_fetched_real_catalog,
                 cat.catalog_source,
+                cat.catalog_owner.clone(),
             )
         };
-        // Model-endpoint entries carry inherited routing and credentials. Do
-        // not reuse them across a config publication; the endpoint will be
-        // fetched again if it is still applicable.
-        let retained_prefetched = (catalog_source != CatalogSource::ModelEndpoint)
-            .then_some(prefetched)
-            .flatten();
-        let retained_real_catalog =
-            has_real_catalog && catalog_source != CatalogSource::ModelEndpoint;
+        let old_config = self.inner.cfg.read().clone();
+        // Model-endpoint entries carry inherited routing and credentials. Keep
+        // them across a config publication while the endpoint connection
+        // context is unchanged; otherwise drop them and let the caller refetch
+        // so dynamically discovered models never disappear silently.
+        let endpoint_catalog_active = catalog_source == CatalogSource::ModelEndpoint;
+        let endpoint_catalog_invalidated = endpoint_catalog_active
+            && !catalog_owner.as_ref().is_some_and(|owner| {
+                !model_endpoint_changed(&old_config, &new_config, owner.0.as_ref())
+            });
+        let endpoint_catalog_still_valid = endpoint_catalog_active && !endpoint_catalog_invalidated;
+        let retained_prefetched = if endpoint_catalog_invalidated {
+            None
+        } else {
+            prefetched
+        };
+        let retained_real_catalog = has_real_catalog && !endpoint_catalog_invalidated;
         let new_catalog = resolve_model_catalog(&new_config, retained_prefetched.clone());
-        if retained_real_catalog && let Err(e) = validate_selectable(&new_config, &new_catalog) {
+        if retained_real_catalog
+            && !endpoint_catalog_active
+            && let Err(e) = validate_selectable(&new_config, &new_catalog)
+        {
             tracing::error!(error = %e, "ignoring config reload: allowed_models excludes all models");
             return;
         }
@@ -445,22 +483,27 @@ impl ModelsManager {
             // Publish the new config before advancing the fence so a refresh
             // that observes this generation can only build a new request.
             cat.generation += 1;
-            if retained_real_catalog {
-                cat.allowlist_excludes_all = allowlist_matches_nothing(&new_config, &new_catalog);
-            }
             cat.prefetched = retained_prefetched;
             cat.models = new_catalog;
             cat.has_fetched_real_catalog = retained_real_catalog;
+            cat.allowlist_excludes_all = allowlist_matches_nothing(&new_config, &cat.models);
             if !retained_real_catalog {
                 cat.etag = None;
-                cat.allowlist_excludes_all = false;
                 self.inner
                     .catalog_progress
                     .send_replace(CatalogProgress::Pending);
             }
-            cat.model_endpoint_catalog_loaded = false;
-            cat.catalog_source = CatalogSource::Global;
-            cat.catalog_owner = None;
+            cat.model_endpoint_catalog_loaded = endpoint_catalog_still_valid;
+            cat.catalog_source = if endpoint_catalog_still_valid {
+                CatalogSource::ModelEndpoint
+            } else {
+                CatalogSource::Global
+            };
+            cat.catalog_owner = if endpoint_catalog_still_valid {
+                catalog_owner
+            } else {
+                None
+            };
         }
         drop(cfg);
 
@@ -574,18 +617,13 @@ impl ModelsManager {
                 // context and remain owned by that catalog. A configured or
                 // bundled model absent from the endpoint does not: restore the
                 // config-only catalog so OnlineIfUncached performs the fetch
-                // appropriate for the new model.
+                // appropriate for the new model. Ownership is by configured key
+                // or endpoint identity, never the routing slug.
                 let returned_by_endpoint = cat
                     .prefetched
                     .as_ref()
                     .is_some_and(|models| resolve_catalog_key(models, &id).is_some());
-                let is_configured_model = cfg.config_models.iter().any(|(key, model)| {
-                    key == id.0.as_ref()
-                        || model
-                            .model
-                            .as_deref()
-                            .is_some_and(|model| model == id.0.as_ref())
-                });
+                let is_configured_model = cfg.config_models.contains_key(id.0.as_ref());
                 let belongs_to_endpoint_catalog = cat.catalog_owner.as_ref() == Some(&id)
                     || (returned_by_endpoint && !is_configured_model);
                 if !belongs_to_endpoint_catalog {
