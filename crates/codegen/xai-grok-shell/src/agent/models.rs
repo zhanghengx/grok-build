@@ -455,10 +455,7 @@ impl ModelsManager {
         };
         let retained_real_catalog = has_real_catalog && !endpoint_catalog_invalidated;
         let new_catalog = resolve_model_catalog(&new_config, retained_prefetched.clone());
-        if retained_real_catalog
-            && !endpoint_catalog_active
-            && let Err(e) = validate_selectable(&new_config, &new_catalog)
-        {
+        if retained_real_catalog && let Err(e) = validate_selectable(&new_config, &new_catalog) {
             tracing::error!(error = %e, "ignoring config reload: allowed_models excludes all models");
             return;
         }

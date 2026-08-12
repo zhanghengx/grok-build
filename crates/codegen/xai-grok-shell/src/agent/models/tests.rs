@@ -1945,6 +1945,62 @@ fn apply_config_preserves_unchanged_endpoint_catalog() {
 }
 
 #[test]
+fn apply_config_rejects_invalid_allowlist_for_retained_endpoint_catalog() {
+    let old_cfg = config_from_toml(
+        r#"
+            [model.endpoint-model]
+            base_url = "https://provider.example/v1"
+            api_key = "model-api-key"
+            "#,
+    );
+    let tmp = tempfile::TempDir::new().unwrap();
+    let auth_manager = Arc::new(AuthManager::new(tmp.path(), GrokComConfig::default()));
+    let mgr = ModelsManagerBuilder::new(
+        None,
+        resolve_model_catalog(&old_cfg, None),
+        acp::ModelId::new("endpoint-model"),
+        auth_manager,
+        old_cfg.clone(),
+    )
+    .cache(test_cache_manager(tmp.path()))
+    .build();
+    {
+        let mut cat = mgr.inner.catalog.write();
+        cat.prefetched = Some(make_prefetched(&["provider-model"]));
+        cat.models = resolve_model_catalog(&old_cfg, cat.prefetched.clone());
+        cat.has_fetched_real_catalog = true;
+        cat.model_endpoint_catalog_loaded = true;
+        cat.catalog_source = CatalogSource::ModelEndpoint;
+        cat.catalog_owner = Some(acp::ModelId::new("endpoint-model"));
+    }
+
+    let new_cfg = config_from_toml(
+        r#"
+            [models]
+            allowed_models = ["nomatch-*"]
+            [model.endpoint-model]
+            base_url = "https://provider.example/v1"
+            api_key = "model-api-key"
+            "#,
+    );
+    mgr.apply_config(new_cfg);
+
+    let cat = mgr.inner.catalog.read();
+    assert!(
+        cat.model_endpoint_catalog_loaded,
+        "an allowlist that excludes every retained endpoint model must be rejected",
+    );
+    assert_eq!(cat.catalog_source, CatalogSource::ModelEndpoint);
+    assert!(!cat.allowlist_excludes_all);
+    assert!(cat.models.contains_key("provider-model"));
+    assert!(
+        mgr.inner.cfg.read().models.allowed_models.is_none(),
+        "the invalid allowlist reload must not be published",
+    );
+    drop(cat);
+}
+
+#[test]
 fn apply_config_recomputes_allowlist_gate_for_pending_catalog() {
     let old_cfg = config_from_toml(
         r#"
