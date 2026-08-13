@@ -1441,7 +1441,6 @@ impl ModelsManager {
         let Some(request) = self.model_endpoint_request().await else {
             return false;
         };
-        let cfg = self.inner.cfg.read().clone();
         let endpoint = self.inner.endpoint.clone();
         let models = match tokio::time::timeout(
             crate::http::STARTUP_FETCH_TIMEOUT,
@@ -1455,6 +1454,7 @@ impl ModelsManager {
                 None
             }
         };
+        let cfg = self.inner.cfg.read().clone();
         if !self.apply_refresh_result_fenced(
             &cfg,
             models,
@@ -1649,7 +1649,7 @@ impl ModelsManager {
         source: CatalogSource,
         catalog_owner: Option<acp::ModelId>,
     ) -> bool {
-        let (first_real_catalog, excludes_all) = {
+        let (first_real_catalog, excludes_all, apply_cfg) = {
             let mut cat = self.inner.catalog.write();
             if source == CatalogSource::ModelEndpoint {
                 if let Some(endpoint_generation) = endpoint_generation
@@ -1681,20 +1681,29 @@ impl ModelsManager {
                 );
                 return false;
             }
+            // A settings-only publication intentionally leaves the endpoint
+            // fence unchanged so an in-flight fetch can still publish. Re-read
+            // the current config at apply time so a stale snapshot cannot
+            // overwrite the latest filters/defaults.
+            let apply_cfg = if source == CatalogSource::ModelEndpoint {
+                self.inner.cfg.read().clone()
+            } else {
+                cfg.clone()
+            };
             let first_real_catalog = !cat.has_fetched_real_catalog;
             cat.has_fetched_real_catalog = true;
             cat.catalog_source = source;
             cat.catalog_owner = catalog_owner;
             cat.model_endpoint_catalog_loaded = source == CatalogSource::ModelEndpoint;
             cat.prefetched = Some(models);
-            cat.models = resolve_model_catalog(cfg, cat.prefetched.clone());
+            cat.models = resolve_model_catalog(&apply_cfg, cat.prefetched.clone());
             cat.etag = new_etag;
-            cat.allowlist_excludes_all = allowlist_matches_nothing(cfg, &cat.models);
+            cat.allowlist_excludes_all = allowlist_matches_nothing(&apply_cfg, &cat.models);
             // In the lock: the flag and its mirror can't desync vs `clear()`.
             self.inner
                 .catalog_progress
                 .send_replace(CatalogProgress::Ready);
-            (first_real_catalog, cat.allowlist_excludes_all)
+            (first_real_catalog, cat.allowlist_excludes_all, apply_cfg)
         };
         if excludes_all {
             tracing::error!("allowed_models excludes all fetched models; prompts will be blocked");
@@ -1704,9 +1713,9 @@ impl ModelsManager {
         // default on the first catalog only when the user hasn't chosen.
         // Either way a now-invalid selection is replaced.
         if first_real_catalog && !self.inner.user_selected_model.load(Ordering::Relaxed) {
-            self.reselect_default_model(cfg);
+            self.reselect_default_model(&apply_cfg);
         } else {
-            self.reselect_current_model_if_missing(cfg);
+            self.reselect_current_model_if_missing(&apply_cfg);
         }
         true
     }
