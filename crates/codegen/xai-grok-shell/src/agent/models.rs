@@ -202,6 +202,9 @@ struct Inner {
     retry_in_flight: AtomicBool,
     /// Single-flight for the etag-triggered background refresh (`spawn_fetch`).
     refresh_in_flight: AtomicBool,
+    /// Serializes model-endpoint catalog refreshes so an older `/models`
+    /// response cannot overwrite a newer one.
+    endpoint_refresh: tokio::sync::Mutex<()>,
     fetches_in_flight: AtomicUsize,
     /// Model-switch signal: a generation counter bumped when the current model id changes.
     model_switch_watch: tokio::sync::watch::Sender<u64>,
@@ -350,6 +353,7 @@ impl ModelsManagerBuilder {
                 endpoint: self.endpoint,
                 retry_in_flight: AtomicBool::new(false),
                 refresh_in_flight: AtomicBool::new(false),
+                endpoint_refresh: tokio::sync::Mutex::new(()),
                 fetches_in_flight: AtomicUsize::new(0),
                 model_switch_watch: tokio::sync::watch::channel(0u64).0,
                 catalog_progress: tokio::sync::watch::channel(CatalogProgress::Pending).0,
@@ -507,40 +511,43 @@ impl ModelsManager {
         let has_session = self.inner.auth_manager.current_or_expired().is_some();
         *self.inner.fetch_auth.write() =
             ModelFetchAuth::resolve(&new_config.endpoints, has_session);
+        // Keep one lock order everywhere: catalog, then cfg. The apply path
+        // (`apply_catalog_fenced`) reads cfg while holding catalog, so taking
+        // cfg first here would invert the order and can deadlock a reload
+        // against an in-flight endpoint refresh.
+        let mut cat = self.inner.catalog.write();
         let mut cfg = self.inner.cfg.write();
         *cfg = new_config.clone();
-        {
-            let mut cat = self.inner.catalog.write();
-            // A config reload can change the endpoint, credential, provider,
-            // or request metadata used by any catalog fetch already in flight.
-            // Publish the new config before advancing the fence so a refresh
-            // that observes this generation can only build a new request.
-            cat.generation += 1;
-            if endpoint_context_changed {
-                cat.endpoint_generation += 1;
-            }
-            cat.prefetched = retained_prefetched;
-            cat.models = new_catalog;
-            cat.has_fetched_real_catalog = retained_real_catalog;
-            cat.allowlist_excludes_all = allowlist_matches_nothing(&new_config, &cat.models);
-            if !retained_real_catalog {
-                cat.etag = None;
-                self.inner
-                    .catalog_progress
-                    .send_replace(CatalogProgress::Pending);
-            }
-            cat.model_endpoint_catalog_loaded = endpoint_catalog_still_valid;
-            cat.catalog_source = if endpoint_catalog_still_valid {
-                CatalogSource::ModelEndpoint
-            } else {
-                CatalogSource::Global
-            };
-            cat.catalog_owner = if endpoint_catalog_still_valid {
-                catalog_owner
-            } else {
-                None
-            };
+        // A config reload can change the endpoint, credential, provider, or
+        // request metadata used by any catalog fetch already in flight.
+        // Publish the new config before advancing the fence so a refresh that
+        // observes this generation can only build a new request.
+        cat.generation += 1;
+        if endpoint_context_changed {
+            cat.endpoint_generation += 1;
         }
+        cat.prefetched = retained_prefetched;
+        cat.models = new_catalog;
+        cat.has_fetched_real_catalog = retained_real_catalog;
+        cat.allowlist_excludes_all = allowlist_matches_nothing(&new_config, &cat.models);
+        if !retained_real_catalog {
+            cat.etag = None;
+            self.inner
+                .catalog_progress
+                .send_replace(CatalogProgress::Pending);
+        }
+        cat.model_endpoint_catalog_loaded = endpoint_catalog_still_valid;
+        cat.catalog_source = if endpoint_catalog_still_valid {
+            CatalogSource::ModelEndpoint
+        } else {
+            CatalogSource::Global
+        };
+        cat.catalog_owner = if endpoint_catalog_still_valid {
+            catalog_owner
+        } else {
+            None
+        };
+        drop(cat);
         drop(cfg);
 
         let preferred_changed = new_preferred != old_preferred && new_preferred.is_some();
@@ -882,16 +889,11 @@ impl ModelsManager {
                 cat.catalog_source == CatalogSource::ModelEndpoint,
             )
         };
-        if same_etag {
-            let fetch_auth = *self.inner.fetch_auth.read();
-            self.inner
-                .cache
-                .renew_ttl(&fetch_auth.cache_auth_method(), &self.cache_origin())
-                .await;
-            return;
-        }
-        tracing::info!(etag = %etag, "models etag changed, refreshing");
         if endpoint_owned {
+            if same_etag {
+                return;
+            }
+            tracing::info!(etag = %etag, "models etag changed, refreshing endpoint catalog");
             let mgr = self.clone();
             tokio::task::spawn(async move {
                 mgr.refresh_current_model_endpoint_inner(
@@ -902,6 +904,15 @@ impl ModelsManager {
             });
             return;
         }
+        if same_etag {
+            let fetch_auth = *self.inner.fetch_auth.read();
+            self.inner
+                .cache
+                .renew_ttl(&fetch_auth.cache_auth_method(), &self.cache_origin())
+                .await;
+            return;
+        }
+        tracing::info!(etag = %etag, "models etag changed, refreshing");
         self.spawn_fetch(Some(etag));
     }
 
@@ -1388,35 +1399,44 @@ impl ModelsManager {
     }
 
     fn current_model_has_endpoint(&self) -> bool {
-        let current = self.current_model_id();
-        let cfg = self.inner.cfg.read().clone();
-        let catalog = self.inner.catalog.read();
-        let Some((key, entry)) = catalog
-            .models
-            .get(current.0.as_ref())
-            .map(|entry| (current.0.as_ref(), entry))
-            .or_else(|| {
-                catalog
-                    .models
-                    .iter()
-                    .find(|(_, entry)| entry.info.model == current.0.as_ref())
-                    .map(|(key, entry)| (key.as_str(), entry))
-            })
-        else {
-            return false;
+        self.model_has_endpoint(&self.current_model_id())
+    }
+
+    /// Whether `model_id` has a configured model-owned endpoint plus a
+    /// credential for it. Reads catalog before cfg to preserve the lock order
+    /// used by the catalog apply path.
+    fn model_has_endpoint(&self, model_id: &acp::ModelId) -> bool {
+        let (configured_endpoint, has_own_credentials) = {
+            let catalog = self.inner.catalog.read();
+            let Some((key, entry)) = catalog
+                .models
+                .get(model_id.0.as_ref())
+                .map(|entry| (model_id.0.as_ref(), entry))
+                .or_else(|| {
+                    catalog
+                        .models
+                        .iter()
+                        .find(|(_, entry)| entry.info.model == model_id.0.as_ref())
+                        .map(|(key, entry)| (key.as_str(), entry))
+                })
+            else {
+                return false;
+            };
+            let cfg = self.inner.cfg.read();
+            let configured_endpoint = cfg.config_models.get(key).is_some_and(|model| {
+                model.base_url.is_some()
+                    || model.api_base_url.is_some()
+                    || model
+                        .model_provider
+                        .as_deref()
+                        .and_then(|provider| cfg.model_providers.get(provider))
+                        .is_some_and(|provider| {
+                            provider.base_url.is_some() || provider.api_base_url.is_some()
+                        })
+            });
+            (configured_endpoint, entry.has_own_credentials())
         };
-        let configured_endpoint = cfg.config_models.get(key).is_some_and(|model| {
-            model.base_url.is_some()
-                || model.api_base_url.is_some()
-                || model
-                    .model_provider
-                    .as_deref()
-                    .and_then(|provider| cfg.model_providers.get(provider))
-                    .is_some_and(|provider| {
-                        provider.base_url.is_some() || provider.api_base_url.is_some()
-                    })
-        });
-        configured_endpoint && entry.has_own_credentials()
+        configured_endpoint && has_own_credentials
     }
 
     /// Load the configured model's own `/models` catalog once at startup.
@@ -1448,16 +1468,27 @@ impl ModelsManager {
             tracing::info!("model-specific catalog refresh skipped: remote_fetch disabled");
             return false;
         }
+        // Endpoint refreshes are serialized: overlapping `/models` calls all
+        // share the same generation fences, so without a queue an older
+        // response could land last and overwrite a newer catalog/etag.
+        let _endpoint_refresh = self.inner.endpoint_refresh.lock().await;
         // Capture both fences before the request: `model_endpoint_request`
         // awaits a provider refresh, during which either the current model or
         // its endpoint configuration can change. A stale result must not mark
         // the new model/configuration as loaded.
-        let (catalog_owner, switch_generation) = {
+        let (catalog_owner, switch_generation, endpoint_generation) = {
             let current = self.inner.current_model_id.read();
-            (current.clone(), self.model_switch_generation())
+            let cat = self.inner.catalog.read();
+            (
+                // ETag refreshes must use the configured owner of an
+                // endpoint-owned catalog, not the currently selected returned
+                // slug or metadata-only overlay.
+                cat.catalog_owner.clone().unwrap_or_else(|| current.clone()),
+                self.model_switch_generation(),
+                cat.endpoint_generation,
+            )
         };
-        let endpoint_generation = self.inner.catalog.read().endpoint_generation;
-        let Some(request) = self.model_endpoint_request().await else {
+        let Some(request) = self.model_endpoint_request(&catalog_owner).await else {
             return false;
         };
         let endpoint = self.inner.endpoint.clone();
@@ -1493,21 +1524,20 @@ impl ModelsManager {
         true
     }
 
-    async fn model_endpoint_request(&self) -> Option<ModelEndpointRequest> {
-        if !self.current_model_has_endpoint() {
+    async fn model_endpoint_request(&self, owner: &acp::ModelId) -> Option<ModelEndpointRequest> {
+        if !self.model_has_endpoint(owner) {
             return None;
         }
-        let current = self.current_model_id();
         let entry = {
             let catalog = self.inner.catalog.read();
             catalog
                 .models
-                .get(current.0.as_ref())
+                .get(owner.0.as_ref())
                 .or_else(|| {
                     catalog
                         .models
                         .values()
-                        .find(|entry| entry.info.model == current.0.as_ref())
+                        .find(|entry| entry.info.model == owner.0.as_ref())
                 })
                 .cloned()
         }?;
