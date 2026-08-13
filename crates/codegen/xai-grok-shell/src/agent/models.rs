@@ -875,9 +875,12 @@ impl ModelsManager {
 
     /// Refresh models when the etag changes.
     pub(crate) async fn refresh_if_new_etag(&self, etag: String) {
-        let same_etag = {
+        let (same_etag, endpoint_owned) = {
             let cat = self.inner.catalog.read();
-            cat.etag.as_deref() == Some(etag.as_str())
+            (
+                cat.etag.as_deref() == Some(etag.as_str()),
+                cat.catalog_source == CatalogSource::ModelEndpoint,
+            )
         };
         if same_etag {
             let fetch_auth = *self.inner.fetch_auth.read();
@@ -888,6 +891,17 @@ impl ModelsManager {
             return;
         }
         tracing::info!(etag = %etag, "models etag changed, refreshing");
+        if endpoint_owned {
+            let mgr = self.clone();
+            tokio::task::spawn(async move {
+                mgr.refresh_current_model_endpoint_inner(
+                    crate::util::config::resolve_remote_fetch_enabled(),
+                    Some(etag),
+                )
+                .await;
+            });
+            return;
+        }
         self.spawn_fetch(Some(etag));
     }
 
@@ -1420,11 +1434,16 @@ impl ModelsManager {
     pub(crate) async fn refresh_current_model_endpoint(&self) -> bool {
         self.refresh_current_model_endpoint_inner(
             crate::util::config::resolve_remote_fetch_enabled(),
+            None,
         )
         .await
     }
 
-    async fn refresh_current_model_endpoint_inner(&self, remote_fetch_enabled: bool) -> bool {
+    async fn refresh_current_model_endpoint_inner(
+        &self,
+        remote_fetch_enabled: bool,
+        observed_etag: Option<String>,
+    ) -> bool {
         if !remote_fetch_enabled {
             tracing::info!("model-specific catalog refresh skipped: remote_fetch disabled");
             return false;
@@ -1442,23 +1461,25 @@ impl ModelsManager {
             return false;
         };
         let endpoint = self.inner.endpoint.clone();
-        let models = match tokio::time::timeout(
+        let (models, response_etag) = match tokio::time::timeout(
             crate::http::STARTUP_FETCH_TIMEOUT,
             endpoint.fetch_model_endpoint(request),
         )
         .await
         {
-            Ok(models) => models,
+            Ok(Some((models, etag))) => (Some(models), etag),
+            Ok(None) => (None, None),
             Err(_) => {
                 tracing::warn!("model-specific catalog fetch timed out");
-                None
+                (None, None)
             }
         };
+        let new_etag = response_etag.or(observed_etag);
         let cfg = self.inner.cfg.read().clone();
         if !self.apply_refresh_result_fenced(
             &cfg,
             models,
-            None,
+            new_etag,
             None,
             Some(endpoint_generation),
             Some(switch_generation),

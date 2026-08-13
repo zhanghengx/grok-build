@@ -605,7 +605,7 @@ async fn stale_endpoint_refresh_is_discarded_after_model_switch() {
         ) -> ModelsFetchFuture {
             Box::pin(async { None })
         }
-        fn fetch_model_endpoint(&self, _request: ModelEndpointRequest) -> ModelsFetchFuture {
+        fn fetch_model_endpoint(&self, _request: ModelEndpointRequest) -> ModelEndpointFetchFuture {
             let started = self.started.clone();
             let release = self.release.clone();
             let catalog = make_prefetched(&["old-endpoint-model"]);
@@ -613,7 +613,7 @@ async fn stale_endpoint_refresh_is_discarded_after_model_switch() {
             started.notify_one();
             Box::pin(async move {
                 release.notified().await;
-                Some(catalog)
+                Some((catalog, None))
             })
         }
     }
@@ -646,8 +646,11 @@ async fn stale_endpoint_refresh_is_discarded_after_model_switch() {
     .build();
 
     let mgr_ref = mgr.clone();
-    let task =
-        tokio::spawn(async move { mgr_ref.refresh_current_model_endpoint_inner(true).await });
+    let task = tokio::spawn(async move {
+        mgr_ref
+            .refresh_current_model_endpoint_inner(true, None)
+            .await
+    });
     started.notified().await;
     assert_eq!(
         calls.load(Ordering::SeqCst),
@@ -689,7 +692,7 @@ async fn stale_endpoint_refresh_is_discarded_after_endpoint_config_change() {
             Box::pin(async { None })
         }
 
-        fn fetch_model_endpoint(&self, request: ModelEndpointRequest) -> ModelsFetchFuture {
+        fn fetch_model_endpoint(&self, request: ModelEndpointRequest) -> ModelEndpointFetchFuture {
             self.requests
                 .lock()
                 .unwrap()
@@ -700,10 +703,10 @@ async fn stale_endpoint_refresh_is_discarded_after_endpoint_config_change() {
                 Box::pin(async move {
                     started.notify_one();
                     release.notified().await;
-                    Some(make_prefetched(&["old-provider-model"]))
+                    Some((make_prefetched(&["old-provider-model"]), None))
                 })
             } else {
-                Box::pin(async { Some(make_prefetched(&["new-provider-model"])) })
+                Box::pin(async { Some((make_prefetched(&["new-provider-model"]), None)) })
             }
         }
     }
@@ -736,8 +739,11 @@ async fn stale_endpoint_refresh_is_discarded_after_endpoint_config_change() {
     .build();
 
     let mgr_ref = mgr.clone();
-    let stale =
-        tokio::spawn(async move { mgr_ref.refresh_current_model_endpoint_inner(true).await });
+    let stale = tokio::spawn(async move {
+        mgr_ref
+            .refresh_current_model_endpoint_inner(true, None)
+            .await
+    });
     old_started.notified().await;
 
     let new_cfg = config_from_toml(
@@ -758,7 +764,7 @@ async fn stale_endpoint_refresh_is_discarded_after_endpoint_config_change() {
     assert!(!mgr.models().contains_key("old-provider-model"));
     assert!(!mgr.inner.catalog.read().model_endpoint_catalog_loaded);
 
-    assert!(mgr.refresh_current_model_endpoint_inner(true).await);
+    assert!(mgr.refresh_current_model_endpoint_inner(true, None).await);
     assert!(mgr.models().contains_key("new-provider-model"));
     assert_eq!(
         requests.lock().unwrap().as_slice(),
@@ -793,7 +799,7 @@ async fn endpoint_refresh_survives_settings_only_config_publication() {
         ) -> ModelsFetchFuture {
             Box::pin(async { None })
         }
-        fn fetch_model_endpoint(&self, _request: ModelEndpointRequest) -> ModelsFetchFuture {
+        fn fetch_model_endpoint(&self, _request: ModelEndpointRequest) -> ModelEndpointFetchFuture {
             let started = self.started.clone();
             let release = self.release.clone();
             let catalog = make_prefetched(&["provider-model"]);
@@ -801,7 +807,7 @@ async fn endpoint_refresh_survives_settings_only_config_publication() {
             started.notify_one();
             Box::pin(async move {
                 release.notified().await;
-                Some(catalog)
+                Some((catalog, None))
             })
         }
     }
@@ -834,8 +840,11 @@ async fn endpoint_refresh_survives_settings_only_config_publication() {
     .build();
 
     let mgr_ref = mgr.clone();
-    let task =
-        tokio::spawn(async move { mgr_ref.refresh_current_model_endpoint_inner(true).await });
+    let task = tokio::spawn(async move {
+        mgr_ref
+            .refresh_current_model_endpoint_inner(true, None)
+            .await
+    });
     started.notified().await;
     assert_eq!(calls.load(Ordering::SeqCst), 1);
 
@@ -883,7 +892,7 @@ async fn endpoint_refresh_applies_latest_settings_after_settings_only_publicatio
         ) -> ModelsFetchFuture {
             Box::pin(async { None })
         }
-        fn fetch_model_endpoint(&self, _request: ModelEndpointRequest) -> ModelsFetchFuture {
+        fn fetch_model_endpoint(&self, _request: ModelEndpointRequest) -> ModelEndpointFetchFuture {
             let started = self.started.clone();
             let release = self.release.clone();
             let catalog = make_prefetched(&["endpoint-model", "provider-model"]);
@@ -891,7 +900,7 @@ async fn endpoint_refresh_applies_latest_settings_after_settings_only_publicatio
             started.notify_one();
             Box::pin(async move {
                 release.notified().await;
-                Some(catalog)
+                Some((catalog, None))
             })
         }
     }
@@ -924,8 +933,11 @@ async fn endpoint_refresh_applies_latest_settings_after_settings_only_publicatio
     .build();
 
     let mgr_ref = mgr.clone();
-    let task =
-        tokio::spawn(async move { mgr_ref.refresh_current_model_endpoint_inner(true).await });
+    let task = tokio::spawn(async move {
+        mgr_ref
+            .refresh_current_model_endpoint_inner(true, None)
+            .await
+    });
     started.notified().await;
     assert_eq!(calls.load(Ordering::SeqCst), 1);
 
@@ -1138,6 +1150,104 @@ async fn refresh_if_new_etag_skips_when_same() {
         mgr.inner.catalog.read().etag.as_deref(),
         Some("\"abc123\""),
         "etag should remain unchanged when same"
+    );
+}
+
+#[tokio::test]
+async fn etag_refresh_routes_to_endpoint_catalog_owner() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct EndpointEtagFetcher {
+        global_calls: Arc<AtomicUsize>,
+        endpoint_calls: Arc<AtomicUsize>,
+        catalog: IndexMap<String, ModelEntry>,
+    }
+    impl ModelsEndpoint for EndpointEtagFetcher {
+        fn fetch_models(
+            &self,
+            _endpoints: config::EndpointsConfig,
+            _auth: Option<GrokAuth>,
+            _fetch_auth: ModelFetchAuth,
+        ) -> ModelsFetchFuture {
+            self.global_calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Some(make_prefetched(&["global-model"])) })
+        }
+
+        fn fetch_model_endpoint(&self, _request: ModelEndpointRequest) -> ModelEndpointFetchFuture {
+            self.endpoint_calls.fetch_add(1, Ordering::SeqCst);
+            let catalog = self.catalog.clone();
+            Box::pin(async move { Some((catalog, Some("\"etag-new\"".to_string()))) })
+        }
+    }
+
+    let cfg = config_from_toml(
+        r#"
+            [model.endpoint-model]
+            base_url = "https://provider.example/v1"
+            api_key = "model-api-key"
+            "#,
+    );
+    let tmp = tempfile::TempDir::new().unwrap();
+    let auth_manager = Arc::new(AuthManager::new(tmp.path(), GrokComConfig::default()));
+    let global_calls = Arc::new(AtomicUsize::new(0));
+    let endpoint_calls = Arc::new(AtomicUsize::new(0));
+    let mgr = ModelsManagerBuilder::new(
+        None,
+        resolve_model_catalog(&cfg, None),
+        acp::ModelId::new("endpoint-model"),
+        auth_manager,
+        cfg.clone(),
+    )
+    .endpoint(Arc::new(EndpointEtagFetcher {
+        global_calls: global_calls.clone(),
+        endpoint_calls: endpoint_calls.clone(),
+        catalog: make_prefetched(&["provider-model"]),
+    }))
+    .cache(test_cache_manager(tmp.path()))
+    .build();
+    {
+        let mut cat = mgr.inner.catalog.write();
+        cat.prefetched = Some(make_prefetched(&["provider-model"]));
+        cat.models = resolve_model_catalog(&cfg, cat.prefetched.clone());
+        cat.has_fetched_real_catalog = true;
+        cat.model_endpoint_catalog_loaded = true;
+        cat.catalog_source = CatalogSource::ModelEndpoint;
+        cat.catalog_owner = Some(acp::ModelId::new("endpoint-model"));
+        cat.etag = Some("\"etag-old\"".to_string());
+    }
+
+    mgr.refresh_if_new_etag("\"etag-new\"".to_string()).await;
+
+    for _ in 0..100 {
+        if mgr.inner.catalog.read().etag.as_deref() == Some("\"etag-new\"") {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+
+    assert_eq!(
+        endpoint_calls.load(Ordering::SeqCst),
+        1,
+        "the new etag must refresh through the endpoint catalog owner",
+    );
+    assert_eq!(
+        global_calls.load(Ordering::SeqCst),
+        0,
+        "an endpoint-owned catalog must never trigger a global etag fetch",
+    );
+    assert_eq!(
+        mgr.inner.catalog.read().etag.as_deref(),
+        Some("\"etag-new\""),
+        "the endpoint refresh must store the response etag",
+    );
+    assert!(mgr.inner.catalog.read().model_endpoint_catalog_loaded);
+    assert!(mgr.models().contains_key("provider-model"));
+
+    mgr.refresh_if_new_etag("\"etag-new\"".to_string()).await;
+    assert_eq!(
+        endpoint_calls.load(Ordering::SeqCst),
+        1,
+        "a matching etag must skip the endpoint refresh",
     );
 }
 
@@ -1698,10 +1808,10 @@ async fn model_endpoint_refresh_uses_model_key_and_updates_catalog() {
             Box::pin(async { None })
         }
 
-        fn fetch_model_endpoint(&self, request: ModelEndpointRequest) -> ModelsFetchFuture {
+        fn fetch_model_endpoint(&self, request: ModelEndpointRequest) -> ModelEndpointFetchFuture {
             *self.request.lock().unwrap() = Some(request);
             let catalog = self.catalog.clone();
-            Box::pin(async move { Some(catalog) })
+            Box::pin(async move { Some((catalog, None)) })
         }
     }
 
@@ -1787,10 +1897,10 @@ async fn model_endpoint_refresh_uses_api_key_base_url_when_separated() {
             Box::pin(async { None })
         }
 
-        fn fetch_model_endpoint(&self, request: ModelEndpointRequest) -> ModelsFetchFuture {
+        fn fetch_model_endpoint(&self, request: ModelEndpointRequest) -> ModelEndpointFetchFuture {
             *self.request.lock().unwrap() = Some(request);
             let catalog = self.catalog.clone();
-            Box::pin(async move { Some(catalog) })
+            Box::pin(async move { Some((catalog, None)) })
         }
     }
 
@@ -1843,10 +1953,10 @@ async fn list_models_online_if_uncached_fetches_configured_model_endpoint_once()
             Box::pin(async { None })
         }
 
-        fn fetch_model_endpoint(&self, _request: ModelEndpointRequest) -> ModelsFetchFuture {
+        fn fetch_model_endpoint(&self, _request: ModelEndpointRequest) -> ModelEndpointFetchFuture {
             self.calls.fetch_add(1, Ordering::SeqCst);
             let catalog = self.catalog.clone();
-            Box::pin(async move { Some(catalog) })
+            Box::pin(async move { Some((catalog, None)) })
         }
     }
 
@@ -1910,7 +2020,7 @@ async fn model_endpoint_without_model_credential_is_not_requested() {
             Box::pin(async { None })
         }
 
-        fn fetch_model_endpoint(&self, _request: ModelEndpointRequest) -> ModelsFetchFuture {
+        fn fetch_model_endpoint(&self, _request: ModelEndpointRequest) -> ModelEndpointFetchFuture {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Box::pin(async { None })
         }
@@ -1960,7 +2070,7 @@ async fn model_endpoint_refresh_respects_remote_fetch_gate() {
             Box::pin(async { None })
         }
 
-        fn fetch_model_endpoint(&self, _request: ModelEndpointRequest) -> ModelsFetchFuture {
+        fn fetch_model_endpoint(&self, _request: ModelEndpointRequest) -> ModelEndpointFetchFuture {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Box::pin(async { None })
         }
@@ -1990,7 +2100,7 @@ async fn model_endpoint_refresh_respects_remote_fetch_gate() {
     .build();
 
     assert!(
-        !mgr.refresh_current_model_endpoint_inner(false).await,
+        !mgr.refresh_current_model_endpoint_inner(false, None).await,
         "a model-owned catalog must not refresh when remote_fetch is disabled"
     );
     assert_eq!(
