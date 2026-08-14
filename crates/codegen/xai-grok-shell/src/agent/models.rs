@@ -188,6 +188,38 @@ fn endpoint_entry_context_differs(raw: &config::ModelEntry, resolved: &config::M
         || raw.api_base_url != resolved.api_base_url
 }
 
+/// Whether a `[model.<key>]` entry, directly or through its provider, defines
+/// a model-owned endpoint URL.
+fn config_model_has_endpoint(cfg: &config::Config, key: &str) -> bool {
+    cfg.config_models.get(key).is_some_and(|model| {
+        model.base_url.is_some()
+            || model.api_base_url.is_some()
+            || model
+                .model_provider
+                .as_deref()
+                .and_then(|pid| cfg.model_providers.get(pid))
+                .is_some_and(|provider| {
+                    provider.base_url.is_some() || provider.api_base_url.is_some()
+                })
+    })
+}
+
+/// Whether a retained or pending endpoint owner is still configured with its
+/// own endpoint and credential in the catalog being published.
+fn pending_endpoint_owner_configured(
+    cfg: &config::Config,
+    catalog: &IndexMap<String, ModelEntry>,
+    owner: &acp::ModelId,
+) -> bool {
+    let owner_key = owner.0.as_ref();
+    let owner_entry = catalog
+        .get(owner_key)
+        .or_else(|| catalog.values().find(|entry| entry.info.model == owner_key));
+    owner_entry.is_some_and(|entry| {
+        entry.has_own_credentials() && config_model_has_endpoint(cfg, owner_key)
+    })
+}
+
 struct Inner {
     catalog: RwLock<CatalogState>,
     current_model_id: RwLock<acp::ModelId>,
@@ -210,6 +242,11 @@ struct Inner {
     /// A fetch attempt currently executing (network/auth work), as opposed to
     /// a retry task sleeping through its backoff between attempts.
     active_fetch: AtomicUsize,
+    /// Generations of the fetch attempts currently executing network/auth
+    /// work. `list_models` joins an in-flight fetch only when its generation
+    /// still matches the catalog, so a config reload cannot park callers
+    /// behind a stale request that the fence will discard.
+    active_fetch_generations: RwLock<Vec<u64>>,
     /// Model-switch signal: a generation counter bumped when the current model id changes.
     model_switch_watch: tokio::sync::watch::Sender<u64>,
     /// Progress of the first real-catalog load, watched by bounded waits.
@@ -236,16 +273,30 @@ impl Drop for RefreshInFlightGuard {
 /// One fetch attempt (or the active portion of a retry iteration) currently
 /// executing. `list_models` joins on this instead of `fetches_in_flight`, so a
 /// retry task sleeping through backoff does not block a fresh catalog request.
-struct ActiveFetchGuard(Arc<Inner>);
+struct ActiveFetchGuard {
+    inner: Arc<Inner>,
+    generation: u64,
+}
 impl ActiveFetchGuard {
-    fn begin(inner: &Arc<Inner>) -> Self {
+    fn begin(inner: &Arc<Inner>, generation: u64) -> Self {
         inner.active_fetch.fetch_add(1, Ordering::AcqRel);
-        Self(inner.clone())
+        inner.active_fetch_generations.write().push(generation);
+        Self {
+            inner: inner.clone(),
+            generation,
+        }
     }
 }
 impl Drop for ActiveFetchGuard {
     fn drop(&mut self) {
-        self.0.active_fetch.fetch_sub(1, Ordering::AcqRel);
+        self.inner.active_fetch.fetch_sub(1, Ordering::AcqRel);
+        let mut generations = self.inner.active_fetch_generations.write();
+        if let Some(index) = generations
+            .iter()
+            .rposition(|generation| *generation == self.generation)
+        {
+            generations.remove(index);
+        }
     }
 }
 
@@ -376,6 +427,7 @@ impl ModelsManagerBuilder {
                 endpoint_refresh: tokio::sync::Mutex::new(()),
                 fetches_in_flight: AtomicUsize::new(0),
                 active_fetch: AtomicUsize::new(0),
+                active_fetch_generations: RwLock::new(Vec::new()),
                 model_switch_watch: tokio::sync::watch::channel(0u64).0,
                 catalog_progress: tokio::sync::watch::channel(CatalogProgress::Pending).0,
                 user_selected_model: AtomicBool::new(false),
@@ -537,39 +589,18 @@ impl ModelsManager {
         };
         let retained_real_catalog = has_real_catalog && !endpoint_catalog_invalidated;
         let new_catalog = resolve_model_catalog(&new_config, retained_prefetched.clone());
-        // When the endpoint context changes, keep the owner as a pending
-        // refresh target so a provider-returned slug that disappears from the
-        // config-only catalog does not strand the replacement fetch.
-        let pending_endpoint_owner = if endpoint_catalog_invalidated {
+        // Keep the owner as a pending refresh target when the endpoint
+        // context changes (or a replacement is already pending) and the new
+        // config still configures that endpoint. A stale owner whose endpoint
+        // was removed must be cleared, otherwise every global result stays
+        // fenced and the catalog can never recover.
+        let pending_endpoint_owner = if endpoint_catalog_active && !endpoint_catalog_invalidated {
             catalog_owner
-                .as_ref()
-                .filter(|owner| {
-                    let owner_key = owner.0.as_ref();
-                    let owner_entry = new_catalog
-                        .get(owner_key)
-                        .or_else(|| new_catalog.values().find(|e| e.info.model == owner_key));
-                    owner_entry.is_some_and(|entry| {
-                        entry.has_own_credentials()
-                            && new_config
-                                .config_models
-                                .get(owner_key)
-                                .is_some_and(|model| {
-                                    model.base_url.is_some()
-                                        || model.api_base_url.is_some()
-                                        || model
-                                            .model_provider
-                                            .as_deref()
-                                            .and_then(|pid| new_config.model_providers.get(pid))
-                                            .is_some_and(|provider| {
-                                                provider.base_url.is_some()
-                                                    || provider.api_base_url.is_some()
-                                            })
-                                })
-                    })
-                })
-                .cloned()
         } else {
             catalog_owner
+                .as_ref()
+                .filter(|owner| pending_endpoint_owner_configured(&new_config, &new_catalog, owner))
+                .cloned()
         };
         if retained_real_catalog && let Err(e) = validate_selectable(&new_config, &new_catalog) {
             tracing::error!(error = %e, "ignoring config reload: allowed_models excludes all models");
@@ -1381,8 +1412,8 @@ impl ModelsManager {
         // Generation first: an identity change after this point fails the
         // apply fence instead of publishing an old-credential fetch.
         let attempt = FetchAttemptGuard::begin(&self.inner);
-        let active = ActiveFetchGuard::begin(&self.inner);
         let generation = attempt.generation;
+        let active = ActiveFetchGuard::begin(&self.inner, generation);
         let cfg = self.inner.cfg.read().clone();
         let endpoints = cfg.endpoints.clone();
         let fetch_auth = *self.inner.fetch_auth.read();
@@ -1435,9 +1466,7 @@ impl ModelsManager {
                     self.wait_for_first_catalog().await;
                 }
                 RefreshStrategy::OnlineIfUncached => {
-                    if !self.inner.catalog.read().model_endpoint_catalog_loaded {
-                        self.refresh_current_model_endpoint().await;
-                    }
+                    self.refresh_current_model_endpoint_if_uncached().await;
                 }
                 RefreshStrategy::Online => {
                     self.refresh_current_model_endpoint().await;
@@ -1454,8 +1483,16 @@ impl ModelsManager {
                     // A startup/background fetch may already be executing. Join
                     // it instead of racing a second request with the same
                     // generation. Only an active request counts: a retry task
-                    // sleeping through backoff should not block a fresh fetch.
-                    if self.inner.active_fetch.load(Ordering::Acquire) > 0 {
+                    // sleeping through backoff should not block a fresh fetch,
+                    // and a fetch captured under an older generation cannot
+                    // publish for the current config, so do not park behind it.
+                    let current_generation = self.inner.catalog.read().generation;
+                    if self
+                        .inner
+                        .active_fetch_generations
+                        .read()
+                        .contains(&current_generation)
+                    {
                         self.wait_for_first_catalog().await;
                     } else {
                         self.fetch_and_apply().await;
@@ -1478,40 +1515,27 @@ impl ModelsManager {
     fn model_has_endpoint(&self, model_id: &acp::ModelId) -> bool {
         let (configured_endpoint, has_own_credentials) = {
             let catalog = self.inner.catalog.read();
+            // A loaded or pending endpoint catalog is keyed to its configured
+            // owner. Resolve both the endpoint config and the credential
+            // against that owner even when the selected model is a returned
+            // slug or a bundled fallback reselected after invalidation.
+            let lookup_id = catalog.catalog_owner.as_ref().unwrap_or(model_id);
             let Some((key, entry)) = catalog
                 .models
-                .get(model_id.0.as_ref())
-                .map(|entry| (model_id.0.as_ref(), entry))
+                .get(lookup_id.0.as_ref())
+                .map(|entry| (lookup_id.0.as_ref(), entry))
                 .or_else(|| {
                     catalog
                         .models
                         .iter()
-                        .find(|(_, entry)| entry.info.model == model_id.0.as_ref())
+                        .find(|(_, entry)| entry.info.model == lookup_id.0.as_ref())
                         .map(|(key, entry)| (key.as_str(), entry))
                 })
             else {
                 return false;
             };
             let cfg = self.inner.cfg.read();
-            // Resolve through the catalog owner for both loaded and pending
-            // endpoint catalogs: after invalidation the owner is retained so a
-            // provider-returned slug can still trigger the replacement fetch.
-            let config_key = catalog
-                .catalog_owner
-                .as_ref()
-                .map(|owner| owner.0.as_ref())
-                .unwrap_or(key);
-            let configured_endpoint = cfg.config_models.get(config_key).is_some_and(|model| {
-                model.base_url.is_some()
-                    || model.api_base_url.is_some()
-                    || model
-                        .model_provider
-                        .as_deref()
-                        .and_then(|provider| cfg.model_providers.get(provider))
-                        .is_some_and(|provider| {
-                            provider.base_url.is_some() || provider.api_base_url.is_some()
-                        })
-            });
+            let configured_endpoint = config_model_has_endpoint(&cfg, key);
             (configured_endpoint, entry.has_own_credentials())
         };
         configured_endpoint && has_own_credentials
@@ -1550,6 +1574,28 @@ impl ModelsManager {
         // share the same generation fences, so without a queue an older
         // response could land last and overwrite a newer catalog/etag.
         let _endpoint_refresh = self.inner.endpoint_refresh.lock().await;
+        self.refresh_current_model_endpoint_locked(observed_etag)
+            .await
+    }
+
+    /// `OnlineIfUncached`: fetch the configured endpoint only when the catalog
+    /// is not already loaded. The recheck happens after the serialization lock
+    /// is acquired, so a burst of list requests joins the first fetch instead
+    /// of queuing one full auth/HTTP round trip per caller.
+    async fn refresh_current_model_endpoint_if_uncached(&self) -> bool {
+        let remote_fetch_enabled = crate::util::config::resolve_remote_fetch_enabled();
+        if !remote_fetch_enabled {
+            tracing::info!("model-specific catalog refresh skipped: remote_fetch disabled");
+            return false;
+        }
+        let _endpoint_refresh = self.inner.endpoint_refresh.lock().await;
+        if self.inner.catalog.read().model_endpoint_catalog_loaded {
+            return true;
+        }
+        self.refresh_current_model_endpoint_locked(None).await
+    }
+
+    async fn refresh_current_model_endpoint_locked(&self, observed_etag: Option<String>) -> bool {
         // Capture both fences before the request: `model_endpoint_request`
         // awaits a provider refresh, during which either the current model or
         // its endpoint configuration can change. A stale result must not mark
@@ -1695,8 +1741,8 @@ impl ModelsManager {
             return;
         }
         let attempt = FetchAttemptGuard::begin(&self.inner);
-        let _active = ActiveFetchGuard::begin(&self.inner);
         let generation = attempt.generation;
+        let _active = ActiveFetchGuard::begin(&self.inner, generation);
         let auth = Self::bounded_startup_auth(&self.inner.auth_manager).await;
         let has_auth = auth.is_some();
         let fetch_auth = *self.inner.fetch_auth.read();
