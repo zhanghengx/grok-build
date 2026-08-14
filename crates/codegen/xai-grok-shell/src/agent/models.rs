@@ -1423,7 +1423,16 @@ impl ModelsManager {
                 return false;
             };
             let cfg = self.inner.cfg.read();
-            let configured_endpoint = cfg.config_models.get(key).is_some_and(|model| {
+            let config_key = if catalog.catalog_source == CatalogSource::ModelEndpoint {
+                catalog
+                    .catalog_owner
+                    .as_ref()
+                    .map(|owner| owner.0.as_ref())
+                    .unwrap_or(key)
+            } else {
+                key
+            };
+            let configured_endpoint = cfg.config_models.get(config_key).is_some_and(|model| {
                 model.base_url.is_some()
                     || model.api_base_url.is_some()
                     || model

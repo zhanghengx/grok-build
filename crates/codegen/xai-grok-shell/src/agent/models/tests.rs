@@ -1028,6 +1028,48 @@ fn current_model_has_endpoint_recognizes_provider_api_base_url() {
     );
 }
 
+#[test]
+fn current_model_has_endpoint_resolves_returned_slug_through_catalog_owner() {
+    let cfg = config_from_toml(
+        r#"
+            [model.alias]
+            model = "provider-model"
+            base_url = "https://provider.example/v1"
+            api_key = "model-api-key"
+            "#,
+    );
+    let tmp = tempfile::TempDir::new().unwrap();
+    let auth_manager = Arc::new(AuthManager::new(tmp.path(), GrokComConfig::default()));
+    let mgr = ModelsManagerBuilder::new(
+        None,
+        resolve_model_catalog(&cfg, None),
+        acp::ModelId::new("alias"),
+        auth_manager,
+        cfg.clone(),
+    )
+    .cache(test_cache_manager(tmp.path()))
+    .build();
+    {
+        let mut cat = mgr.inner.catalog.write();
+        let mut prefetched = make_prefetched(&["provider-model"]);
+        for entry in prefetched.values_mut() {
+            entry.api_key = Some("model-api-key".to_string());
+        }
+        cat.prefetched = Some(prefetched.clone());
+        cat.models = resolve_model_catalog(&cfg, Some(prefetched));
+        cat.has_fetched_real_catalog = true;
+        cat.model_endpoint_catalog_loaded = true;
+        cat.catalog_source = CatalogSource::ModelEndpoint;
+        cat.catalog_owner = Some(acp::ModelId::new("alias"));
+    }
+
+    mgr.set_current_model_id(acp::ModelId::new("provider-model"));
+    assert!(
+        mgr.current_model_has_endpoint(),
+        "a provider-returned slug must resolve endpoint ownership through the catalog owner",
+    );
+}
+
 fn config_from_toml(toml: &str) -> config::Config {
     config::Config::new_from_toml_cfg(&toml::from_str(toml).unwrap()).unwrap()
 }
