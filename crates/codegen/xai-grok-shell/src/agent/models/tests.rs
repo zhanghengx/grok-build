@@ -3106,6 +3106,234 @@ fn apply_config_recomputes_allowlist_gate_for_pending_catalog() {
     assert!(!mgr.inner.catalog.read().model_endpoint_catalog_loaded);
 }
 
+#[tokio::test]
+async fn apply_config_retains_pending_endpoint_owner_for_returned_slug() {
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct RecordingEndpoint {
+        calls: Arc<AtomicUsize>,
+        base_urls: Arc<Mutex<Vec<String>>>,
+    }
+    impl ModelsEndpoint for RecordingEndpoint {
+        fn fetch_models(
+            &self,
+            _endpoints: config::EndpointsConfig,
+            _auth: Option<GrokAuth>,
+            _fetch_auth: ModelFetchAuth,
+        ) -> ModelsFetchFuture {
+            Box::pin(async { None })
+        }
+
+        fn fetch_model_endpoint(&self, request: ModelEndpointRequest) -> ModelEndpointFetchFuture {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.base_urls
+                .lock()
+                .unwrap()
+                .push(request.base_url.clone());
+            Box::pin(async { Some((make_prefetched(&["provider-model"]), None)) })
+        }
+    }
+
+    let old_cfg = config_from_toml(
+        r#"
+            [model.endpoint-model]
+            base_url = "https://old-provider.example/v1"
+            api_key = "old-api-key"
+            "#,
+    );
+    let tmp = tempfile::TempDir::new().unwrap();
+    let auth_manager = Arc::new(AuthManager::new(tmp.path(), GrokComConfig::default()));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let base_urls = Arc::new(Mutex::new(Vec::new()));
+    let mgr = ModelsManagerBuilder::new(
+        None,
+        resolve_model_catalog(&old_cfg, None),
+        acp::ModelId::new("endpoint-model"),
+        auth_manager,
+        old_cfg.clone(),
+    )
+    .endpoint(Arc::new(RecordingEndpoint {
+        calls: calls.clone(),
+        base_urls: base_urls.clone(),
+    }))
+    .cache(test_cache_manager(tmp.path()))
+    .build();
+    {
+        let mut cat = mgr.inner.catalog.write();
+        cat.prefetched = Some(make_prefetched(&["provider-model"]));
+        cat.models = resolve_model_catalog(&old_cfg, cat.prefetched.clone());
+        cat.has_fetched_real_catalog = true;
+        cat.model_endpoint_catalog_loaded = true;
+        cat.catalog_source = CatalogSource::ModelEndpoint;
+        cat.catalog_owner = Some(acp::ModelId::new("endpoint-model"));
+    }
+    mgr.set_current_model_id(acp::ModelId::new("provider-model"));
+
+    let new_cfg = config_from_toml(
+        r#"
+            [models]
+            allowed_models = ["provider-model"]
+            [model.endpoint-model]
+            base_url = "https://new-provider.example/v1"
+            api_key = "new-api-key"
+            "#,
+    );
+    mgr.apply_config(new_cfg)
+        .expect("endpoint context reload should apply");
+
+    {
+        let cat = mgr.inner.catalog.read();
+        assert_eq!(
+            cat.catalog_owner.as_ref().map(|o| o.0.as_ref()),
+            Some("endpoint-model"),
+            "the endpoint owner must be retained as a pending refresh target",
+        );
+        assert!(!cat.model_endpoint_catalog_loaded);
+        assert_eq!(cat.catalog_source, CatalogSource::Global);
+        assert!(
+            !cat.models.contains_key("provider-model"),
+            "the returned slug is gone from the config-only catalog",
+        );
+    }
+
+    assert!(
+        mgr.refresh_current_model_endpoint_inner(true, None).await,
+        "the replacement fetch must still target the retained endpoint owner",
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        base_urls.lock().unwrap().as_slice(),
+        ["https://new-provider.example/v1"],
+        "the replacement must use the new endpoint, not the reselected model",
+    );
+    assert!(mgr.models().contains_key("provider-model"));
+    assert!(mgr.inner.catalog.read().model_endpoint_catalog_loaded);
+}
+
+#[tokio::test(start_paused = true)]
+async fn list_models_online_if_uncached_fetches_during_retry_backoff() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct FirstFailEndpoint {
+        calls: Arc<AtomicUsize>,
+    }
+    impl ModelsEndpoint for FirstFailEndpoint {
+        fn fetch_models(
+            &self,
+            _endpoints: config::EndpointsConfig,
+            _auth: Option<GrokAuth>,
+            _fetch_auth: ModelFetchAuth,
+        ) -> ModelsFetchFuture {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            let catalog = make_prefetched(&["grok-4"]);
+            Box::pin(async move { if n == 0 { None } else { Some(catalog) } })
+        }
+
+        fn fetch_model_endpoint(&self, _request: ModelEndpointRequest) -> ModelEndpointFetchFuture {
+            Box::pin(async { None })
+        }
+    }
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mgr = cold_manager(
+        config_from_toml(
+            "[endpoints]
+deployment_key = \"deploy-key\"",
+        ),
+        Arc::new(FirstFailEndpoint {
+            calls: calls.clone(),
+        }),
+    );
+    mgr.spawn_catalog_retry_with_backoff(
+        /*remote_fetch_enabled*/ true,
+        crate::tools::retry::BackoffConfig::new(2, 60_000, 60_000),
+    );
+
+    // Let the first attempt fail and the retry task enter its backoff sleep.
+    for _ in 0..1000 {
+        if calls.load(Ordering::SeqCst) >= 1 && mgr.inner.active_fetch.load(Ordering::Acquire) == 0
+        {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(mgr.inner.active_fetch.load(Ordering::Acquire), 0);
+
+    mgr.list_models(RefreshStrategy::OnlineIfUncached).await;
+
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        2,
+        "a sleeping retry task must not block a fresh models/list fetch",
+    );
+    assert!(mgr.has_fetched_real_catalog());
+    assert!(mgr.models().contains_key("grok-4"));
+}
+
+#[test]
+fn apply_config_rejected_reload_does_not_publish_fetch_auth() {
+    let old_cfg = config_from_toml(
+        r#"
+            [endpoints]
+            deployment_key = "deploy-key"
+            [model.endpoint-model]
+            base_url = "https://provider.example/v1"
+            api_key = "model-api-key"
+            "#,
+    );
+    let tmp = tempfile::TempDir::new().unwrap();
+    let auth_manager = Arc::new(AuthManager::new(tmp.path(), GrokComConfig::default()));
+    let mgr = ModelsManagerBuilder::new(
+        None,
+        resolve_model_catalog(&old_cfg, None),
+        acp::ModelId::new("endpoint-model"),
+        auth_manager,
+        old_cfg.clone(),
+    )
+    .cache(test_cache_manager(tmp.path()))
+    .build();
+    {
+        let mut cat = mgr.inner.catalog.write();
+        cat.prefetched = Some(make_prefetched(&["provider-model"]));
+        cat.models = resolve_model_catalog(&old_cfg, cat.prefetched.clone());
+        cat.has_fetched_real_catalog = true;
+        cat.model_endpoint_catalog_loaded = true;
+        cat.catalog_source = CatalogSource::ModelEndpoint;
+        cat.catalog_owner = Some(acp::ModelId::new("endpoint-model"));
+    }
+    assert_eq!(
+        *mgr.inner.fetch_auth.read(),
+        ModelFetchAuth::Deployment,
+        "setup: the old config should resolve to deployment auth",
+    );
+
+    let new_cfg = config_from_toml(
+        r#"
+            [models]
+            allowed_models = ["nomatch-*"]
+            [model.endpoint-model]
+            base_url = "https://provider.example/v1"
+            api_key = "model-api-key"
+            "#,
+    );
+    assert!(
+        mgr.apply_config(new_cfg).is_err(),
+        "an allowlist that excludes every retained endpoint model must be rejected",
+    );
+    assert_eq!(
+        *mgr.inner.fetch_auth.read(),
+        ModelFetchAuth::Deployment,
+        "a rejected reload must not publish its proposed fetch auth",
+    );
+    assert_eq!(
+        mgr.inner.cfg.read().endpoints.deployment_key.as_deref(),
+        Some("deploy-key"),
+        "the rejected reload must leave manager config unchanged",
+    );
+}
+
 // ── auth-change refresh: has_fetched_real_catalog flag ─────────────
 
 #[test]

@@ -131,7 +131,8 @@ struct CatalogState {
     /// Which source populated the catalog; a global result must not replace
     /// an authoritative model endpoint catalog.
     catalog_source: CatalogSource,
-    /// Configured model whose endpoint populated a model-scoped catalog.
+    /// Configured model whose endpoint populated a model-scoped catalog, or
+    /// whose replacement endpoint is pending while an invalidation reloads it.
     catalog_owner: Option<acp::ModelId>,
     /// `allowed_models` matched nothing; the prompt path blocks instead.
     allowlist_excludes_all: bool,
@@ -206,6 +207,9 @@ struct Inner {
     /// response cannot overwrite a newer one.
     endpoint_refresh: tokio::sync::Mutex<()>,
     fetches_in_flight: AtomicUsize,
+    /// A fetch attempt currently executing (network/auth work), as opposed to
+    /// a retry task sleeping through its backoff between attempts.
+    active_fetch: AtomicUsize,
     /// Model-switch signal: a generation counter bumped when the current model id changes.
     model_switch_watch: tokio::sync::watch::Sender<u64>,
     /// Progress of the first real-catalog load, watched by bounded waits.
@@ -226,6 +230,22 @@ struct RefreshInFlightGuard(Arc<Inner>);
 impl Drop for RefreshInFlightGuard {
     fn drop(&mut self) {
         self.0.refresh_in_flight.store(false, Ordering::Release);
+    }
+}
+
+/// One fetch attempt (or the active portion of a retry iteration) currently
+/// executing. `list_models` joins on this instead of `fetches_in_flight`, so a
+/// retry task sleeping through backoff does not block a fresh catalog request.
+struct ActiveFetchGuard(Arc<Inner>);
+impl ActiveFetchGuard {
+    fn begin(inner: &Arc<Inner>) -> Self {
+        inner.active_fetch.fetch_add(1, Ordering::AcqRel);
+        Self(inner.clone())
+    }
+}
+impl Drop for ActiveFetchGuard {
+    fn drop(&mut self) {
+        self.0.active_fetch.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -355,6 +375,7 @@ impl ModelsManagerBuilder {
                 refresh_in_flight: AtomicBool::new(false),
                 endpoint_refresh: tokio::sync::Mutex::new(()),
                 fetches_in_flight: AtomicUsize::new(0),
+                active_fetch: AtomicUsize::new(0),
                 model_switch_watch: tokio::sync::watch::channel(0u64).0,
                 catalog_progress: tokio::sync::watch::channel(CatalogProgress::Pending).0,
                 user_selected_model: AtomicBool::new(false),
@@ -459,8 +480,11 @@ impl ModelsManager {
         }
         let new_preferred = new_config.models.default.clone();
         let has_session = self.inner.auth_manager.current_or_expired().is_some();
-        *self.inner.fetch_auth.write() =
-            ModelFetchAuth::resolve(&new_config.endpoints, has_session);
+        let new_fetch_auth = ModelFetchAuth::resolve(&new_config.endpoints, has_session);
+        // Take the lock before the catalog snapshot so a rejected reload cannot
+        // publish the proposed auth mode, while keeping the same serialization
+        // point used by the concurrent-refresh test.
+        let mut fetch_auth = self.inner.fetch_auth.write();
         // Keep one lock order everywhere: catalog, then cfg. The apply path
         // (`apply_catalog_fenced`) reads cfg while holding catalog, so taking
         // cfg first here would invert the order and can deadlock a reload
@@ -513,6 +537,40 @@ impl ModelsManager {
         };
         let retained_real_catalog = has_real_catalog && !endpoint_catalog_invalidated;
         let new_catalog = resolve_model_catalog(&new_config, retained_prefetched.clone());
+        // When the endpoint context changes, keep the owner as a pending
+        // refresh target so a provider-returned slug that disappears from the
+        // config-only catalog does not strand the replacement fetch.
+        let pending_endpoint_owner = if endpoint_catalog_invalidated {
+            catalog_owner
+                .as_ref()
+                .filter(|owner| {
+                    let owner_key = owner.0.as_ref();
+                    let owner_entry = new_catalog
+                        .get(owner_key)
+                        .or_else(|| new_catalog.values().find(|e| e.info.model == owner_key));
+                    owner_entry.is_some_and(|entry| {
+                        entry.has_own_credentials()
+                            && new_config
+                                .config_models
+                                .get(owner_key)
+                                .is_some_and(|model| {
+                                    model.base_url.is_some()
+                                        || model.api_base_url.is_some()
+                                        || model
+                                            .model_provider
+                                            .as_deref()
+                                            .and_then(|pid| new_config.model_providers.get(pid))
+                                            .is_some_and(|provider| {
+                                                provider.base_url.is_some()
+                                                    || provider.api_base_url.is_some()
+                                            })
+                                })
+                    })
+                })
+                .cloned()
+        } else {
+            catalog_owner
+        };
         if retained_real_catalog && let Err(e) = validate_selectable(&new_config, &new_catalog) {
             tracing::error!(error = %e, "ignoring config reload: allowed_models excludes all models");
             return Err(e);
@@ -520,6 +578,7 @@ impl ModelsManager {
 
         let mut cfg = self.inner.cfg.write();
         *cfg = new_config.clone();
+        *fetch_auth = new_fetch_auth;
         // A config reload can change the endpoint, credential, provider, or
         // request metadata used by any catalog fetch already in flight.
         // Publish the new config before advancing the fence so a refresh that
@@ -544,13 +603,13 @@ impl ModelsManager {
         } else {
             CatalogSource::Global
         };
-        cat.catalog_owner = if endpoint_catalog_still_valid {
-            catalog_owner
-        } else {
-            None
-        };
+        // Keep the endpoint owner as a pending refresh target while its
+        // replacement catalog loads, even after the current model is reselected
+        // away from a provider-returned slug.
+        cat.catalog_owner = pending_endpoint_owner;
         drop(cat);
         drop(cfg);
+        drop(fetch_auth);
 
         let preferred_changed = new_preferred != old_preferred && new_preferred.is_some();
         let mut campaign_defaults = std::collections::HashSet::new();
@@ -886,10 +945,9 @@ impl ModelsManager {
     pub(crate) async fn refresh_if_new_etag(&self, etag: String) {
         let (same_etag, endpoint_owned) = {
             let cat = self.inner.catalog.read();
-            (
-                cat.etag.as_deref() == Some(etag.as_str()),
-                cat.catalog_source == CatalogSource::ModelEndpoint,
-            )
+            let endpoint_owned = cat.catalog_source == CatalogSource::ModelEndpoint
+                || (!cat.model_endpoint_catalog_loaded && cat.catalog_owner.is_some());
+            (cat.etag.as_deref() == Some(etag.as_str()), endpoint_owned)
         };
         if endpoint_owned {
             if same_etag {
@@ -1323,6 +1381,7 @@ impl ModelsManager {
         // Generation first: an identity change after this point fails the
         // apply fence instead of publishing an old-credential fetch.
         let attempt = FetchAttemptGuard::begin(&self.inner);
+        let active = ActiveFetchGuard::begin(&self.inner);
         let generation = attempt.generation;
         let cfg = self.inner.cfg.read().clone();
         let endpoints = cfg.endpoints.clone();
@@ -1333,6 +1392,7 @@ impl ModelsManager {
 
         tokio::task::spawn(async move {
             let _attempt = attempt;
+            let _active = active;
             let _refresh_guard = RefreshInFlightGuard(mgr.inner.clone());
             let auth = Self::bounded_startup_auth(&auth_manager).await;
             let new_prefetched = match tokio::time::timeout(
@@ -1391,12 +1451,11 @@ impl ModelsManager {
             }
             RefreshStrategy::OnlineIfUncached => {
                 if !self.inner.catalog.read().has_fetched_real_catalog {
-                    // A startup/background fetch may already be in flight.
-                    // Join it instead of racing a second request with the same
-                    // generation: if the later request completed first, the
-                    // older response could apply last and replace the newer
-                    // catalog.
-                    if self.inner.fetches_in_flight.load(Ordering::Acquire) > 0 {
+                    // A startup/background fetch may already be executing. Join
+                    // it instead of racing a second request with the same
+                    // generation. Only an active request counts: a retry task
+                    // sleeping through backoff should not block a fresh fetch.
+                    if self.inner.active_fetch.load(Ordering::Acquire) > 0 {
                         self.wait_for_first_catalog().await;
                     } else {
                         self.fetch_and_apply().await;
@@ -1434,15 +1493,14 @@ impl ModelsManager {
                 return false;
             };
             let cfg = self.inner.cfg.read();
-            let config_key = if catalog.catalog_source == CatalogSource::ModelEndpoint {
-                catalog
-                    .catalog_owner
-                    .as_ref()
-                    .map(|owner| owner.0.as_ref())
-                    .unwrap_or(key)
-            } else {
-                key
-            };
+            // Resolve through the catalog owner for both loaded and pending
+            // endpoint catalogs: after invalidation the owner is retained so a
+            // provider-returned slug can still trigger the replacement fetch.
+            let config_key = catalog
+                .catalog_owner
+                .as_ref()
+                .map(|owner| owner.0.as_ref())
+                .unwrap_or(key);
             let configured_endpoint = cfg.config_models.get(config_key).is_some_and(|model| {
                 model.base_url.is_some()
                     || model.api_base_url.is_some()
@@ -1637,6 +1695,7 @@ impl ModelsManager {
             return;
         }
         let attempt = FetchAttemptGuard::begin(&self.inner);
+        let _active = ActiveFetchGuard::begin(&self.inner);
         let generation = attempt.generation;
         let auth = Self::bounded_startup_auth(&self.inner.auth_manager).await;
         let has_auth = auth.is_some();
@@ -1745,8 +1804,9 @@ impl ModelsManager {
                 );
                 return false;
             }
-            if source == CatalogSource::Global && cat.catalog_source == CatalogSource::ModelEndpoint
-            {
+            let endpoint_authoritative = cat.catalog_source == CatalogSource::ModelEndpoint
+                || (!cat.model_endpoint_catalog_loaded && cat.catalog_owner.is_some());
+            if source == CatalogSource::Global && endpoint_authoritative {
                 tracing::info!(
                     "global model catalog result discarded: model endpoint catalog is authoritative"
                 );
