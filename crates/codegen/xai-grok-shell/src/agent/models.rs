@@ -457,16 +457,34 @@ impl ModelsManager {
             tracing::error!(error = %e, "ignoring config reload: invalid model filters");
             return Err(e);
         }
-        let (prefetched, has_real_catalog, catalog_source, catalog_owner) = {
-            let cat = self.inner.catalog.read();
+        let new_preferred = new_config.models.default.clone();
+        let has_session = self.inner.auth_manager.current_or_expired().is_some();
+        *self.inner.fetch_auth.write() =
+            ModelFetchAuth::resolve(&new_config.endpoints, has_session);
+        // Keep one lock order everywhere: catalog, then cfg. The apply path
+        // (`apply_catalog_fenced`) reads cfg while holding catalog, so taking
+        // cfg first here would invert the order and can deadlock a reload
+        // against an in-flight endpoint refresh. Re-read the live catalog
+        // state under the write lock: an endpoint refresh can commit between
+        // an unlocked snapshot and this publication, and applying the stale
+        // retained entries while keeping the fresh etag would latch the old
+        // models as loaded.
+        let current_model_key = self.inner.current_model_id.read().0.as_ref().to_string();
+        let mut cat = self.inner.catalog.write();
+        let (old_config, old_preferred, old_default_is_campaign) = {
+            let cfg = self.inner.cfg.read();
             (
-                cat.prefetched.clone(),
-                cat.has_fetched_real_catalog,
-                cat.catalog_source,
-                cat.catalog_owner.clone(),
+                cfg.clone(),
+                cfg.models.default.clone(),
+                cfg.models.default_is_campaign_driven,
             )
         };
-        let old_config = self.inner.cfg.read().clone();
+        let (prefetched, has_real_catalog, catalog_source, catalog_owner) = (
+            cat.prefetched.clone(),
+            cat.has_fetched_real_catalog,
+            cat.catalog_source,
+            cat.catalog_owner.clone(),
+        );
         // Model-endpoint entries carry inherited routing and credentials. Keep
         // them across a config publication while the endpoint connection
         // context is unchanged; otherwise drop them and let the caller refetch
@@ -484,7 +502,7 @@ impl ModelsManager {
             let owner_key = catalog_owner
                 .as_ref()
                 .map(|owner| owner.0.as_ref().to_string())
-                .unwrap_or_else(|| self.inner.current_model_id.read().0.as_ref().to_string());
+                .unwrap_or(current_model_key);
             model_endpoint_changed(&old_config, &new_config, &owner_key)
         };
         let endpoint_catalog_still_valid = endpoint_catalog_active && !endpoint_catalog_invalidated;
@@ -500,22 +518,6 @@ impl ModelsManager {
             return Err(e);
         }
 
-        let (old_preferred, old_default_is_campaign) = {
-            let cfg = self.inner.cfg.read();
-            (
-                cfg.models.default.clone(),
-                cfg.models.default_is_campaign_driven,
-            )
-        };
-        let new_preferred = new_config.models.default.clone();
-        let has_session = self.inner.auth_manager.current_or_expired().is_some();
-        *self.inner.fetch_auth.write() =
-            ModelFetchAuth::resolve(&new_config.endpoints, has_session);
-        // Keep one lock order everywhere: catalog, then cfg. The apply path
-        // (`apply_catalog_fenced`) reads cfg while holding catalog, so taking
-        // cfg first here would invert the order and can deadlock a reload
-        // against an in-flight endpoint refresh.
-        let mut cat = self.inner.catalog.write();
         let mut cfg = self.inner.cfg.write();
         *cfg = new_config.clone();
         // A config reload can change the endpoint, credential, provider, or
@@ -1389,7 +1391,16 @@ impl ModelsManager {
             }
             RefreshStrategy::OnlineIfUncached => {
                 if !self.inner.catalog.read().has_fetched_real_catalog {
-                    self.fetch_and_apply().await;
+                    // A startup/background fetch may already be in flight.
+                    // Join it instead of racing a second request with the same
+                    // generation: if the later request completed first, the
+                    // older response could apply last and replace the newer
+                    // catalog.
+                    if self.inner.fetches_in_flight.load(Ordering::Acquire) > 0 {
+                        self.wait_for_first_catalog().await;
+                    } else {
+                        self.fetch_and_apply().await;
+                    }
                 }
             }
             RefreshStrategy::Online => {

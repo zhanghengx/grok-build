@@ -2306,6 +2306,78 @@ async fn list_models_online_if_uncached_fetches_configured_model_endpoint_once()
 }
 
 #[tokio::test]
+async fn list_models_online_if_uncached_joins_in_flight_global_fetch() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct SlowGlobalEndpoint {
+        calls: Arc<AtomicUsize>,
+        started: Arc<tokio::sync::Notify>,
+    }
+    impl ModelsEndpoint for SlowGlobalEndpoint {
+        fn fetch_models(
+            &self,
+            _endpoints: config::EndpointsConfig,
+            _auth: Option<GrokAuth>,
+            _fetch_auth: ModelFetchAuth,
+        ) -> ModelsFetchFuture {
+            let _n = self.calls.fetch_add(1, Ordering::SeqCst);
+            let started = self.started.clone();
+            let catalog = make_prefetched(&["grok-4"]);
+            Box::pin(async move {
+                started.notify_one();
+                // Keep the fetch in flight long enough for the list path to
+                // observe and join it, but short enough to stay under the
+                // startup fetch timeout.
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                Some(catalog)
+            })
+        }
+
+        fn fetch_model_endpoint(&self, _request: ModelEndpointRequest) -> ModelEndpointFetchFuture {
+            Box::pin(async { None })
+        }
+    }
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let started = Arc::new(tokio::sync::Notify::new());
+    let mgr = cold_manager(
+        config_from_toml(
+            "[endpoints]
+deployment_key = \"deploy-key\"",
+        ),
+        Arc::new(SlowGlobalEndpoint {
+            calls: calls.clone(),
+            started: started.clone(),
+        }),
+    );
+
+    // Simulate the cold-start background refresh already being in flight.
+    let mgr_ref = mgr.clone();
+    let fetch_task = tokio::spawn(async move {
+        mgr_ref
+            .fetch_and_apply_inner(/*remote_fetch_enabled*/ true)
+            .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(15), started.notified())
+        .await
+        .expect("the startup fetch never reached the transport");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+    // `x.ai/models/list` must join the active attempt instead of racing a
+    // second request with the same generation.
+    mgr.list_models(RefreshStrategy::OnlineIfUncached).await;
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "the list handler must join the in-flight startup fetch, not issue a second one",
+    );
+
+    fetch_task.await.unwrap();
+    assert!(mgr.has_fetched_real_catalog());
+    assert!(mgr.models().contains_key("grok-4"));
+}
+
+#[tokio::test]
 async fn model_endpoint_without_model_credential_is_not_requested() {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -2887,6 +2959,104 @@ fn apply_config_reselecting_default_stops_after_rejection() {
     assert!(
         mgr.inner.cfg.read().models.allowed_models.is_none(),
         "the rejected reload must not be published",
+    );
+}
+
+#[test]
+fn apply_config_revalidates_endpoint_snapshot_after_concurrent_refresh() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let old_cfg = config_from_toml(
+        r#"
+            [model.endpoint-model]
+            base_url = "https://provider.example/v1"
+            api_key = "model-api-key"
+            "#,
+    );
+    let tmp = tempfile::TempDir::new().unwrap();
+    let auth_manager = Arc::new(AuthManager::new(tmp.path(), GrokComConfig::default()));
+    let mgr = ModelsManagerBuilder::new(
+        None,
+        resolve_model_catalog(&old_cfg, None),
+        acp::ModelId::new("endpoint-model"),
+        auth_manager,
+        old_cfg.clone(),
+    )
+    .cache(test_cache_manager(tmp.path()))
+    .build();
+    {
+        let mut cat = mgr.inner.catalog.write();
+        cat.prefetched = Some(make_prefetched(&["old-provider-model"]));
+        cat.models = resolve_model_catalog(&old_cfg, cat.prefetched.clone());
+        cat.has_fetched_real_catalog = true;
+        cat.model_endpoint_catalog_loaded = true;
+        cat.catalog_source = CatalogSource::ModelEndpoint;
+        cat.catalog_owner = Some(acp::ModelId::new("endpoint-model"));
+        cat.etag = Some("\"etag-old\"".to_string());
+    }
+
+    let settings_cfg = config_from_toml(
+        r#"
+            [models]
+            default = "endpoint-model"
+            [model.endpoint-model]
+            base_url = "https://provider.example/v1"
+            api_key = "model-api-key"
+            "#,
+    );
+
+    // Hold the fetch_auth write lock: apply_config blocks on it just before
+    // its final catalog write, so this pauses the publication in the window
+    // where an endpoint refresh can commit.
+    let _fetch_auth = mgr.inner.fetch_auth.write();
+
+    let entered = Arc::new(AtomicBool::new(false));
+    let entered_for_thread = entered.clone();
+    let mgr2 = mgr.clone();
+    let apply_thread = std::thread::spawn(move || {
+        entered_for_thread.store(true, Ordering::SeqCst);
+        mgr2.apply_config(settings_cfg)
+    });
+    while !entered.load(Ordering::SeqCst) {
+        std::thread::yield_now();
+    }
+    // Let the publication thread reach the fetch_auth block before the
+    // refresh commits.
+    std::thread::sleep(std::time::Duration::from_millis(100));
+
+    // Simulate an endpoint ETag refresh committing in that window: fresh
+    // prefetched entries plus a new response etag.
+    {
+        let mut cat = mgr.inner.catalog.write();
+        cat.prefetched = Some(make_prefetched(&["new-provider-model"]));
+        cat.models = resolve_model_catalog(&old_cfg, cat.prefetched.clone());
+        cat.etag = Some("\"etag-new\"".to_string());
+        cat.has_fetched_real_catalog = true;
+        cat.catalog_source = CatalogSource::ModelEndpoint;
+        cat.catalog_owner = Some(acp::ModelId::new("endpoint-model"));
+        cat.model_endpoint_catalog_loaded = true;
+    }
+    drop(_fetch_auth);
+    apply_thread
+        .join()
+        .expect("apply_config thread panicked")
+        .expect("settings-only reload should apply");
+
+    let cat = mgr.inner.catalog.read();
+    assert!(cat.model_endpoint_catalog_loaded);
+    assert_eq!(cat.catalog_source, CatalogSource::ModelEndpoint);
+    assert!(
+        cat.models.contains_key("new-provider-model"),
+        "the settings publication must not overwrite the refreshed endpoint models",
+    );
+    assert!(
+        !cat.models.contains_key("old-provider-model"),
+        "stale endpoint entries must not be re-latched",
+    );
+    assert_eq!(
+        cat.etag.as_deref(),
+        Some("\"etag-new\""),
+        "the fresh etag must be preserved so a same-etag response skips the refresh",
     );
 }
 
