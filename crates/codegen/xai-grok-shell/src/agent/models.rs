@@ -1511,15 +1511,20 @@ impl ModelsManager {
         let started = self.reserve_global_fetch().await;
         let Some((attempt, active)) = started else {
             self.inner.refresh_in_flight.store(false, Ordering::Release);
+            let joined_generation = self.inner.catalog.read().generation;
             self.wait_for_first_catalog_inner(remote_fetch_enabled)
                 .await;
             // The joined fetch started before this etag change and applies no
             // etag, so it can publish the old catalog. Re-issue the refresh
             // when the catalog still does not carry the observed etag instead
-            // of letting the change signal disappear.
-            if new_etag
-                .as_deref()
-                .is_some_and(|etag| self.inner.catalog.read().etag.as_deref() != Some(etag))
+            // of letting the change signal disappear. Never replay the etag
+            // across an identity/config generation change: `on_auth_changed`
+            // can advance the catalog generation while we wait, and the new
+            // catalog's etag is scoped to a different identity/resource.
+            if self.inner.catalog.read().generation == joined_generation
+                && new_etag
+                    .as_deref()
+                    .is_some_and(|etag| self.inner.catalog.read().etag.as_deref() != Some(etag))
             {
                 Box::pin(self.spawn_fetch_inner(new_etag, remote_fetch_enabled)).await;
             }
@@ -1569,50 +1574,79 @@ impl ModelsManager {
 
     /// Resolve the model list: waits for or requests a catalog fetch.
     pub async fn list_models(&self, strategy: RefreshStrategy) {
-        if self.current_model_has_endpoint() {
-            // A model-scoped endpoint is authoritative for this configuration.
-            // Do not populate the picker from the global proxy and then leave
-            // the configured endpoint's model list unused.
-            match strategy {
-                RefreshStrategy::Offline => {
-                    self.wait_for_first_catalog().await;
-                }
-                RefreshStrategy::OnlineIfUncached => {
-                    self.refresh_current_model_endpoint_if_uncached().await;
-                }
-                RefreshStrategy::Online => {
-                    self.refresh_current_model_endpoint().await;
-                }
-            }
-            return;
-        }
-        match strategy {
-            RefreshStrategy::Offline => {
-                self.wait_for_first_catalog().await;
-            }
-            RefreshStrategy::OnlineIfUncached => {
-                if !self.inner.catalog.read().has_fetched_real_catalog {
-                    // A startup/background fetch may already be executing. Join
-                    // it instead of racing a second request with the same
-                    // generation. Only an active request counts: a retry task
-                    // sleeping through backoff should not block a fresh fetch,
-                    // and a fetch captured under an older generation cannot
-                    // publish for the current config, so do not park behind it.
-                    let current_generation = self.inner.catalog.read().generation;
-                    if self
-                        .inner
-                        .active_fetch_generations
-                        .read()
-                        .contains(&current_generation)
-                    {
+        // `x.ai/models/list` is a one-shot consumer, so the source decision
+        // made at entry must not go stale. A model switch can land while a
+        // catalog fetch is awaiting; recheck the source after each operation
+        // and run the path for the current model instead of serving a catalog
+        // from the branch that was valid when the request started.
+        for _ in 0..3 {
+            if self.current_model_has_endpoint() {
+                // A model-scoped endpoint is authoritative for this
+                // configuration. Do not populate the picker from the global
+                // proxy and then leave the configured endpoint's model list
+                // unused.
+                match strategy {
+                    RefreshStrategy::Offline => {
                         self.wait_for_first_catalog().await;
-                    } else {
+                    }
+                    RefreshStrategy::OnlineIfUncached => {
+                        self.refresh_current_model_endpoint_if_uncached().await;
+                    }
+                    RefreshStrategy::Online => {
+                        self.refresh_current_model_endpoint().await;
+                    }
+                }
+                if self.current_model_has_endpoint() {
+                    return;
+                }
+                // The model changed away from the endpoint source while the
+                // refresh was awaiting; run the global path for the new model.
+            } else {
+                match strategy {
+                    RefreshStrategy::Offline => {
+                        self.wait_for_first_catalog().await;
+                        return;
+                    }
+                    RefreshStrategy::OnlineIfUncached => {
+                        if !self.inner.catalog.read().has_fetched_real_catalog {
+                            let remote_fetch_enabled =
+                                crate::util::config::resolve_remote_fetch_enabled();
+                            if !remote_fetch_enabled {
+                                return;
+                            }
+                            // The generation lookup, active-fetch check, and
+                            // fetch start must be one synchronized decision: a
+                            // config reload can otherwise advance the
+                            // generation between the two reads and park this
+                            // request behind a stale fetch that can never
+                            // publish for the current config.
+                            let started = self.reserve_global_fetch().await;
+                            if let Some(started) = started {
+                                self.fetch_and_apply_reserved(started).await;
+                            } else {
+                                self.wait_for_first_catalog().await;
+                                // The joined fetch may have been captured under
+                                // an older generation (a reload advanced it
+                                // while we waited). If it could not publish,
+                                // start a fresh fetch for the current config
+                                // instead of leaving the request without a
+                                // catalog.
+                                if !self.inner.catalog.read().has_fetched_real_catalog {
+                                    self.fetch_and_apply().await;
+                                }
+                            }
+                        }
+                    }
+                    RefreshStrategy::Online => {
                         self.fetch_and_apply().await;
                     }
                 }
-            }
-            RefreshStrategy::Online => {
-                self.fetch_and_apply().await;
+                if self.current_model_has_endpoint() {
+                    // The model changed to an endpoint source while the global
+                    // path was awaiting; run the endpoint path for it.
+                    continue;
+                }
+                return;
             }
         }
     }
@@ -1887,14 +1921,17 @@ impl ModelsManager {
             return;
         }
         let started = self.reserve_global_fetch().await;
-        let (attempt, active) = match started {
-            Some(started) => started,
-            None => {
-                self.wait_for_first_catalog_inner(remote_fetch_enabled)
-                    .await;
-                return;
-            }
+        let Some(started) = started else {
+            self.wait_for_first_catalog_inner(remote_fetch_enabled)
+                .await;
+            return;
         };
+        self.fetch_and_apply_reserved(started).await;
+    }
+
+    /// Run a global catalog fetch for an already-reserved generation.
+    async fn fetch_and_apply_reserved(&self, started: (FetchAttemptGuard, ActiveFetchGuard)) {
+        let (attempt, active) = started;
         let generation = attempt.generation;
         let _active = active;
         let auth = Self::bounded_startup_auth(&self.inner.auth_manager).await;
