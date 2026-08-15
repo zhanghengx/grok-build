@@ -1417,6 +1417,93 @@ async fn etag_refresh_routes_cold_configured_endpoint_to_endpoint_fetch() {
 }
 
 #[tokio::test]
+async fn etag_refresh_cold_endpoint_fetches_even_when_global_etag_matches() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct ColdEndpointEtagFetcher {
+        global_calls: Arc<AtomicUsize>,
+        endpoint_calls: Arc<AtomicUsize>,
+        catalog: IndexMap<String, ModelEntry>,
+    }
+    impl ModelsEndpoint for ColdEndpointEtagFetcher {
+        fn fetch_models(
+            &self,
+            _endpoints: config::EndpointsConfig,
+            _auth: Option<GrokAuth>,
+            _fetch_auth: ModelFetchAuth,
+        ) -> ModelsFetchFuture {
+            self.global_calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Some(make_prefetched(&["global-model"])) })
+        }
+
+        fn fetch_model_endpoint(&self, _request: ModelEndpointRequest) -> ModelEndpointFetchFuture {
+            self.endpoint_calls.fetch_add(1, Ordering::SeqCst);
+            let catalog = self.catalog.clone();
+            Box::pin(async move { Some((catalog, Some("\"same\"".to_string()))) })
+        }
+    }
+
+    let cfg = config_from_toml(
+        r#"
+            [model.endpoint-model]
+            base_url = "https://provider.example/v1"
+            api_key = "model-api-key"
+            "#,
+    );
+    let tmp = tempfile::TempDir::new().unwrap();
+    let auth_manager = Arc::new(AuthManager::new(tmp.path(), GrokComConfig::default()));
+    let global_calls = Arc::new(AtomicUsize::new(0));
+    let endpoint_calls = Arc::new(AtomicUsize::new(0));
+    let mgr = ModelsManagerBuilder::new(
+        None,
+        resolve_model_catalog(&cfg, None),
+        acp::ModelId::new("endpoint-model"),
+        auth_manager,
+        cfg.clone(),
+    )
+    .endpoint(Arc::new(ColdEndpointEtagFetcher {
+        global_calls: global_calls.clone(),
+        endpoint_calls: endpoint_calls.clone(),
+        catalog: make_prefetched(&["provider-model"]),
+    }))
+    .cache(test_cache_manager(tmp.path()))
+    .build();
+    {
+        let mut cat = mgr.inner.catalog.write();
+        cat.prefetched = Some(make_prefetched(&["global-model"]));
+        cat.models = resolve_model_catalog(&cfg, cat.prefetched.clone());
+        cat.has_fetched_real_catalog = true;
+        cat.catalog_source = CatalogSource::Global;
+        cat.etag = Some("\"same\"".to_string());
+    }
+
+    mgr.refresh_if_new_etag("\"same\"".to_string()).await;
+
+    for _ in 0..100 {
+        if mgr.inner.catalog.read().catalog_source == CatalogSource::ModelEndpoint {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+
+    assert_eq!(
+        endpoint_calls.load(Ordering::SeqCst),
+        1,
+        "an endpoint etag that equals the stale global etag must still refresh the endpoint",
+    );
+    assert_eq!(
+        global_calls.load(Ordering::SeqCst),
+        0,
+        "a cold configured endpoint must not launch a global fetch",
+    );
+    let cat = mgr.inner.catalog.read();
+    assert_eq!(cat.catalog_source, CatalogSource::ModelEndpoint);
+    assert!(cat.model_endpoint_catalog_loaded);
+    assert!(cat.models.contains_key("provider-model"));
+    assert_eq!(cat.etag.as_deref(), Some("\"same\""));
+}
+
+#[tokio::test]
 async fn etag_refresh_uses_catalog_owner_when_current_is_returned_slug() {
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -2380,6 +2467,101 @@ async fn byok_endpoint_catalog_survives_sign_out() {
     assert!(mgr.inner.user_selected_model.load(Ordering::Relaxed));
 }
 
+#[tokio::test]
+#[serial]
+async fn byok_logout_clears_stale_global_catalog_when_endpoint_refresh_fails() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct FailingEndpointRefresh {
+        global_calls: Arc<AtomicUsize>,
+        endpoint_calls: Arc<AtomicUsize>,
+    }
+    impl ModelsEndpoint for FailingEndpointRefresh {
+        fn fetch_models(
+            &self,
+            _endpoints: config::EndpointsConfig,
+            _auth: Option<GrokAuth>,
+            _fetch_auth: ModelFetchAuth,
+        ) -> ModelsFetchFuture {
+            self.global_calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { None })
+        }
+
+        fn fetch_model_endpoint(&self, _request: ModelEndpointRequest) -> ModelEndpointFetchFuture {
+            self.endpoint_calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { None })
+        }
+    }
+
+    let _no_key = EnvGuard::unset("XAI_API_KEY");
+    let _no_legacy_key = EnvGuard::unset("GROK_CODE_XAI_API_KEY");
+    let cfg = config_from_toml(
+        r#"
+            [model.endpoint-model]
+            base_url = "https://provider.example/v1"
+            api_key = "model-api-key"
+            "#,
+    );
+    let tmp = tempfile::TempDir::new().unwrap();
+    let auth_manager = Arc::new(AuthManager::new(tmp.path(), GrokComConfig::default()));
+    let global_calls = Arc::new(AtomicUsize::new(0));
+    let endpoint_calls = Arc::new(AtomicUsize::new(0));
+    let mgr = ModelsManagerBuilder::new(
+        None,
+        resolve_model_catalog(&cfg, None),
+        acp::ModelId::new("endpoint-model"),
+        auth_manager,
+        cfg.clone(),
+    )
+    .endpoint(Arc::new(FailingEndpointRefresh {
+        global_calls: global_calls.clone(),
+        endpoint_calls: endpoint_calls.clone(),
+    }))
+    .cache(test_cache_manager(tmp.path()))
+    .build();
+    // A prior identity's global catalog is resident and marked real, but the
+    // BYOK endpoint catalog has never loaded.
+    {
+        let mut cat = mgr.inner.catalog.write();
+        cat.prefetched = Some(make_prefetched(&["grok-4"]));
+        cat.models = resolve_model_catalog(&cfg, cat.prefetched.clone());
+        cat.has_fetched_real_catalog = true;
+        cat.catalog_source = CatalogSource::Global;
+        cat.etag = Some("\"global-etag\"".to_string());
+    }
+    mgr.inner.user_selected_model.store(true, Ordering::Relaxed);
+
+    mgr.on_auth_changed().await;
+
+    assert_eq!(
+        endpoint_calls.load(Ordering::SeqCst),
+        1,
+        "sign-out must still attempt the BYOK endpoint refresh",
+    );
+    assert_eq!(
+        global_calls.load(Ordering::SeqCst),
+        0,
+        "sign-out must not fetch the prior identity's global catalog",
+    );
+    let cat = mgr.inner.catalog.read();
+    assert!(
+        !cat.has_fetched_real_catalog,
+        "a failed BYOK refresh must not leave the prior identity's global catalog resident",
+    );
+    assert!(
+        cat.prefetched.is_none(),
+        "the prior identity's prefetched models must be dropped",
+    );
+    assert!(
+        !cat.models.contains_key("grok-4"),
+        "the prior identity's models must not survive sign-out",
+    );
+    assert!(
+        cat.models.contains_key("endpoint-model"),
+        "the bundled/config catalog must remain usable after sign-out",
+    );
+}
+
 #[test]
 fn from_config_without_prefetch_produces_usable_catalog() {
     let tmp = tempfile::TempDir::new().unwrap();
@@ -2856,7 +3038,26 @@ async fn etag_refresh_joins_in_flight_global_fetch() {
     release.notify_one();
     fetch_task.await.unwrap();
     etag_task.await.unwrap();
-    assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+    // The joined fetch predated the etag change and applied no etag, so the
+    // etag refresh must be replayed rather than lost.
+    let mut replayed = false;
+    for _ in 0..200 {
+        if mgr.inner.catalog.read().etag.as_deref() == Some("\"etag-new\"") {
+            replayed = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert!(
+        replayed,
+        "the etag change must be replayed after the older fetch completes",
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        2,
+        "replaying the etag change must issue a fresh fetch",
+    );
     assert!(mgr.has_fetched_real_catalog());
     assert!(mgr.models().contains_key("grok-4"));
 }

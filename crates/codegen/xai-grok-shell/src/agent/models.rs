@@ -1040,15 +1040,23 @@ impl ModelsManager {
     /// Refresh models when the etag changes.
     pub(crate) async fn refresh_if_new_etag(&self, etag: String) {
         let current_has_endpoint = self.current_model_has_endpoint();
-        let (same_etag, endpoint_owned) = {
+        let (same_etag, endpoint_owned, catalog_is_endpoint_owned) = {
             let cat = self.inner.catalog.read();
-            let endpoint_owned = cat.catalog_source == CatalogSource::ModelEndpoint
+            let catalog_is_endpoint_owned = cat.catalog_source == CatalogSource::ModelEndpoint;
+            let endpoint_owned = catalog_is_endpoint_owned
                 || (!cat.model_endpoint_catalog_loaded
                     && (cat.catalog_owner.is_some() || current_has_endpoint));
-            (cat.etag.as_deref() == Some(etag.as_str()), endpoint_owned)
+            (
+                cat.etag.as_deref() == Some(etag.as_str()),
+                endpoint_owned,
+                catalog_is_endpoint_owned,
+            )
         };
         if endpoint_owned {
-            if same_etag {
+            // ETags are scoped to their resource/origin. A global etag that
+            // happens to equal the observed endpoint etag must not suppress
+            // the endpoint fetch while the endpoint catalog is still unloaded.
+            if catalog_is_endpoint_owned && same_etag {
                 return;
             }
             tracing::info!(etag = %etag, "models etag changed, refreshing endpoint catalog");
@@ -1089,28 +1097,39 @@ impl ModelsManager {
         let has_session = self.inner.auth_manager.current_or_expired().is_some();
         let fetch_auth = ModelFetchAuth::resolve(&config.endpoints, has_session);
         *self.inner.fetch_auth.write() = fetch_auth;
-        let endpoint_configured = self.current_model_has_endpoint();
+        let mut endpoint_configured = self.current_model_has_endpoint();
         // No session but the endpoint needs one: a fetch would 401, so skip it
         // and reset to this identity's bundled catalog. A model-owned catalog
         // with its own API key is independent of the Grok identity and must
         // not be dropped by the session-only fallback.
-        if !has_session && fetch_auth == ModelFetchAuth::Session && !endpoint_configured {
-            self.clear();
-            self.rebuild_bundled(&config);
-            // No fetch is coming; wake parked waiters. Lock and gate like
-            // every other outcome publish.
-            {
-                let _cat = self.inner.catalog.read();
-                self.inner.catalog_progress.send_if_modified(|p| {
-                    let pending = *p == CatalogProgress::Pending;
-                    if pending {
-                        *p = CatalogProgress::Failed;
-                    }
-                    pending
-                });
+        if !has_session && fetch_auth == ModelFetchAuth::Session {
+            // Preserve a resident catalog only when it is actually
+            // endpoint-owned. A prior identity's global catalog must be
+            // cleared before the BYOK refresh so a failed refresh cannot
+            // leave it behind as the "real" catalog.
+            let catalog_is_endpoint_owned =
+                self.inner.catalog.read().catalog_source == CatalogSource::ModelEndpoint;
+            if !endpoint_configured || !catalog_is_endpoint_owned {
+                self.clear();
+                self.rebuild_bundled(&config);
+                endpoint_configured = self.current_model_has_endpoint();
             }
-            self.notify_models_updated();
-            return;
+            if !endpoint_configured {
+                // No fetch is coming; wake parked waiters. Lock and gate like
+                // every other outcome publish.
+                {
+                    let _cat = self.inner.catalog.read();
+                    self.inner.catalog_progress.send_if_modified(|p| {
+                        let pending = *p == CatalogProgress::Pending;
+                        if pending {
+                            *p = CatalogProgress::Failed;
+                        }
+                        pending
+                    });
+                }
+                self.notify_models_updated();
+                return;
+            }
         }
 
         let remote_fetch_enabled = crate::util::config::resolve_remote_fetch_enabled();
@@ -1494,6 +1513,16 @@ impl ModelsManager {
             self.inner.refresh_in_flight.store(false, Ordering::Release);
             self.wait_for_first_catalog_inner(remote_fetch_enabled)
                 .await;
+            // The joined fetch started before this etag change and applies no
+            // etag, so it can publish the old catalog. Re-issue the refresh
+            // when the catalog still does not carry the observed etag instead
+            // of letting the change signal disappear.
+            if new_etag
+                .as_deref()
+                .is_some_and(|etag| self.inner.catalog.read().etag.as_deref() != Some(etag))
+            {
+                Box::pin(self.spawn_fetch_inner(new_etag, remote_fetch_enabled)).await;
+            }
             return;
         };
         let generation = attempt.generation;
@@ -1659,11 +1688,16 @@ impl ModelsManager {
         let _endpoint_refresh = self.inner.endpoint_refresh.lock().await;
         // A queued ETag watcher may have observed the same change as a refresh
         // that already committed while it waited for the lock. Recheck before
-        // spending another auth and HTTP round trip.
-        if let Some(observed_etag) = observed_etag.as_deref()
-            && self.inner.catalog.read().etag.as_deref() == Some(observed_etag)
-        {
-            return true;
+        // spending another auth and HTTP round trip, but only against an
+        // endpoint-owned catalog's etag: a global etag is scoped to a
+        // different resource and must not suppress the endpoint fetch.
+        if let Some(observed_etag) = observed_etag.as_deref() {
+            let cat = self.inner.catalog.read();
+            if cat.catalog_source == CatalogSource::ModelEndpoint
+                && cat.etag.as_deref() == Some(observed_etag)
+            {
+                return true;
+            }
         }
         self.refresh_current_model_endpoint_locked(observed_etag)
             .await
