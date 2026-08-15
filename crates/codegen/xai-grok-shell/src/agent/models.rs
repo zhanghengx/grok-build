@@ -805,8 +805,11 @@ impl ModelsManager {
             changed
         };
         if changed {
-            let cfg = self.inner.cfg.read().clone();
             let mut cat = self.inner.catalog.write();
+            // Snapshot config only after taking the catalog lock: `apply_config`
+            // uses catalog-then-config order, and a switch that waited behind
+            // the publication must rebuild against the config it committed.
+            let cfg = self.inner.cfg.read().clone();
             if cat.catalog_source == CatalogSource::ModelEndpoint {
                 // Models returned by the endpoint inherit its connection
                 // context and remain owned by that catalog, including IDs that
@@ -1036,10 +1039,12 @@ impl ModelsManager {
 
     /// Refresh models when the etag changes.
     pub(crate) async fn refresh_if_new_etag(&self, etag: String) {
+        let current_has_endpoint = self.current_model_has_endpoint();
         let (same_etag, endpoint_owned) = {
             let cat = self.inner.catalog.read();
             let endpoint_owned = cat.catalog_source == CatalogSource::ModelEndpoint
-                || (!cat.model_endpoint_catalog_loaded && cat.catalog_owner.is_some());
+                || (!cat.model_endpoint_catalog_loaded
+                    && (cat.catalog_owner.is_some() || current_has_endpoint));
             (cat.etag.as_deref() == Some(etag.as_str()), endpoint_owned)
         };
         if endpoint_owned {
@@ -1066,7 +1071,7 @@ impl ModelsManager {
             return;
         }
         tracing::info!(etag = %etag, "models etag changed, refreshing");
-        self.spawn_fetch(Some(etag));
+        self.spawn_fetch(Some(etag)).await;
     }
 
     /// Auth identity changed: invalidate the disk cache and refresh the catalog.
@@ -1084,9 +1089,12 @@ impl ModelsManager {
         let has_session = self.inner.auth_manager.current_or_expired().is_some();
         let fetch_auth = ModelFetchAuth::resolve(&config.endpoints, has_session);
         *self.inner.fetch_auth.write() = fetch_auth;
+        let endpoint_configured = self.current_model_has_endpoint();
         // No session but the endpoint needs one: a fetch would 401, so skip it
-        // and reset to this identity's bundled catalog.
-        if !has_session && fetch_auth == ModelFetchAuth::Session {
+        // and reset to this identity's bundled catalog. A model-owned catalog
+        // with its own API key is independent of the Grok identity and must
+        // not be dropped by the session-only fallback.
+        if !has_session && fetch_auth == ModelFetchAuth::Session && !endpoint_configured {
             self.clear();
             self.rebuild_bundled(&config);
             // No fetch is coming; wake parked waiters. Lock and gate like
@@ -1106,7 +1114,12 @@ impl ModelsManager {
         }
 
         let remote_fetch_enabled = crate::util::config::resolve_remote_fetch_enabled();
-        self.fetch_and_apply_inner(remote_fetch_enabled).await;
+        if endpoint_configured {
+            self.refresh_current_model_endpoint_inner(remote_fetch_enabled, None)
+                .await;
+        } else {
+            self.fetch_and_apply_inner(remote_fetch_enabled).await;
+        }
 
         let needs_bundled_fallback = {
             let cat = self.inner.catalog.read();
@@ -1450,14 +1463,15 @@ impl ModelsManager {
         }
     }
 
-    fn spawn_fetch(&self, new_etag: Option<String>) {
+    async fn spawn_fetch(&self, new_etag: Option<String>) {
         self.spawn_fetch_inner(
             new_etag,
             crate::util::config::resolve_remote_fetch_enabled(),
-        );
+        )
+        .await;
     }
 
-    fn spawn_fetch_inner(&self, new_etag: Option<String>, remote_fetch_enabled: bool) {
+    async fn spawn_fetch_inner(&self, new_etag: Option<String>, remote_fetch_enabled: bool) {
         if !remote_fetch_enabled {
             tracing::info!("model catalog refresh skipped: remote_fetch disabled");
             return;
@@ -1471,11 +1485,18 @@ impl ModelsManager {
             tracing::debug!("model catalog refresh already in flight, skipping");
             return;
         }
-        // Generation first: an identity change after this point fails the
-        // apply fence instead of publishing an old-credential fetch.
-        let attempt = FetchAttemptGuard::begin(&self.inner);
+        // Reserve the current generation under the same global single-flight
+        // used by `fetch_and_apply_inner`. If `models/list` or a background
+        // fetch already owns it, join that attempt instead of racing a second
+        // same-generation request whose older response could land last.
+        let started = self.reserve_global_fetch().await;
+        let Some((attempt, active)) = started else {
+            self.inner.refresh_in_flight.store(false, Ordering::Release);
+            self.wait_for_first_catalog_inner(remote_fetch_enabled)
+                .await;
+            return;
+        };
         let generation = attempt.generation;
-        let active = ActiveFetchGuard::begin(&self.inner, generation);
         let cfg = self.inner.cfg.read().clone();
         let endpoints = cfg.endpoints.clone();
         let fetch_auth = *self.inner.fetch_auth.read();
@@ -1805,34 +1826,33 @@ impl ModelsManager {
             .await
     }
 
+    /// Reserve the current catalog generation for a global fetch. Returns
+    /// `None` when an attempt already owns that generation, so callers join
+    /// through the progress watch instead of racing a second same-generation
+    /// request whose older response could land last.
+    async fn reserve_global_fetch(&self) -> Option<(FetchAttemptGuard, ActiveFetchGuard)> {
+        let _start = self.inner.global_fetch_start.lock().await;
+        let cat = self.inner.catalog.read();
+        let generation = cat.generation;
+        if self
+            .inner
+            .active_fetch_generations
+            .read()
+            .contains(&generation)
+        {
+            return None;
+        }
+        let attempt = FetchAttemptGuard::begin_with_generation(&self.inner, generation);
+        let active = ActiveFetchGuard::begin(&self.inner, generation);
+        Some((attempt, active))
+    }
+
     async fn fetch_and_apply_inner(&self, remote_fetch_enabled: bool) {
         if !remote_fetch_enabled {
             tracing::info!("model catalog refresh skipped: remote_fetch disabled");
             return;
         }
-        // Reserve the global fetch under one synchronization point. A cold-start
-        // retry task can be scheduled but not yet polled, so checking only the
-        // active-fetch list and then starting a request is not atomic: two
-        // same-generation requests could both be accepted and the older one
-        // could complete last. Whichever caller reserves the current generation
-        // runs the fetch; everyone else joins it through the progress watch.
-        let started = {
-            let _start = self.inner.global_fetch_start.lock().await;
-            let cat = self.inner.catalog.read();
-            let generation = cat.generation;
-            if self
-                .inner
-                .active_fetch_generations
-                .read()
-                .contains(&generation)
-            {
-                None
-            } else {
-                let attempt = FetchAttemptGuard::begin_with_generation(&self.inner, generation);
-                let active = ActiveFetchGuard::begin(&self.inner, generation);
-                Some((attempt, active))
-            }
-        };
+        let started = self.reserve_global_fetch().await;
         let (attempt, active) = match started {
             Some(started) => started,
             None => {
