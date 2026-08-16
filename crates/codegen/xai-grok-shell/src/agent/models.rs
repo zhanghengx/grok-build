@@ -226,7 +226,11 @@ fn pending_endpoint_owner_configured(
 /// model is only a temporary fallback with no selectable entry in the
 /// config/global catalog. It is cleared once a selectable model from another
 /// source is selected.
-fn endpoint_owner_retained_for_selected_model(cat: &CatalogState, current: &acp::ModelId) -> bool {
+fn endpoint_owner_retained_for_selected_model(
+    cat: &CatalogState,
+    current: &acp::ModelId,
+    clear_on_other_source: bool,
+) -> bool {
     let Some(owner) = cat.catalog_owner.as_ref() else {
         return true;
     };
@@ -256,6 +260,13 @@ fn endpoint_owner_retained_for_selected_model(cat: &CatalogState, current: &acp:
         if !overlay_changes_context {
             return true;
         }
+    }
+    if !clear_on_other_source {
+        // Automatic reselection (for example, a config-only rebuild after an
+        // endpoint invalidation moves a returned slug to the bundled default)
+        // is not a choice of another source. Keep the pending owner so the
+        // replacement endpoint refresh still targets it.
+        return true;
     }
     let selected_from_other_source = resolve_catalog_key(&cat.models, current)
         .and_then(|key| cat.models.get(key.0.as_ref()))
@@ -293,6 +304,10 @@ struct Inner {
     /// still matches the catalog, so a config reload cannot park callers
     /// behind a stale request that the fence will discard.
     active_fetch_generations: RwLock<Vec<u64>>,
+    /// Bumped every time an active fetch finishes, so callers that joined an
+    /// in-flight generation can wait for its outcome even when the catalog was
+    /// already `Ready` (later refreshes do not change `catalog_progress`).
+    active_fetch_done: tokio::sync::watch::Sender<u64>,
     /// Model-switch signal: a generation counter bumped when the current model id changes.
     model_switch_watch: tokio::sync::watch::Sender<u64>,
     /// Progress of the first real-catalog load, watched by bounded waits.
@@ -343,6 +358,9 @@ impl Drop for ActiveFetchGuard {
         {
             generations.remove(index);
         }
+        drop(generations);
+        let next_version = *self.inner.active_fetch_done.borrow() + 1;
+        self.inner.active_fetch_done.send_replace(next_version);
     }
 }
 
@@ -479,6 +497,7 @@ impl ModelsManagerBuilder {
                 fetches_in_flight: AtomicUsize::new(0),
                 active_fetch: AtomicUsize::new(0),
                 active_fetch_generations: RwLock::new(Vec::new()),
+                active_fetch_done: tokio::sync::watch::channel(0u64).0,
                 model_switch_watch: tokio::sync::watch::channel(0u64).0,
                 catalog_progress: tokio::sync::watch::channel(CatalogProgress::Pending).0,
                 user_selected_model: AtomicBool::new(false),
@@ -716,13 +735,14 @@ impl ModelsManager {
                 .get(cur.0.as_ref())
                 .is_some_and(|e| e.info.user_selectable)
         };
-        if preferred_changed && !(campaign_only_flip && current_still_ok) {
-            self.reselect_default_model(&new_config);
+        let selection_moved = preferred_changed && !(campaign_only_flip && current_still_ok);
+        if selection_moved {
+            self.reselect_default_model(&new_config, true);
         } else {
-            self.reselect_current_model_if_missing(&new_config);
+            self.reselect_current_model_if_missing(&new_config, false);
         }
 
-        self.revalidate_pending_owner_for_selected_model();
+        self.revalidate_pending_owner_for_selected_model(selection_moved);
         self.notify_models_updated();
         Ok(())
     }
@@ -733,7 +753,7 @@ impl ModelsManager {
         new_config: config::Config,
     ) -> Result<(), String> {
         self.apply_config(new_config.clone())?;
-        self.reselect_default_model(&new_config);
+        self.reselect_default_model(&new_config, true);
         self.notify_models_updated();
         Ok(())
     }
@@ -787,10 +807,10 @@ impl ModelsManager {
         self.inner
             .user_selected_model
             .store(true, Ordering::Relaxed);
-        self.set_current_model_id_internal(id);
+        self.set_current_model_id_internal(id, true);
     }
 
-    fn set_current_model_id_internal(&self, id: acp::ModelId) {
+    fn set_current_model_id_internal(&self, id: acp::ModelId, clear_pending_owner: bool) {
         let changed = {
             let mut cur = self.inner.current_model_id.write();
             let changed = *cur != id;
@@ -857,7 +877,7 @@ impl ModelsManager {
             // A pending owner survives an endpoint invalidation. Once the
             // selected model belongs to another source, drop it so refreshes
             // target that source instead of the stale endpoint.
-            if !endpoint_owner_retained_for_selected_model(&cat, &id) {
+            if !endpoint_owner_retained_for_selected_model(&cat, &id, clear_pending_owner) {
                 tracing::info!(model = %id.0, "clearing pending endpoint owner after model switch");
                 cat.catalog_owner = None;
             }
@@ -1034,7 +1054,7 @@ impl ModelsManager {
     /// Reset to this identity's bundled catalog and reselect a valid default.
     fn rebuild_bundled(&self, cfg: &config::Config) {
         self.rebuild(cfg, None);
-        self.reselect_current_model_if_missing(cfg);
+        self.reselect_current_model_if_missing(cfg, false);
     }
 
     /// Refresh models when the etag changes.
@@ -1512,8 +1532,12 @@ impl ModelsManager {
         let Some((attempt, active)) = started else {
             self.inner.refresh_in_flight.store(false, Ordering::Release);
             let joined_generation = self.inner.catalog.read().generation;
-            self.wait_for_first_catalog_inner(remote_fetch_enabled)
-                .await;
+            // Wait for the fetch we joined to finish, not just for the first
+            // catalog to become ready. With a real catalog already loaded,
+            // `catalog_progress` stays `Ready` during later refreshes, so the
+            // old wait returned immediately and replaying the etag here would
+            // recurse while the same active fetch was still registered.
+            self.wait_for_active_generation(joined_generation).await;
             // The joined fetch started before this etag change and applies no
             // etag, so it can publish the old catalog. Re-issue the refresh
             // when the catalog still does not carry the observed etag instead
@@ -1585,6 +1609,7 @@ impl ModelsManager {
                 // configuration. Do not populate the picker from the global
                 // proxy and then leave the configured endpoint's model list
                 // unused.
+                let owner_before = self.current_endpoint_owner();
                 match strategy {
                     RefreshStrategy::Offline => {
                         self.wait_for_first_catalog().await;
@@ -1596,11 +1621,26 @@ impl ModelsManager {
                         self.refresh_current_model_endpoint().await;
                     }
                 }
-                if self.current_model_has_endpoint() {
+                if !self.current_model_has_endpoint() {
+                    // The model changed away from the endpoint source while
+                    // the refresh was awaiting; run the global path for it.
+                    continue;
+                }
+                if self.current_model_endpoint_catalog_loaded() {
                     return;
                 }
-                // The model changed away from the endpoint source while the
-                // refresh was awaiting; run the global path for the new model.
+                // The refresh did not leave a loaded catalog for the current
+                // model. This can happen when the current model switched from
+                // one endpoint owner to another while the first `/models`
+                // request was pending; run the loop again so the new owner's
+                // catalog is fetched instead of serving the stale/config-only
+                // catalog. A same-owner failure is left alone: retrying the
+                // same endpoint here would turn one failed `models/list` into
+                // three network requests.
+                if self.current_endpoint_owner() != owner_before {
+                    continue;
+                }
+                return;
             } else {
                 match strategy {
                     RefreshStrategy::Offline => {
@@ -1623,6 +1663,17 @@ impl ModelsManager {
                             let started = self.reserve_global_fetch().await;
                             if let Some(started) = started {
                                 self.fetch_and_apply_reserved(started).await;
+                                // A config reload can advance the catalog
+                                // generation while the reserved request is in
+                                // flight, so its result is discarded by the
+                                // fence. Re-run the fetch for the current
+                                // generation instead of returning without a
+                                // real catalog.
+                                if !self.current_model_has_endpoint()
+                                    && !self.inner.catalog.read().has_fetched_real_catalog
+                                {
+                                    self.fetch_and_apply().await;
+                                }
                             } else {
                                 self.wait_for_first_catalog().await;
                                 // The joined fetch may have been captured under
@@ -1653,6 +1704,39 @@ impl ModelsManager {
 
     fn current_model_has_endpoint(&self) -> bool {
         self.model_has_endpoint(&self.current_model_id())
+    }
+
+    /// Whether the currently selected model's configured endpoint catalog is
+    /// the loaded one. The catalog belongs to the current model only when it is
+    /// the owner or was returned by that owner's `/models` response; a switch
+    /// to a different endpoint owner must not be satisfied by the previous
+    /// owner's catalog.
+    fn current_model_endpoint_catalog_loaded(&self) -> bool {
+        let current = self.current_model_id();
+        let cat = self.inner.catalog.read();
+        if cat.catalog_source != CatalogSource::ModelEndpoint || !cat.model_endpoint_catalog_loaded
+        {
+            return false;
+        }
+        cat.catalog_owner.as_ref().is_some_and(|owner| {
+            owner == &current
+                || cat
+                    .prefetched
+                    .as_ref()
+                    .is_some_and(|models| resolve_catalog_key(models, &current).is_some())
+        })
+    }
+
+    /// The model whose endpoint owns the catalog (or would own a pending
+    /// refresh), falling back to the current model id when no owner is tracked.
+    fn current_endpoint_owner(&self) -> acp::ModelId {
+        let current = self.current_model_id();
+        self.inner
+            .catalog
+            .read()
+            .catalog_owner
+            .clone()
+            .unwrap_or(current)
     }
 
     /// Whether `model_id` has a configured model-owned endpoint plus a
@@ -1755,11 +1839,16 @@ impl ModelsManager {
     }
 
     async fn refresh_current_model_endpoint_locked(&self, observed_etag: Option<String>) -> bool {
-        // Capture both fences before the request: `model_endpoint_request`
-        // awaits a provider refresh, during which either the current model or
-        // its endpoint configuration can change. A stale result must not mark
-        // the new model/configuration as loaded.
-        let (catalog_owner, switch_generation, endpoint_generation) = {
+        // Capture the endpoint identity and its config fence before the
+        // request: `model_endpoint_request` awaits a provider refresh, during
+        // which either the current model or its endpoint configuration can
+        // change. A stale result must not mark the new model/configuration as
+        // loaded. The endpoint fence, not the model-switch generation, is the
+        // correct bound for this result: switching between models returned by
+        // the same endpoint must not discard the refresh, while switching to a
+        // different endpoint (or clearing the identity) bumps
+        // `endpoint_generation` and rejects it.
+        let (catalog_owner, endpoint_generation) = {
             let cat = self.inner.catalog.read();
             let current = self.inner.current_model_id.read();
             (
@@ -1767,7 +1856,6 @@ impl ModelsManager {
                 // endpoint-owned catalog, not the currently selected returned
                 // slug or metadata-only overlay.
                 cat.catalog_owner.clone().unwrap_or_else(|| current.clone()),
-                self.model_switch_generation(),
                 cat.endpoint_generation,
             )
         };
@@ -1796,7 +1884,7 @@ impl ModelsManager {
             new_etag,
             None,
             Some(endpoint_generation),
-            Some(switch_generation),
+            None,
             CatalogSource::ModelEndpoint,
             Some(catalog_owner),
         ) {
@@ -1915,6 +2003,24 @@ impl ModelsManager {
         Some((attempt, active))
     }
 
+    /// Wait until the active fetch that owns `generation` has finished. Uses a
+    /// versioned watch so a completion racing the initial check cannot be lost,
+    /// unlike a bare `Notify`.
+    async fn wait_for_active_generation(&self, generation: u64) {
+        let mut done = self.inner.active_fetch_done.subscribe();
+        loop {
+            {
+                let active = self.inner.active_fetch_generations.read();
+                if !active.contains(&generation) {
+                    return;
+                }
+            }
+            if done.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+
     async fn fetch_and_apply_inner(&self, remote_fetch_enabled: bool) {
         if !remote_fetch_enabled {
             tracing::info!("model catalog refresh skipped: remote_fetch disabled");
@@ -2027,6 +2133,23 @@ impl ModelsManager {
                     );
                     return false;
                 }
+                if let Some(expected_owner) = catalog_owner.as_ref() {
+                    let current = self.inner.current_model_id.read();
+                    let pending_owner_matches = !cat.model_endpoint_catalog_loaded
+                        && cat.catalog_owner.as_ref() == Some(expected_owner);
+                    let owner_matches = expected_owner == &*current
+                        || cat
+                            .prefetched
+                            .as_ref()
+                            .is_some_and(|models| resolve_catalog_key(models, &current).is_some())
+                        || pending_owner_matches;
+                    if !owner_matches {
+                        tracing::info!(
+                            "model catalog result discarded: current model no longer belongs to the endpoint owner"
+                        );
+                        return false;
+                    }
+                }
             } else if let Some(generation) = generation
                 && cat.generation != generation
             {
@@ -2081,9 +2204,9 @@ impl ModelsManager {
         // default on the first catalog only when the user hasn't chosen.
         // Either way a now-invalid selection is replaced.
         if first_real_catalog && !self.inner.user_selected_model.load(Ordering::Relaxed) {
-            self.reselect_default_model(&apply_cfg);
+            self.reselect_default_model(&apply_cfg, true);
         } else {
-            self.reselect_current_model_if_missing(&apply_cfg);
+            self.reselect_current_model_if_missing(&apply_cfg, true);
         }
         true
     }
@@ -2166,7 +2289,11 @@ impl ModelsManager {
 
     /// Re-pick the default when the current model is gone or unselectable;
     /// auth visibility never evicts an explicit user pick.
-    fn reselect_current_model_if_missing(&self, config: &config::Config) {
+    fn reselect_current_model_if_missing(
+        &self,
+        config: &config::Config,
+        clear_pending_owner: bool,
+    ) {
         let current = self.inner.current_model_id.read().clone();
         let user_selected = self.inner.user_selected_model.load(Ordering::Relaxed);
         let needs_reselection = {
@@ -2193,15 +2320,15 @@ impl ModelsManager {
             old = %current.0, new = %new_id.0, source = %source,
             "current model not in new catalog, reselecting default"
         );
-        self.set_current_model_id_internal(new_id);
+        self.set_current_model_id_internal(new_id, clear_pending_owner);
     }
 
     /// Drop a pending endpoint owner once the selected model belongs to another
     /// source (or a temporary fallback no longer needs the pending refresh).
-    fn revalidate_pending_owner_for_selected_model(&self) {
+    fn revalidate_pending_owner_for_selected_model(&self, clear_pending_owner: bool) {
         let mut cat = self.inner.catalog.write();
         let current = self.inner.current_model_id.read().clone();
-        if !endpoint_owner_retained_for_selected_model(&cat, &current) {
+        if !endpoint_owner_retained_for_selected_model(&cat, &current, clear_pending_owner) {
             tracing::info!(
                 model = %current.0,
                 "clearing pending endpoint owner after model selection"
@@ -2211,7 +2338,7 @@ impl ModelsManager {
     }
 
     /// Re-resolve the default model against the current catalog.
-    fn reselect_default_model(&self, config: &config::Config) {
+    fn reselect_default_model(&self, config: &config::Config, clear_pending_owner: bool) {
         let (key, _, source) = {
             let cat = self.inner.catalog.read();
             let models = &cat.models;
@@ -2224,7 +2351,7 @@ impl ModelsManager {
                 old = %current.0, new = %new_id.0, source = %source,
                 "re-resolved default model after catalog populated"
             );
-            self.set_current_model_id_internal(new_id);
+            self.set_current_model_id_internal(new_id, clear_pending_owner);
         }
     }
 }
