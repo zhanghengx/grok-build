@@ -1114,7 +1114,7 @@ impl ModelsManager {
     /// Refresh models when the etag changes.
     pub(crate) async fn refresh_if_new_etag(&self, etag: String) {
         let current_has_endpoint = self.current_model_has_endpoint();
-        let (same_etag, endpoint_owned, catalog_is_endpoint_owned) = {
+        let (same_etag, endpoint_owned, catalog_is_endpoint_owned, observed_endpoint_generation) = {
             let cat = self.inner.catalog.read();
             let catalog_is_endpoint_owned = cat.catalog_source == CatalogSource::ModelEndpoint;
             let endpoint_owned = catalog_is_endpoint_owned
@@ -1124,6 +1124,7 @@ impl ModelsManager {
                 cat.etag.as_deref() == Some(etag.as_str()),
                 endpoint_owned,
                 catalog_is_endpoint_owned,
+                cat.endpoint_generation,
             )
         };
         if endpoint_owned {
@@ -1144,10 +1145,11 @@ impl ModelsManager {
                 + 1;
             let mgr = self.clone();
             tokio::task::spawn(async move {
-                mgr.refresh_current_model_endpoint_inner(
+                mgr.refresh_current_model_endpoint_inner_with_origin(
                     crate::util::config::resolve_remote_fetch_enabled(),
                     Some(etag),
                     Some(seq),
+                    Some(observed_endpoint_generation),
                 )
                 .await;
             });
@@ -1874,6 +1876,22 @@ impl ModelsManager {
         observed_etag: Option<String>,
         observed_seq: Option<u64>,
     ) -> bool {
+        self.refresh_current_model_endpoint_inner_with_origin(
+            remote_fetch_enabled,
+            observed_etag,
+            observed_seq,
+            None,
+        )
+        .await
+    }
+
+    async fn refresh_current_model_endpoint_inner_with_origin(
+        &self,
+        remote_fetch_enabled: bool,
+        observed_etag: Option<String>,
+        observed_seq: Option<u64>,
+        observed_endpoint_generation: Option<u64>,
+    ) -> bool {
         if !remote_fetch_enabled {
             tracing::info!("model-specific catalog refresh skipped: remote_fetch disabled");
             return false;
@@ -1900,6 +1918,7 @@ impl ModelsManager {
             let cat = self.inner.catalog.read();
             if cat.catalog_source == CatalogSource::ModelEndpoint
                 && cat.etag.as_deref() == Some(observed_etag)
+                && observed_endpoint_generation.map_or(true, |g| cat.endpoint_generation == g)
             {
                 if let Some(seq) = observed_seq {
                     self.inner
@@ -1909,8 +1928,12 @@ impl ModelsManager {
                 return true;
             }
         }
-        self.refresh_current_model_endpoint_locked(observed_etag, observed_seq)
-            .await
+        self.refresh_current_model_endpoint_locked(
+            observed_etag,
+            observed_seq,
+            observed_endpoint_generation,
+        )
+        .await
     }
 
     /// `OnlineIfUncached`: fetch the configured endpoint only when the catalog
@@ -1927,13 +1950,15 @@ impl ModelsManager {
         if self.inner.catalog.read().model_endpoint_catalog_loaded {
             return true;
         }
-        self.refresh_current_model_endpoint_locked(None, None).await
+        self.refresh_current_model_endpoint_locked(None, None, None)
+            .await
     }
 
     async fn refresh_current_model_endpoint_locked(
         &self,
         observed_etag: Option<String>,
         observed_seq: Option<u64>,
+        observed_endpoint_generation: Option<u64>,
     ) -> bool {
         // Capture the endpoint identity and its config fence before the
         // request: `model_endpoint_request` awaits a provider refresh, during
@@ -1972,6 +1997,16 @@ impl ModelsManager {
                 (None, None)
             }
         };
+        // The observed ETag belongs to the endpoint that produced the
+        // notification. If the endpoint changed while the watcher waited for
+        // the refresh lock, do not stamp the old ETag onto the new endpoint's
+        // catalog when `/models` omits its own ETag.
+        let observed_etag =
+            if observed_endpoint_generation.map_or(true, |g| g == endpoint_generation) {
+                observed_etag
+            } else {
+                None
+            };
         let new_etag = response_etag.or(observed_etag);
         let cfg = self.inner.cfg.read().clone();
         if !self.apply_refresh_result_fenced(

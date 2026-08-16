@@ -1986,6 +1986,127 @@ async fn endpoint_etag_refresh_rechecks_after_lock() {
 }
 
 #[tokio::test]
+async fn endpoint_etag_observed_fallback_discarded_after_endpoint_switch() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct SwitchEndpoint {
+        calls: Arc<AtomicUsize>,
+    }
+    impl ModelsEndpoint for SwitchEndpoint {
+        fn fetch_models(
+            &self,
+            _endpoints: config::EndpointsConfig,
+            _auth: Option<GrokAuth>,
+            _fetch_auth: ModelFetchAuth,
+        ) -> ModelsFetchFuture {
+            Box::pin(async { None })
+        }
+
+        fn fetch_model_endpoint(&self, _request: ModelEndpointRequest) -> ModelEndpointFetchFuture {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            // `/models` omits its own ETag, so without the origin fence the
+            // stale endpoint-A ETag would be stored on the endpoint-B catalog.
+            Box::pin(async { Some((make_prefetched(&["endpoint-model"]), None)) })
+        }
+    }
+
+    let old_cfg = config_from_toml(
+        r#"
+            [model.endpoint-model]
+            base_url = "https://provider-a.example/v1"
+            api_key = "a-key"
+            "#,
+    );
+    let tmp = tempfile::TempDir::new().unwrap();
+    let auth_manager = Arc::new(AuthManager::new(tmp.path(), GrokComConfig::default()));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mgr = ModelsManagerBuilder::new(
+        None,
+        resolve_model_catalog(&old_cfg, None),
+        acp::ModelId::new("endpoint-model"),
+        auth_manager,
+        old_cfg.clone(),
+    )
+    .endpoint(Arc::new(SwitchEndpoint {
+        calls: calls.clone(),
+    }))
+    .cache(test_cache_manager(tmp.path()))
+    .build();
+    let observed_endpoint_generation = {
+        let mut cat = mgr.inner.catalog.write();
+        cat.prefetched = Some(make_prefetched(&["endpoint-model"]));
+        cat.models = resolve_model_catalog(&old_cfg, cat.prefetched.clone());
+        cat.has_fetched_real_catalog = true;
+        cat.model_endpoint_catalog_loaded = true;
+        cat.catalog_source = CatalogSource::ModelEndpoint;
+        cat.catalog_owner = Some(acp::ModelId::new("endpoint-model"));
+        cat.etag = Some("\"etag-a\"".to_string());
+        cat.endpoint_generation
+    };
+
+    // Queue the endpoint-A ETag watcher behind the refresh lock, then switch
+    // the endpoint before the watcher can run.
+    let _endpoint_refresh = mgr.inner.endpoint_refresh.lock().await;
+    let stale_watcher = tokio::spawn({
+        let mgr = mgr.clone();
+        async move {
+            mgr.refresh_current_model_endpoint_inner_with_origin(
+                true,
+                Some("etag-a".to_string()),
+                Some(1),
+                Some(observed_endpoint_generation),
+            )
+            .await
+        }
+    });
+    let new_cfg = config_from_toml(
+        r#"
+            [model.endpoint-model]
+            base_url = "https://provider-b.example/v1"
+            api_key = "b-key"
+            "#,
+    );
+    mgr.apply_config(new_cfg)
+        .expect("endpoint switch should apply");
+    drop(_endpoint_refresh);
+    assert!(
+        stale_watcher.await.unwrap(),
+        "the queued endpoint watcher should still refresh the new endpoint",
+    );
+
+    {
+        let cat = mgr.inner.catalog.read();
+        assert_eq!(cat.catalog_source, CatalogSource::ModelEndpoint);
+        assert!(cat.model_endpoint_catalog_loaded);
+        assert_eq!(
+            cat.etag.as_deref(),
+            None,
+            "the endpoint-A ETag must not be stored on the endpoint-B catalog",
+        );
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+    // A later endpoint-B notification carrying the same string must still
+    // trigger a fetch instead of being suppressed as unchanged.
+    let notify_mgr = mgr.clone();
+    tokio::spawn(async move {
+        notify_mgr.refresh_if_new_etag("etag-a".to_string()).await;
+    });
+    for _ in 0..200 {
+        if calls.load(Ordering::SeqCst) >= 2 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        2,
+        "a same-valued endpoint-B ETag notification must not be suppressed by the stale endpoint-A ETag",
+    );
+    assert_eq!(mgr.inner.catalog.read().etag.as_deref(), Some("etag-a"));
+}
+
+#[tokio::test]
 async fn set_current_model_id_change_fires_watch_to_all_subscribers() {
     let mgr = test_manager();
     let mut rx_a = mgr.subscribe_model_switch();
