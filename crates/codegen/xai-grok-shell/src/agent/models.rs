@@ -138,10 +138,12 @@ struct CatalogState {
     allowlist_excludes_all: bool,
     /// Bumped on identity change; a fetch captured before it must not apply.
     generation: u64,
-    /// Bumped when the current model's endpoint connection context changes or
-    /// the identity is cleared. A model-endpoint fetch captured before it must
-    /// not apply; settings-only publications leave it unchanged so an in-flight
-    /// endpoint refresh can still publish.
+    /// Bumped when the effective endpoint owner changes (including a cold
+    /// switch before the endpoint catalog first loads), when the current
+    /// model's endpoint connection context changes, or when the identity is
+    /// cleared. A model-endpoint fetch captured before it must not apply;
+    /// settings-only publications leave it unchanged so an in-flight endpoint
+    /// refresh can still publish.
     endpoint_generation: u64,
 }
 
@@ -859,8 +861,9 @@ impl ModelsManager {
     }
 
     fn set_current_model_id_internal(&self, id: acp::ModelId, clear_pending_owner: bool) {
-        let changed = {
+        let (changed, previous_model_id) = {
             let mut cur = self.inner.current_model_id.write();
+            let previous_model_id = cur.clone();
             let changed = *cur != id;
             if changed {
                 *cur = id.clone();
@@ -870,13 +873,18 @@ impl ModelsManager {
                     .model_switch_watch
                     .send_modify(|generation| *generation += 1);
             }
-            changed
+            (changed, previous_model_id)
         };
         if changed {
             let mut cat = self.inner.catalog.write();
             // Snapshot config only after taking the catalog lock: `apply_config`
             // uses catalog-then-config order, and a switch that waited behind
             // the publication must rebuild against the config it committed.
+            // The effective endpoint owner can change before the endpoint
+            // catalog first loads. Capture the previous owner under the same
+            // lock so a cold switch still advances the endpoint fence and
+            // rejects ETag/refresh work captured for the old origin.
+            let previous_endpoint_owner = cat.catalog_owner.clone().unwrap_or(previous_model_id);
             let cfg = self.inner.cfg.read().clone();
             if cat.catalog_source == CatalogSource::ModelEndpoint {
                 // Models returned by the endpoint inherit its connection
@@ -928,6 +936,14 @@ impl ModelsManager {
             if !endpoint_owner_retained_for_selected_model(&cat, &id, clear_pending_owner) {
                 tracing::info!(model = %id.0, "clearing pending endpoint owner after model switch");
                 cat.catalog_owner = None;
+            }
+            let effective_endpoint_owner = cat.catalog_owner.clone().unwrap_or_else(|| id.clone());
+            if previous_endpoint_owner != effective_endpoint_owner {
+                tracing::info!(
+                    model = %id.0,
+                    "advancing endpoint fence after endpoint owner change"
+                );
+                cat.endpoint_generation += 1;
             }
         } else if clear_pending_owner {
             // Explicitly reselecting the already-current model is still a
@@ -2465,12 +2481,21 @@ impl ModelsManager {
     fn revalidate_pending_owner_for_selected_model(&self, clear_pending_owner: bool) {
         let mut cat = self.inner.catalog.write();
         let current = self.inner.current_model_id.read().clone();
+        let previous_endpoint_owner = cat.catalog_owner.clone().unwrap_or_else(|| current.clone());
         if !endpoint_owner_retained_for_selected_model(&cat, &current, clear_pending_owner) {
             tracing::info!(
                 model = %current.0,
                 "clearing pending endpoint owner after model selection"
             );
             cat.catalog_owner = None;
+        }
+        let effective_endpoint_owner = cat.catalog_owner.clone().unwrap_or_else(|| current.clone());
+        if previous_endpoint_owner != effective_endpoint_owner {
+            tracing::info!(
+                model = %current.0,
+                "advancing endpoint fence after endpoint owner change"
+            );
+            cat.endpoint_generation += 1;
         }
     }
 

@@ -2107,6 +2107,136 @@ async fn endpoint_etag_observed_fallback_discarded_after_endpoint_switch() {
 }
 
 #[tokio::test]
+async fn endpoint_etag_cold_owner_switch_discards_observed_fallback() {
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct ColdSwitchEndpoint {
+        calls: Arc<AtomicUsize>,
+        base_urls: Arc<Mutex<Vec<String>>>,
+    }
+    impl ModelsEndpoint for ColdSwitchEndpoint {
+        fn fetch_models(
+            &self,
+            _endpoints: config::EndpointsConfig,
+            _auth: Option<GrokAuth>,
+            _fetch_auth: ModelFetchAuth,
+        ) -> ModelsFetchFuture {
+            Box::pin(async { None })
+        }
+
+        fn fetch_model_endpoint(&self, request: ModelEndpointRequest) -> ModelEndpointFetchFuture {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.base_urls
+                .lock()
+                .unwrap()
+                .push(request.base_url.clone());
+            // `/models` omits its own ETag, so without the cold-switch fence
+            // the endpoint-A ETag would be stored on the endpoint-B catalog.
+            let catalog = make_prefetched(&["endpoint-b"]);
+            Box::pin(async move { Some((catalog, None)) })
+        }
+    }
+
+    let cfg = config_from_toml(
+        r#"
+            [model.endpoint-a]
+            base_url = "https://provider-a.example/v1"
+            api_key = "a-key"
+
+            [model.endpoint-b]
+            base_url = "https://provider-b.example/v1"
+            api_key = "b-key"
+            "#,
+    );
+    let tmp = tempfile::TempDir::new().unwrap();
+    let auth_manager = Arc::new(AuthManager::new(tmp.path(), GrokComConfig::default()));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let base_urls = Arc::new(Mutex::new(Vec::new()));
+    let mgr = ModelsManagerBuilder::new(
+        None,
+        resolve_model_catalog(&cfg, None),
+        acp::ModelId::new("endpoint-a"),
+        auth_manager,
+        cfg.clone(),
+    )
+    .endpoint(Arc::new(ColdSwitchEndpoint {
+        calls: calls.clone(),
+        base_urls: base_urls.clone(),
+    }))
+    .cache(test_cache_manager(tmp.path()))
+    .build();
+    let observed_endpoint_generation = {
+        let cat = mgr.inner.catalog.read();
+        assert_eq!(cat.catalog_source, CatalogSource::Global);
+        assert!(!cat.model_endpoint_catalog_loaded);
+        cat.endpoint_generation
+    };
+
+    // Queue the endpoint-A ETag watcher behind the refresh lock, then switch
+    // to endpoint-backed model B while A's catalog is still cold.
+    let _endpoint_refresh = mgr.inner.endpoint_refresh.lock().await;
+    let stale_watcher = tokio::spawn({
+        let mgr = mgr.clone();
+        async move {
+            mgr.refresh_current_model_endpoint_inner_with_origin(
+                true,
+                Some("etag-a".to_string()),
+                Some(1),
+                Some(observed_endpoint_generation),
+            )
+            .await
+        }
+    });
+    mgr.set_current_model_id(acp::ModelId::new("endpoint-b"));
+    drop(_endpoint_refresh);
+    assert!(
+        stale_watcher.await.unwrap(),
+        "the queued endpoint watcher should refresh the new endpoint",
+    );
+
+    {
+        let cat = mgr.inner.catalog.read();
+        assert_eq!(cat.catalog_source, CatalogSource::ModelEndpoint);
+        assert!(cat.model_endpoint_catalog_loaded);
+        assert_eq!(
+            cat.catalog_owner.as_ref().map(|owner| owner.0.as_ref()),
+            Some("endpoint-b"),
+        );
+        assert_eq!(
+            cat.etag.as_deref(),
+            None,
+            "the endpoint-A ETag must not be stored on the endpoint-B catalog",
+        );
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        base_urls.lock().unwrap().as_slice(),
+        ["https://provider-b.example/v1"],
+        "the queued watcher must refresh the new endpoint, not the old one",
+    );
+
+    // A later endpoint-B notification carrying the same string must still
+    // trigger a fetch instead of being suppressed as unchanged.
+    let notify_mgr = mgr.clone();
+    tokio::spawn(async move {
+        notify_mgr.refresh_if_new_etag("etag-a".to_string()).await;
+    });
+    for _ in 0..200 {
+        if calls.load(Ordering::SeqCst) >= 2 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        2,
+        "a same-valued endpoint-B ETag notification must not be suppressed by the stale endpoint-A ETag",
+    );
+    assert_eq!(mgr.inner.catalog.read().etag.as_deref(), Some("etag-a"));
+}
+
+#[tokio::test]
 async fn set_current_model_id_change_fires_watch_to_all_subscribers() {
     let mgr = test_manager();
     let mut rx_a = mgr.subscribe_model_switch();
@@ -7052,6 +7182,7 @@ async fn explicit_reselection_clears_pending_owner_after_automatic_fallback() {
     // Explicitly re-picking the already-current fallback is a selection from
     // another source: it must drop the stale pending endpoint owner so
     // refreshes target the global catalog instead.
+    let fence_before = mgr.inner.catalog.read().endpoint_generation;
     mgr.set_current_model_id(acp::ModelId::new("grok-4"));
 
     {
@@ -7063,6 +7194,10 @@ async fn explicit_reselection_clears_pending_owner_after_automatic_fallback() {
         );
         assert_eq!(cat.catalog_source, CatalogSource::Global);
     }
+    assert!(
+        mgr.inner.catalog.read().endpoint_generation > fence_before,
+        "clearing the pending endpoint owner must advance the endpoint fence",
+    );
     assert!(
         !mgr.current_model_has_endpoint(),
         "without the pending owner the current model must not route through the old endpoint",
