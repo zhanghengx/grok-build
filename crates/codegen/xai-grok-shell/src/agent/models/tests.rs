@@ -2237,6 +2237,136 @@ async fn endpoint_etag_cold_owner_switch_discards_observed_fallback() {
 }
 
 #[tokio::test]
+async fn endpoint_etag_observed_fallback_discarded_after_catalog_reset_reuses_old_fence() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct ResetEndpoint {
+        calls: Arc<AtomicUsize>,
+    }
+    impl ModelsEndpoint for ResetEndpoint {
+        fn fetch_models(
+            &self,
+            _endpoints: config::EndpointsConfig,
+            _auth: Option<GrokAuth>,
+            _fetch_auth: ModelFetchAuth,
+        ) -> ModelsFetchFuture {
+            Box::pin(async { None })
+        }
+
+        fn fetch_model_endpoint(&self, _request: ModelEndpointRequest) -> ModelEndpointFetchFuture {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            // `/models` omits its own ETag, so without a monotonic endpoint
+            // fence the stale endpoint-A ETag would be stamped on endpoint-B.
+            Box::pin(async { Some((make_prefetched(&["endpoint-b"]), None)) })
+        }
+    }
+
+    let cfg = config_from_toml(
+        r#"
+            [model.endpoint-a]
+            base_url = "https://provider-a.example/v1"
+            api_key = "a-key"
+
+            [model.endpoint-b]
+            base_url = "https://provider-b.example/v1"
+            api_key = "b-key"
+            "#,
+    );
+    let tmp = tempfile::TempDir::new().unwrap();
+    let auth_manager = Arc::new(AuthManager::new(tmp.path(), GrokComConfig::default()));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mgr = ModelsManagerBuilder::new(
+        None,
+        resolve_model_catalog(&cfg, None),
+        acp::ModelId::new("endpoint-a"),
+        auth_manager,
+        cfg.clone(),
+    )
+    .endpoint(Arc::new(ResetEndpoint {
+        calls: calls.clone(),
+    }))
+    .cache(test_cache_manager(tmp.path()))
+    .build();
+    let observed_endpoint_generation = {
+        let mut cat = mgr.inner.catalog.write();
+        // Two cold owner switches ran the endpoint fence ahead of the catalog
+        // generation before endpoint A's catalog loaded.
+        cat.prefetched = Some(make_prefetched(&["provider-a"]));
+        cat.models = resolve_model_catalog(&cfg, cat.prefetched.clone());
+        cat.has_fetched_real_catalog = true;
+        cat.model_endpoint_catalog_loaded = true;
+        cat.catalog_source = CatalogSource::ModelEndpoint;
+        cat.catalog_owner = Some(acp::ModelId::new("endpoint-a"));
+        cat.endpoint_generation = cat.generation + 2;
+        cat.etag = Some("\"etag-a\"".to_string());
+        cat.endpoint_generation
+    };
+
+    // Queue the endpoint-A ETag watcher behind the refresh lock, then switch
+    // to endpoint B so the catalog reset must advance the fence from the
+    // previous endpoint value instead of re-deriving it from the catalog
+    // generation (which would reproduce the old token).
+    let _endpoint_refresh = mgr.inner.endpoint_refresh.lock().await;
+    let stale_watcher = tokio::spawn({
+        let mgr = mgr.clone();
+        async move {
+            mgr.refresh_current_model_endpoint_inner_with_origin(
+                true,
+                Some("etag-a".to_string()),
+                Some(1),
+                Some(observed_endpoint_generation),
+            )
+            .await
+        }
+    });
+    mgr.set_current_model_id(acp::ModelId::new("endpoint-b"));
+    drop(_endpoint_refresh);
+    assert!(
+        stale_watcher.await.unwrap(),
+        "the queued endpoint watcher should still refresh the new endpoint",
+    );
+
+    {
+        let cat = mgr.inner.catalog.read();
+        assert_eq!(cat.catalog_source, CatalogSource::ModelEndpoint);
+        assert!(cat.model_endpoint_catalog_loaded);
+        assert_eq!(
+            cat.catalog_owner.as_ref().map(|owner| owner.0.as_ref()),
+            Some("endpoint-b"),
+        );
+        assert!(
+            cat.endpoint_generation > observed_endpoint_generation,
+            "the endpoint fence must advance from its previous value, not the catalog generation",
+        );
+        assert_eq!(
+            cat.etag.as_deref(),
+            None,
+            "the endpoint-A ETag must not be stamped onto the endpoint-B catalog",
+        );
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+    // A later endpoint-B notification carrying the same string must still
+    // trigger a fetch instead of being suppressed as unchanged.
+    let notify_mgr = mgr.clone();
+    tokio::spawn(async move {
+        notify_mgr.refresh_if_new_etag("etag-a".to_string()).await;
+    });
+    for _ in 0..200 {
+        if calls.load(Ordering::SeqCst) >= 2 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        2,
+        "a same-valued endpoint-B ETag notification must not be suppressed by the stale endpoint-A ETag",
+    );
+    assert_eq!(mgr.inner.catalog.read().etag.as_deref(), Some("etag-a"));
+}
+
+#[tokio::test]
 async fn set_current_model_id_change_fires_watch_to_all_subscribers() {
     let mgr = test_manager();
     let mut rx_a = mgr.subscribe_model_switch();
@@ -6478,6 +6608,104 @@ async fn etag_refresh_waits_for_active_fetch_when_catalog_already_ready() {
     );
     assert!(mgr.has_fetched_real_catalog());
     assert!(mgr.models().contains_key("grok-4"));
+}
+
+#[tokio::test]
+async fn global_etag_refresh_survives_settings_only_config_publication() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct BlockingEndpoint {
+        calls: Arc<AtomicUsize>,
+        started: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+    impl ModelsEndpoint for BlockingEndpoint {
+        fn fetch_models(
+            &self,
+            _endpoints: config::EndpointsConfig,
+            _auth: Option<GrokAuth>,
+            _fetch_auth: ModelFetchAuth,
+        ) -> ModelsFetchFuture {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            let started = self.started.clone();
+            let release = self.release.clone();
+            let catalog = make_prefetched(&["grok-4", "new-model"]);
+            Box::pin(async move {
+                if n == 0 {
+                    started.notify_one();
+                    release.notified().await;
+                }
+                Some(catalog)
+            })
+        }
+    }
+
+    let old_cfg = config_from_toml("[endpoints]\ndeployment_key = \"deploy-key\"");
+    let calls = Arc::new(AtomicUsize::new(0));
+    let started = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let mgr = cold_manager(
+        old_cfg.clone(),
+        Arc::new(BlockingEndpoint {
+            calls: calls.clone(),
+            started: started.clone(),
+            release: release.clone(),
+        }),
+    );
+    let seed_cfg = config::Config::default();
+    assert!(
+        mgr.apply_refresh_result(
+            &seed_cfg,
+            Some(make_prefetched(&["grok-4", "legacy-model"])),
+            Some("\"etag-old\"".into())
+        ),
+        "seeding a real global catalog should succeed"
+    );
+    assert!(mgr.has_fetched_real_catalog());
+
+    // Start an ETag-triggered global refresh and hold it in flight, then
+    // publish an unrelated settings-only reload with unchanged endpoints.
+    let refresh_mgr = mgr.clone();
+    let refresh_task = tokio::spawn(async move {
+        refresh_mgr
+            .spawn_fetch_inner(Some("\"etag-new\"".to_string()), true)
+            .await;
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(5), started.notified())
+        .await
+        .expect("the global etag refresh never reached the transport");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+    let new_cfg = config_from_toml(
+        "[models]\nallowed_models = [\"grok-4\"]\n[endpoints]\ndeployment_key = \"deploy-key\"",
+    );
+    mgr.apply_config(new_cfg)
+        .expect("a settings-only reload should apply");
+
+    release.notify_one();
+    refresh_task.await.unwrap();
+
+    let mut applied = false;
+    for _ in 0..200 {
+        if mgr.inner.catalog.read().etag.as_deref() == Some("\"etag-new\"") {
+            applied = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert!(
+        applied,
+        "a settings-only config publication must not discard the in-flight global etag refresh",
+    );
+    let cat = mgr.inner.catalog.read();
+    assert!(
+        cat.models["grok-4"].info.user_selectable,
+        "the allowed model must remain selectable",
+    );
+    assert!(
+        !cat.models["new-model"].info.user_selectable,
+        "the fetched catalog must be resolved against the newly published allowlist",
+    );
 }
 
 #[tokio::test]

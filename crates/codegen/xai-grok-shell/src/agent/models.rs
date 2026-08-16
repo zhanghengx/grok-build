@@ -732,12 +732,20 @@ impl ModelsManager {
 
         let mut cfg = self.inner.cfg.write();
         *cfg = new_config.clone();
+        let old_fetch_auth = *fetch_auth;
         *fetch_auth = new_fetch_auth;
-        // A config reload can change the endpoint, credential, provider, or
-        // request metadata used by any catalog fetch already in flight.
-        // Publish the new config before advancing the fence so a refresh that
-        // observes this generation can only build a new request.
-        cat.generation += 1;
+        // A config reload can change the endpoint or auth used by a global
+        // catalog fetch already in flight. Only then must the catalog fence
+        // advance: a settings-only publication should not discard an in-flight
+        // refresh, or the retained real catalog keeps `OnlineIfUncached` from
+        // recovering and the picker stays stale until the next ETag. Publish
+        // the new config before advancing the fence so a refresh that observes
+        // this generation can only build a new request.
+        let global_fetch_shape_changed =
+            old_config.endpoints != new_config.endpoints || new_fetch_auth != old_fetch_auth;
+        if global_fetch_shape_changed {
+            cat.generation += 1;
+        }
         if endpoint_context_changed {
             cat.endpoint_generation += 1;
         }
@@ -916,13 +924,14 @@ impl ModelsManager {
                     || (returned_by_endpoint && !overlay_changes_context);
                 if !belongs_to_endpoint_catalog {
                     let generation = cat.generation + 1;
+                    let endpoint_generation = cat.endpoint_generation + 1;
                     let models = resolve_model_catalog(&cfg, None);
                     let allowlist_excludes_all = allowlist_matches_nothing(&cfg, &models);
                     *cat = CatalogState {
                         models,
                         allowlist_excludes_all,
                         generation,
-                        endpoint_generation: generation,
+                        endpoint_generation,
                         ..Default::default()
                     };
                     self.inner
@@ -1666,8 +1675,9 @@ impl ModelsManager {
                     None
                 }
             };
+            let apply_cfg = mgr.inner.cfg.read().clone();
             if !mgr.apply_refresh_result_fenced(
-                &cfg,
+                &apply_cfg,
                 new_prefetched,
                 new_etag,
                 Some(generation),
@@ -2221,8 +2231,9 @@ impl ModelsManager {
                 None
             }
         };
+        let apply_cfg = self.inner.cfg.read().clone();
         let success = self.apply_refresh_result_fenced(
-            &cfg,
+            &apply_cfg,
             new_prefetched,
             None,
             Some(generation),
