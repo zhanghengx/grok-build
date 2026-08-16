@@ -3,7 +3,7 @@
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use parking_lot::RwLock;
 
@@ -292,6 +292,12 @@ struct Inner {
     /// Serializes model-endpoint catalog refreshes so an older `/models`
     /// response cannot overwrite a newer one.
     endpoint_refresh: tokio::sync::Mutex<()>,
+    /// Monotonic sequence assigned to each endpoint ETag notification before
+    /// its refresh task is spawned, so out-of-order task execution cannot
+    /// regress the stored endpoint ETag.
+    next_endpoint_etag_seq: AtomicU64,
+    /// Highest endpoint ETag notification sequence applied so far.
+    applied_endpoint_etag_seq: AtomicU64,
     /// Serializes the global fetch start decision so `list_models` and the
     /// background retry task cannot both reserve the same catalog generation.
     global_fetch_start: tokio::sync::Mutex<()>,
@@ -493,6 +499,8 @@ impl ModelsManagerBuilder {
                 retry_in_flight: AtomicBool::new(false),
                 refresh_in_flight: AtomicBool::new(false),
                 endpoint_refresh: tokio::sync::Mutex::new(()),
+                next_endpoint_etag_seq: AtomicU64::new(0),
+                applied_endpoint_etag_seq: AtomicU64::new(0),
                 global_fetch_start: tokio::sync::Mutex::new(()),
                 fetches_in_flight: AtomicUsize::new(0),
                 active_fetch: AtomicUsize::new(0),
@@ -1126,11 +1134,20 @@ impl ModelsManager {
                 return;
             }
             tracing::info!(etag = %etag, "models etag changed, refreshing endpoint catalog");
+            // Assign the notification sequence before spawning: spawned tasks
+            // can acquire `endpoint_refresh` out of notification order, and
+            // this value lets the newer task's committed ETag win.
+            let seq = self
+                .inner
+                .next_endpoint_etag_seq
+                .fetch_add(1, Ordering::AcqRel)
+                + 1;
             let mgr = self.clone();
             tokio::task::spawn(async move {
                 mgr.refresh_current_model_endpoint_inner(
                     crate::util::config::resolve_remote_fetch_enabled(),
                     Some(etag),
+                    Some(seq),
                 )
                 .await;
             });
@@ -1207,7 +1224,7 @@ impl ModelsManager {
 
         let remote_fetch_enabled = crate::util::config::resolve_remote_fetch_enabled();
         if endpoint_configured {
-            self.refresh_current_model_endpoint_inner(remote_fetch_enabled, None)
+            self.refresh_current_model_endpoint_inner(remote_fetch_enabled, None, None)
                 .await;
         } else {
             self.fetch_and_apply_inner(remote_fetch_enabled).await;
@@ -1581,10 +1598,9 @@ impl ModelsManager {
         // used by `fetch_and_apply_inner`. If `models/list` or a background
         // fetch already owns it, join that attempt instead of racing a second
         // same-generation request whose older response could land last.
-        let started = self.reserve_global_fetch().await;
+        let (started, joined_generation) = self.reserve_global_fetch().await;
         let Some((attempt, active)) = started else {
             self.inner.refresh_in_flight.store(false, Ordering::Release);
-            let joined_generation = self.inner.catalog.read().generation;
             // Wait for the fetch we joined to finish, not just for the first
             // catalog to become ready. With a real catalog already loaded,
             // `catalog_progress` stays `Ready` during later refreshes, so the
@@ -1713,7 +1729,7 @@ impl ModelsManager {
                             // generation between the two reads and park this
                             // request behind a stale fetch that can never
                             // publish for the current config.
-                            let started = self.reserve_global_fetch().await;
+                            let (started, joined_generation) = self.reserve_global_fetch().await;
                             if let Some(started) = started {
                                 self.fetch_and_apply_reserved(started).await;
                                 // A config reload can advance the catalog
@@ -1728,7 +1744,14 @@ impl ModelsManager {
                                     self.fetch_and_apply().await;
                                 }
                             } else {
-                                self.wait_for_first_catalog().await;
+                                // Wait for the joined active generation to
+                                // finish instead of `catalog_progress`: a
+                                // config reload can advance the generation
+                                // while the joined fetch is in flight, and the
+                                // stale attempt deliberately does not publish
+                                // `Failed`, so the progress wait would sit out
+                                // the full startup budget before retrying.
+                                self.wait_for_active_generation(joined_generation).await;
                                 // The joined fetch may have been captured under
                                 // an older generation (a reload advanced it
                                 // while we waited). If it could not publish,
@@ -1840,6 +1863,7 @@ impl ModelsManager {
         self.refresh_current_model_endpoint_inner(
             crate::util::config::resolve_remote_fetch_enabled(),
             None,
+            None,
         )
         .await
     }
@@ -1848,6 +1872,7 @@ impl ModelsManager {
         &self,
         remote_fetch_enabled: bool,
         observed_etag: Option<String>,
+        observed_seq: Option<u64>,
     ) -> bool {
         if !remote_fetch_enabled {
             tracing::info!("model-specific catalog refresh skipped: remote_fetch disabled");
@@ -1857,6 +1882,15 @@ impl ModelsManager {
         // share the same generation fences, so without a queue an older
         // response could land last and overwrite a newer catalog/etag.
         let _endpoint_refresh = self.inner.endpoint_refresh.lock().await;
+        // Spawned ETag watchers can run out of notification order. Once a
+        // newer notification has committed, an older watcher's result must
+        // not overwrite it, even when the server omits its own ETag and this
+        // watcher would otherwise fall back to its observed value.
+        if let Some(seq) = observed_seq
+            && seq < self.inner.applied_endpoint_etag_seq.load(Ordering::Acquire)
+        {
+            return false;
+        }
         // A queued ETag watcher may have observed the same change as a refresh
         // that already committed while it waited for the lock. Recheck before
         // spending another auth and HTTP round trip, but only against an
@@ -1867,10 +1901,15 @@ impl ModelsManager {
             if cat.catalog_source == CatalogSource::ModelEndpoint
                 && cat.etag.as_deref() == Some(observed_etag)
             {
+                if let Some(seq) = observed_seq {
+                    self.inner
+                        .applied_endpoint_etag_seq
+                        .store(seq, Ordering::Release);
+                }
                 return true;
             }
         }
-        self.refresh_current_model_endpoint_locked(observed_etag)
+        self.refresh_current_model_endpoint_locked(observed_etag, observed_seq)
             .await
     }
 
@@ -1888,10 +1927,14 @@ impl ModelsManager {
         if self.inner.catalog.read().model_endpoint_catalog_loaded {
             return true;
         }
-        self.refresh_current_model_endpoint_locked(None).await
+        self.refresh_current_model_endpoint_locked(None, None).await
     }
 
-    async fn refresh_current_model_endpoint_locked(&self, observed_etag: Option<String>) -> bool {
+    async fn refresh_current_model_endpoint_locked(
+        &self,
+        observed_etag: Option<String>,
+        observed_seq: Option<u64>,
+    ) -> bool {
         // Capture the endpoint identity and its config fence before the
         // request: `model_endpoint_request` awaits a provider refresh, during
         // which either the current model or its endpoint configuration can
@@ -1942,6 +1985,11 @@ impl ModelsManager {
             Some(catalog_owner),
         ) {
             return false;
+        }
+        if let Some(seq) = observed_seq {
+            self.inner
+                .applied_endpoint_etag_seq
+                .store(seq, Ordering::Release);
         }
         tracing::info!("model-specific catalog refreshed");
         self.notify_models_updated();
@@ -2035,11 +2083,12 @@ impl ModelsManager {
             .await
     }
 
-    /// Reserve the current catalog generation for a global fetch. Returns
-    /// `None` when an attempt already owns that generation, so callers join
-    /// through the progress watch instead of racing a second same-generation
+    /// Reserve the current catalog generation for a global fetch. Returns the
+    /// reservation plus the generation the decision was made under. `None`
+    /// means an attempt already owns that generation, so callers join it with
+    /// `wait_for_active_generation` instead of racing a second same-generation
     /// request whose older response could land last.
-    async fn reserve_global_fetch(&self) -> Option<(FetchAttemptGuard, ActiveFetchGuard)> {
+    async fn reserve_global_fetch(&self) -> (Option<(FetchAttemptGuard, ActiveFetchGuard)>, u64) {
         let _start = self.inner.global_fetch_start.lock().await;
         let cat = self.inner.catalog.read();
         let generation = cat.generation;
@@ -2049,11 +2098,11 @@ impl ModelsManager {
             .read()
             .contains(&generation)
         {
-            return None;
+            return (None, generation);
         }
         let attempt = FetchAttemptGuard::begin_with_generation(&self.inner, generation);
         let active = ActiveFetchGuard::begin(&self.inner, generation);
-        Some((attempt, active))
+        (Some((attempt, active)), generation)
     }
 
     /// Wait until the active fetch that owns `generation` has finished. Uses a
@@ -2079,7 +2128,7 @@ impl ModelsManager {
             tracing::info!("model catalog refresh skipped: remote_fetch disabled");
             return;
         }
-        let started = self.reserve_global_fetch().await;
+        let (started, _joined_generation) = self.reserve_global_fetch().await;
         let Some(started) = started else {
             self.wait_for_first_catalog_inner(remote_fetch_enabled)
                 .await;
