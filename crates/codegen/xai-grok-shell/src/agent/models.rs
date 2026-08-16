@@ -921,6 +921,12 @@ impl ModelsManager {
                 tracing::info!(model = %id.0, "clearing pending endpoint owner after model switch");
                 cat.catalog_owner = None;
             }
+        } else if clear_pending_owner {
+            // Explicitly reselecting the already-current model is still a
+            // selection from another source (for example, after an automatic
+            // fallback retained the pending endpoint owner). Revalidate it
+            // even though the id did not change.
+            self.revalidate_pending_owner_for_selected_model(true);
         }
     }
 
@@ -2185,10 +2191,10 @@ impl ModelsManager {
                     let pending_owner_matches = !cat.model_endpoint_catalog_loaded
                         && cat.catalog_owner.as_ref() == Some(expected_owner);
                     let owner_matches = expected_owner == &*current
-                        || cat
-                            .prefetched
-                            .as_ref()
-                            .is_some_and(|models| resolve_catalog_key(models, &current).is_some())
+                        || (cat.catalog_source == CatalogSource::ModelEndpoint
+                            && cat.prefetched.as_ref().is_some_and(|models| {
+                                resolve_catalog_key(models, &current).is_some()
+                            }))
                         || pending_owner_matches;
                     if !owner_matches {
                         tracing::info!(

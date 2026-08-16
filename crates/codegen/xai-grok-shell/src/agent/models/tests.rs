@@ -6603,3 +6603,228 @@ async fn apply_config_keeps_pending_endpoint_owner_across_automatic_fallback() {
     assert!(mgr.models().contains_key("provider-model"));
     assert!(mgr.inner.catalog.read().model_endpoint_catalog_loaded);
 }
+
+#[tokio::test]
+async fn endpoint_refresh_discarded_through_global_catalog_siblings() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct BlockingEndpoint {
+        calls: Arc<AtomicUsize>,
+        started: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+    impl ModelsEndpoint for BlockingEndpoint {
+        fn fetch_models(
+            &self,
+            _endpoints: config::EndpointsConfig,
+            _auth: Option<GrokAuth>,
+            _fetch_auth: ModelFetchAuth,
+        ) -> ModelsFetchFuture {
+            Box::pin(async { None })
+        }
+
+        fn fetch_model_endpoint(&self, _request: ModelEndpointRequest) -> ModelEndpointFetchFuture {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let started = self.started.clone();
+            let release = self.release.clone();
+            let catalog = make_prefetched(&["provider-model"]);
+            Box::pin(async move {
+                started.notify_one();
+                release.notified().await;
+                Some((catalog, None))
+            })
+        }
+    }
+
+    let cfg = config_from_toml(
+        r#"
+            [model.endpoint-model]
+            base_url = "https://provider.example/v1"
+            api_key = "model-api-key"
+            "#,
+    );
+    let tmp = tempfile::TempDir::new().unwrap();
+    let auth_manager = Arc::new(AuthManager::new(tmp.path(), GrokComConfig::default()));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let started = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let mgr = ModelsManagerBuilder::new(
+        None,
+        resolve_model_catalog(&cfg, None),
+        acp::ModelId::new("endpoint-model"),
+        auth_manager,
+        cfg.clone(),
+    )
+    .endpoint(Arc::new(BlockingEndpoint {
+        calls: calls.clone(),
+        started: started.clone(),
+        release: release.clone(),
+    }))
+    .cache(test_cache_manager(tmp.path()))
+    .build();
+    // A prior global catalog load (for example, after an initial endpoint
+    // failure) populated `prefetched` with global models while the endpoint
+    // refresh is still in flight.
+    {
+        let mut cat = mgr.inner.catalog.write();
+        cat.prefetched = Some(make_prefetched(&["grok-4"]));
+        cat.models = resolve_model_catalog(&cfg, cat.prefetched.clone());
+        cat.has_fetched_real_catalog = true;
+        cat.model_endpoint_catalog_loaded = false;
+        cat.catalog_source = CatalogSource::Global;
+        cat.catalog_owner = None;
+    }
+
+    let refresh_mgr = mgr.clone();
+    let refresh_task = tokio::spawn(async move {
+        refresh_mgr
+            .refresh_current_model_endpoint_inner(true, None)
+            .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(5), started.notified())
+        .await
+        .expect("the endpoint fetch never reached the transport");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+    // Switching to a model that happens to be in the global catalog must not
+    // make the in-flight endpoint response a "sibling" of the endpoint owner.
+    mgr.set_current_model_id(acp::ModelId::new("grok-4"));
+    release.notify_one();
+    assert!(
+        !refresh_task.await.unwrap(),
+        "an endpoint result must not apply through a global catalog's prefetched entries",
+    );
+
+    let cat = mgr.inner.catalog.read();
+    assert_eq!(cat.catalog_source, CatalogSource::Global);
+    assert!(!cat.model_endpoint_catalog_loaded);
+    assert_eq!(
+        cat.catalog_owner.as_ref().map(|o| o.0.as_ref()),
+        None,
+        "no endpoint owner may be latched from the discarded response",
+    );
+    assert!(cat.models.contains_key("grok-4"));
+    assert!(
+        !cat.models.contains_key("provider-model"),
+        "the endpoint response must not replace the global catalog",
+    );
+    drop(cat);
+}
+
+#[tokio::test]
+async fn explicit_reselection_clears_pending_owner_after_automatic_fallback() {
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct RecordingEndpoint {
+        calls: Arc<AtomicUsize>,
+        base_urls: Arc<Mutex<Vec<String>>>,
+    }
+    impl ModelsEndpoint for RecordingEndpoint {
+        fn fetch_models(
+            &self,
+            _endpoints: config::EndpointsConfig,
+            _auth: Option<GrokAuth>,
+            _fetch_auth: ModelFetchAuth,
+        ) -> ModelsFetchFuture {
+            Box::pin(async { None })
+        }
+
+        fn fetch_model_endpoint(&self, request: ModelEndpointRequest) -> ModelEndpointFetchFuture {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.base_urls
+                .lock()
+                .unwrap()
+                .push(request.base_url.clone());
+            Box::pin(async { Some((make_prefetched(&["provider-model"]), None)) })
+        }
+    }
+
+    let old_cfg = config_from_toml(
+        r#"
+            [models]
+            default = "grok-4"
+
+            [model.endpoint-model]
+            model = "provider-model"
+            base_url = "https://provider.example/v1"
+            api_key = "model-api-key"
+
+            [model.grok-4]
+            model = "grok-4"
+            "#,
+    );
+    let tmp = tempfile::TempDir::new().unwrap();
+    let auth_manager = Arc::new(AuthManager::new(tmp.path(), GrokComConfig::default()));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let base_urls = Arc::new(Mutex::new(Vec::new()));
+    let mgr = ModelsManagerBuilder::new(
+        None,
+        resolve_model_catalog(&old_cfg, None),
+        acp::ModelId::new("endpoint-model"),
+        auth_manager,
+        old_cfg.clone(),
+    )
+    .endpoint(Arc::new(RecordingEndpoint {
+        calls: calls.clone(),
+        base_urls: base_urls.clone(),
+    }))
+    .cache(test_cache_manager(tmp.path()))
+    .build();
+    {
+        let mut cat = mgr.inner.catalog.write();
+        cat.prefetched = Some(make_prefetched(&["provider-model"]));
+        cat.models = resolve_model_catalog(&old_cfg, cat.prefetched.clone());
+        cat.has_fetched_real_catalog = true;
+        cat.model_endpoint_catalog_loaded = true;
+        cat.catalog_source = CatalogSource::ModelEndpoint;
+        cat.catalog_owner = Some(acp::ModelId::new("endpoint-model"));
+    }
+    mgr.set_current_model_id(acp::ModelId::new("provider-model"));
+
+    let new_cfg = config_from_toml(
+        r#"
+            [models]
+            default = "grok-4"
+
+            [model.endpoint-model]
+            model = "provider-model"
+            base_url = "https://new-provider.example/v1"
+            api_key = "new-api-key"
+
+            [model.grok-4]
+            model = "grok-4"
+            "#,
+    );
+    mgr.apply_config(new_cfg)
+        .expect("endpoint context reload should apply");
+
+    {
+        let cat = mgr.inner.catalog.read();
+        assert_eq!(mgr.current_model_id().0.as_ref(), "grok-4");
+        assert_eq!(
+            cat.catalog_owner.as_ref().map(|o| o.0.as_ref()),
+            Some("endpoint-model"),
+            "the automatic fallback must still retain the pending owner before an explicit pick",
+        );
+    }
+
+    // Explicitly re-picking the already-current fallback is a selection from
+    // another source: it must drop the stale pending endpoint owner so
+    // refreshes target the global catalog instead.
+    mgr.set_current_model_id(acp::ModelId::new("grok-4"));
+
+    {
+        let cat = mgr.inner.catalog.read();
+        assert_eq!(
+            cat.catalog_owner.as_ref().map(|o| o.0.as_ref()),
+            None,
+            "an explicit pick of the fallback must clear the retained pending owner",
+        );
+        assert_eq!(cat.catalog_source, CatalogSource::Global);
+    }
+    assert!(
+        !mgr.current_model_has_endpoint(),
+        "without the pending owner the current model must not route through the old endpoint",
+    );
+}
