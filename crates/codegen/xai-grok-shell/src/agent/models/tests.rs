@@ -3959,6 +3959,123 @@ fn apply_config_preserves_unchanged_endpoint_catalog() {
     drop(cat);
 }
 
+#[tokio::test]
+async fn apply_config_switches_owner_to_selected_returned_slug_overlay_endpoint() {
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct RecordingEndpoint {
+        calls: Arc<AtomicUsize>,
+        base_urls: Arc<Mutex<Vec<String>>>,
+    }
+    impl ModelsEndpoint for RecordingEndpoint {
+        fn fetch_models(
+            &self,
+            _endpoints: config::EndpointsConfig,
+            _auth: Option<GrokAuth>,
+            _fetch_auth: ModelFetchAuth,
+        ) -> ModelsFetchFuture {
+            Box::pin(async { None })
+        }
+
+        fn fetch_model_endpoint(&self, request: ModelEndpointRequest) -> ModelEndpointFetchFuture {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.base_urls
+                .lock()
+                .unwrap()
+                .push(request.base_url.clone());
+            Box::pin(async { Some((make_prefetched(&["provider-model"]), None)) })
+        }
+    }
+
+    let old_cfg = config_from_toml(
+        r#"
+            [model.endpoint-model]
+            base_url = "https://provider.example/v1"
+            api_key = "model-api-key"
+            "#,
+    );
+    let tmp = tempfile::TempDir::new().unwrap();
+    let auth_manager = Arc::new(AuthManager::new(tmp.path(), GrokComConfig::default()));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let base_urls = Arc::new(Mutex::new(Vec::new()));
+    let mgr = ModelsManagerBuilder::new(
+        None,
+        resolve_model_catalog(&old_cfg, None),
+        acp::ModelId::new("endpoint-model"),
+        auth_manager,
+        old_cfg.clone(),
+    )
+    .endpoint(Arc::new(RecordingEndpoint {
+        calls: calls.clone(),
+        base_urls: base_urls.clone(),
+    }))
+    .cache(test_cache_manager(tmp.path()))
+    .build();
+    let mut prefetched = make_prefetched(&["provider-model", "provider-sibling"]);
+    for entry in prefetched.values_mut() {
+        entry.api_key = Some("endpoint-api-key".to_string());
+    }
+    {
+        let mut cat = mgr.inner.catalog.write();
+        cat.prefetched = Some(prefetched.clone());
+        cat.models = resolve_model_catalog(&old_cfg, Some(prefetched));
+        cat.has_fetched_real_catalog = true;
+        cat.model_endpoint_catalog_loaded = true;
+        cat.catalog_source = CatalogSource::ModelEndpoint;
+        cat.catalog_owner = Some(acp::ModelId::new("endpoint-model"));
+    }
+    mgr.set_current_model_id(acp::ModelId::new("provider-model"));
+
+    let new_cfg = config_from_toml(
+        r#"
+            [model.endpoint-model]
+            base_url = "https://provider.example/v1"
+            api_key = "model-api-key"
+
+            [model.provider-model]
+            base_url = "https://own.example/v1"
+            api_key = "own-api-key"
+            "#,
+    );
+    mgr.apply_config(new_cfg)
+        .expect("config reload should apply");
+
+    {
+        let cat = mgr.inner.catalog.read();
+        assert_eq!(cat.catalog_source, CatalogSource::Global);
+        assert!(!cat.model_endpoint_catalog_loaded);
+        assert_eq!(
+            cat.catalog_owner.as_ref().map(|o| o.0.as_ref()),
+            Some("provider-model"),
+            "the pending owner must switch to the selected slug's own endpoint",
+        );
+        assert!(
+            !cat.models.contains_key("provider-sibling"),
+            "the old endpoint catalog must not be retained when the selected overlay changes context",
+        );
+        assert_eq!(
+            cat.models["provider-model"].api_key.as_deref(),
+            Some("own-api-key"),
+        );
+    }
+
+    assert!(
+        mgr.current_model_has_endpoint(),
+        "the selected slug's own endpoint must remain the refresh target",
+    );
+    assert!(
+        mgr.refresh_current_model_endpoint_inner(true, None).await,
+        "the replacement fetch must target the selected slug's own endpoint",
+    );
+    assert_eq!(
+        base_urls.lock().unwrap().as_slice(),
+        ["https://own.example/v1"],
+        "the replacement must query the overlay endpoint, not the previous owner",
+    );
+    assert!(mgr.models().contains_key("provider-model"));
+}
+
 #[test]
 fn apply_config_rejects_invalid_allowlist_for_retained_endpoint_catalog() {
     let old_cfg = config_from_toml(
@@ -5966,16 +6083,138 @@ async fn etag_refresh_waits_for_active_fetch_when_catalog_already_ready() {
     release.notify_one();
     fetch_task.await.unwrap();
     etag_task.await.unwrap();
+
+    // The join/replay now runs in a background task, so wait for the replayed
+    // fetch instead of assuming it completed with `refresh_if_new_etag`.
+    let mut replayed = false;
+    for _ in 0..200 {
+        if mgr.inner.catalog.read().etag.as_deref() == Some("\"etag-new\"") {
+            replayed = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert!(
+        replayed,
+        "after the active fetch finishes, the etag change must be replayed",
+    );
     assert_eq!(
         calls.load(Ordering::SeqCst),
         2,
-        "after the active fetch finishes, the etag change must be replayed",
+        "replaying the etag change must issue a fresh fetch",
     );
     assert_eq!(
         mgr.inner.catalog.read().etag.as_deref(),
         Some("\"etag-new\""),
     );
     assert!(mgr.has_fetched_real_catalog());
+    assert!(mgr.models().contains_key("grok-4"));
+}
+
+#[tokio::test]
+async fn etag_refresh_does_not_block_sampling_path_behind_active_fetch() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct FirstBlockingGlobalEndpoint {
+        calls: Arc<AtomicUsize>,
+        started: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+    impl ModelsEndpoint for FirstBlockingGlobalEndpoint {
+        fn fetch_models(
+            &self,
+            _endpoints: config::EndpointsConfig,
+            _auth: Option<GrokAuth>,
+            _fetch_auth: ModelFetchAuth,
+        ) -> ModelsFetchFuture {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            let started = self.started.clone();
+            let release = self.release.clone();
+            let catalog = make_prefetched(&["grok-4"]);
+            Box::pin(async move {
+                if n == 0 {
+                    started.notify_one();
+                    release.notified().await;
+                }
+                Some(catalog)
+            })
+        }
+
+        fn fetch_model_endpoint(&self, _request: ModelEndpointRequest) -> ModelEndpointFetchFuture {
+            Box::pin(async { None })
+        }
+    }
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let started = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let mgr = cold_manager(
+        config_from_toml("[endpoints]\ndeployment_key = \"deploy-key\""),
+        Arc::new(FirstBlockingGlobalEndpoint {
+            calls: calls.clone(),
+            started: started.clone(),
+            release: release.clone(),
+        }),
+    );
+    let cfg = config::Config::default();
+    assert!(
+        mgr.apply_refresh_result(
+            &cfg,
+            Some(make_prefetched(&["grok-4"])),
+            Some("\"etag-old\"".into())
+        ),
+        "seeding a real catalog should succeed"
+    );
+    assert!(mgr.has_fetched_real_catalog());
+
+    let fetch_mgr = mgr.clone();
+    let fetch_task = tokio::spawn(async move {
+        fetch_mgr.fetch_and_apply_inner(true).await;
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(5), started.notified())
+        .await
+        .expect("the global fetch never reached the transport");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+    // The sampling-event drainer calls `refresh_if_new_etag` inline; it must
+    // return promptly while the active fetch is still registered instead of
+    // waiting out the full auth+fetch startup bounds.
+    tokio::time::timeout(
+        std::time::Duration::from_millis(100),
+        mgr.refresh_if_new_etag("\"etag-new\"".to_string()),
+    )
+    .await
+    .expect("etag refresh must not block the sampling path behind an active fetch");
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "the etag refresh must join, not race, the active fetch",
+    );
+
+    release.notify_one();
+    fetch_task.await.unwrap();
+
+    let mut replayed = false;
+    for _ in 0..200 {
+        if mgr.inner.catalog.read().etag.as_deref() == Some("\"etag-new\"") {
+            replayed = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert!(
+        replayed,
+        "the background replay must complete after the active fetch",
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        2,
+        "replaying the etag change must issue a fresh fetch",
+    );
+    assert_eq!(
+        mgr.inner.catalog.read().etag.as_deref(),
+        Some("\"etag-new\""),
+    );
     assert!(mgr.models().contains_key("grok-4"));
 }
 

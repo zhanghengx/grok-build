@@ -639,19 +639,45 @@ impl ModelsManager {
         // context is unchanged; otherwise drop them and let the caller refetch
         // so dynamically discovered models never disappear silently.
         let endpoint_catalog_active = catalog_source == CatalogSource::ModelEndpoint;
-        let endpoint_catalog_invalidated = endpoint_catalog_active
-            && !catalog_owner.as_ref().is_some_and(|owner| {
-                !model_endpoint_changed(&old_config, &new_config, owner.0.as_ref())
+        // A returned slug that gains its own endpoint or credentials through a
+        // config overlay no longer belongs to the endpoint catalog: sampling
+        // routes through the overlay, so retaining the old owner would keep
+        // refreshing the previous endpoint. Compare the selected entry's
+        // resolved connection context across the publication.
+        let selected_overlay_changed_context = endpoint_catalog_active
+            && prefetched.as_ref().is_some_and(|prefetched| {
+                let current = acp::ModelId::new(Arc::from(current_model_key.clone()));
+                if !resolve_catalog_key(prefetched, &current).is_some() {
+                    return false;
+                }
+                let prefetched = prefetched.clone();
+                let old_resolved = resolve_model_catalog(&old_config, Some(prefetched.clone()));
+                let new_resolved = resolve_model_catalog(&new_config, Some(prefetched));
+                let old_entry = resolve_catalog_key(&old_resolved, &current)
+                    .and_then(|key| old_resolved.get(key.0.as_ref()));
+                let new_entry = resolve_catalog_key(&new_resolved, &current)
+                    .and_then(|key| new_resolved.get(key.0.as_ref()));
+                match (old_entry, new_entry) {
+                    (Some(old_entry), Some(new_entry)) => {
+                        endpoint_entry_context_differs(old_entry, new_entry)
+                    }
+                    _ => false,
+                }
             });
+        let endpoint_catalog_invalidated = endpoint_catalog_active
+            && (selected_overlay_changed_context
+                || !catalog_owner.as_ref().is_some_and(|owner| {
+                    !model_endpoint_changed(&old_config, &new_config, owner.0.as_ref())
+                }));
         // A settings-only publication must not invalidate an in-flight
         // model-endpoint fetch, but a change to the endpoint connection
         // context must. Before the endpoint catalog loads, the current model
         // id is the fetch's owner.
-        let endpoint_context_changed = {
+        let endpoint_context_changed = selected_overlay_changed_context || {
             let owner_key = catalog_owner
                 .as_ref()
                 .map(|owner| owner.0.as_ref().to_string())
-                .unwrap_or(current_model_key);
+                .unwrap_or_else(|| current_model_key.clone());
             model_endpoint_changed(&old_config, &new_config, &owner_key)
         };
         let endpoint_catalog_still_valid = endpoint_catalog_active && !endpoint_catalog_invalidated;
@@ -666,9 +692,23 @@ impl ModelsManager {
         // context changes (or a replacement is already pending) and the new
         // config still configures that endpoint. A stale owner whose endpoint
         // was removed must be cleared, otherwise every global result stays
-        // fenced and the catalog can never recover.
+        // fenced and the catalog can never recover. When the selected returned
+        // slug gains its own endpoint, point the pending refresh at that model
+        // instead of the previous owner.
         let pending_endpoint_owner = if endpoint_catalog_active && !endpoint_catalog_invalidated {
             catalog_owner
+        } else if selected_overlay_changed_context {
+            let current = acp::ModelId::new(Arc::from(current_model_key.clone()));
+            if pending_endpoint_owner_configured(&new_config, &new_catalog, &current) {
+                Some(current)
+            } else {
+                catalog_owner
+                    .as_ref()
+                    .filter(|owner| {
+                        pending_endpoint_owner_configured(&new_config, &new_catalog, owner)
+                    })
+                    .cloned()
+            }
         } else {
             catalog_owner
                 .as_ref()
@@ -1099,7 +1139,14 @@ impl ModelsManager {
             return;
         }
         tracing::info!(etag = %etag, "models etag changed, refreshing");
-        self.spawn_fetch(Some(etag)).await;
+        // Keep the serial sampling-event drainer off the refresh path: an
+        // ETag change can arrive while a startup/global fetch owns the
+        // generation, and joining it can block for the full auth+fetch bounds.
+        // Run the join/replay in a background task, matching the endpoint path.
+        let mgr = self.clone();
+        tokio::task::spawn(async move {
+            mgr.spawn_fetch(Some(etag)).await;
+        });
     }
 
     /// Auth identity changed: invalidate the disk cache and refresh the catalog.
