@@ -1174,23 +1174,32 @@ impl ModelsManager {
             let cat = self.inner.catalog.read();
             let catalog_is_endpoint_owned = cat.catalog_source == CatalogSource::ModelEndpoint;
             let endpoint_owned = match emitting_model.as_ref() {
-                Some(model) => match cat.catalog_owner.as_ref() {
-                    // The ETag belongs to the tracked endpoint only when it
-                    // came from its configured owner or from a model its
-                    // `/models` response returned. Anything else is scoped to
-                    // the global resource.
-                    Some(owner) => {
-                        owner == model
-                            || (catalog_is_endpoint_owned
-                                && cat.prefetched.as_ref().is_some_and(|models| {
-                                    resolve_catalog_key(models, model).is_some()
-                                }))
+                Some(model) => {
+                    // The session emits the routing slug (`SamplingConfig.model`),
+                    // which can differ from the configured key (`[model.alias]
+                    // model = "provider-slug"`). Resolve it back to its catalog
+                    // key before classifying the ETag so a cold configured
+                    // endpoint is not misrouted to the global fetch.
+                    let resolved =
+                        resolve_catalog_key(&cat.models, model).unwrap_or_else(|| model.clone());
+                    match cat.catalog_owner.as_ref() {
+                        // The ETag belongs to the tracked endpoint only when it
+                        // came from its configured owner or from a model its
+                        // `/models` response returned. Anything else is scoped to
+                        // the global resource.
+                        Some(owner) => {
+                            owner == &resolved
+                                || (catalog_is_endpoint_owned
+                                    && cat.prefetched.as_ref().is_some_and(|models| {
+                                        resolve_catalog_key(models, &resolved).is_some()
+                                    }))
+                        }
+                        None => {
+                            &resolved == &*self.inner.current_model_id.read()
+                                && self.model_has_endpoint(&resolved)
+                        }
                     }
-                    None => {
-                        model == &*self.inner.current_model_id.read()
-                            && self.model_has_endpoint(model)
-                    }
-                },
+                }
                 None => {
                     catalog_is_endpoint_owned
                         || (!cat.model_endpoint_catalog_loaded
@@ -1232,7 +1241,10 @@ impl ModelsManager {
             });
             return;
         }
-        if same_etag {
+        // The stored ETag only suppresses a global refresh when the resident
+        // catalog is itself the global resource. An endpoint catalog's ETag is
+        // scoped to the endpoint, so equality must not renew the global cache.
+        if same_etag && !catalog_is_endpoint_owned {
             let fetch_auth = *self.inner.fetch_auth.read();
             self.inner
                 .cache
@@ -2238,10 +2250,14 @@ impl ModelsManager {
             tracing::info!("model catalog refresh skipped: remote_fetch disabled");
             return;
         }
-        let (started, _joined_generation) = self.reserve_global_fetch().await;
+        let (started, joined_generation) = self.reserve_global_fetch().await;
         let Some(started) = started else {
-            self.wait_for_first_catalog_inner(remote_fetch_enabled)
-                .await;
+            // Wait for the joined active generation to finish, not just for the
+            // first catalog to become ready: once a real catalog is loaded,
+            // `catalog_progress` stays `Ready` during later refreshes, so the
+            // old wait returned immediately and this caller could complete and
+            // notify with the stale catalog while the shared fetch still ran.
+            self.wait_for_active_generation(joined_generation).await;
             return;
         };
         self.fetch_and_apply_reserved(started).await;
