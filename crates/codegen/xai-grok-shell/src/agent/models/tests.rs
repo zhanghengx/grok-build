@@ -528,7 +528,7 @@ fn stale_fetch_result_is_discarded_after_identity_change() {
     mgr.clear();
 
     assert!(!mgr.apply_refresh_result_fenced(
-        &cfg,
+        None,
         Some(make_prefetched(&["stale-model"])),
         None,
         Some(stale_generation),
@@ -541,7 +541,7 @@ fn stale_fetch_result_is_discarded_after_identity_change() {
     assert!(!mgr.has_fetched_real_catalog());
 
     assert!(!mgr.apply_refresh_result_fenced(
-        &cfg,
+        None,
         None,
         None,
         Some(stale_generation),
@@ -574,7 +574,7 @@ fn global_refresh_cannot_replace_model_endpoint_catalog() {
 
     let generation = mgr.inner.catalog.read().generation;
     assert!(!mgr.apply_refresh_result_fenced(
-        &cfg,
+        None,
         Some(make_prefetched(&["global-model"])),
         None,
         Some(generation),
@@ -1234,7 +1234,8 @@ async fn refresh_if_new_etag_skips_when_same() {
     let mgr = test_manager();
     mgr.inner.catalog.write().etag = Some("\"abc123\"".to_string());
 
-    mgr.refresh_if_new_etag("\"abc123\"".to_string()).await;
+    mgr.refresh_if_new_etag("\"abc123\"".to_string(), None)
+        .await;
     assert_eq!(
         mgr.inner.catalog.read().etag.as_deref(),
         Some("\"abc123\""),
@@ -1305,7 +1306,8 @@ async fn etag_refresh_routes_to_endpoint_catalog_owner() {
         cat.etag = Some("\"etag-old\"".to_string());
     }
 
-    mgr.refresh_if_new_etag("\"etag-new\"".to_string()).await;
+    mgr.refresh_if_new_etag("\"etag-new\"".to_string(), None)
+        .await;
 
     for _ in 0..100 {
         if mgr.inner.catalog.read().etag.as_deref() == Some("\"etag-new\"") {
@@ -1332,7 +1334,8 @@ async fn etag_refresh_routes_to_endpoint_catalog_owner() {
     assert!(mgr.inner.catalog.read().model_endpoint_catalog_loaded);
     assert!(mgr.models().contains_key("provider-model"));
 
-    mgr.refresh_if_new_etag("\"etag-new\"".to_string()).await;
+    mgr.refresh_if_new_etag("\"etag-new\"".to_string(), None)
+        .await;
     assert_eq!(
         endpoint_calls.load(Ordering::SeqCst),
         1,
@@ -1393,7 +1396,8 @@ async fn etag_refresh_routes_cold_configured_endpoint_to_endpoint_fetch() {
     .cache(test_cache_manager(tmp.path()))
     .build();
 
-    mgr.refresh_if_new_etag("\"etag-new\"".to_string()).await;
+    mgr.refresh_if_new_etag("\"etag-new\"".to_string(), None)
+        .await;
 
     for _ in 0..100 {
         if mgr.inner.catalog.read().etag.as_deref() == Some("\"etag-new\"") {
@@ -1480,7 +1484,7 @@ async fn etag_refresh_cold_endpoint_fetches_even_when_global_etag_matches() {
         cat.etag = Some("\"same\"".to_string());
     }
 
-    mgr.refresh_if_new_etag("\"same\"".to_string()).await;
+    mgr.refresh_if_new_etag("\"same\"".to_string(), None).await;
 
     for _ in 0..100 {
         if mgr.inner.catalog.read().catalog_source == CatalogSource::ModelEndpoint {
@@ -1586,7 +1590,8 @@ async fn etag_refresh_uses_catalog_owner_when_current_is_returned_slug() {
         "the endpoint-returned slug must remain owned by the configured endpoint",
     );
 
-    mgr.refresh_if_new_etag("\"etag-new\"".to_string()).await;
+    mgr.refresh_if_new_etag("\"etag-new\"".to_string(), None)
+        .await;
 
     for _ in 0..100 {
         if mgr.inner.catalog.read().etag.as_deref() == Some("\"etag-new\"") {
@@ -1641,7 +1646,7 @@ async fn endpoint_owned_same_etag_does_not_renew_global_cache() {
     );
     let before = std::fs::read(&mgr.inner.cache.path).unwrap();
 
-    mgr.refresh_if_new_etag("\"same\"".to_string()).await;
+    mgr.refresh_if_new_etag("\"same\"".to_string(), None).await;
 
     let after = std::fs::read(&mgr.inner.cache.path).unwrap();
     assert_eq!(
@@ -2090,7 +2095,9 @@ async fn endpoint_etag_observed_fallback_discarded_after_endpoint_switch() {
     // trigger a fetch instead of being suppressed as unchanged.
     let notify_mgr = mgr.clone();
     tokio::spawn(async move {
-        notify_mgr.refresh_if_new_etag("etag-a".to_string()).await;
+        notify_mgr
+            .refresh_if_new_etag("etag-a".to_string(), None)
+            .await;
     });
     for _ in 0..200 {
         if calls.load(Ordering::SeqCst) >= 2 {
@@ -2220,7 +2227,9 @@ async fn endpoint_etag_cold_owner_switch_discards_observed_fallback() {
     // trigger a fetch instead of being suppressed as unchanged.
     let notify_mgr = mgr.clone();
     tokio::spawn(async move {
-        notify_mgr.refresh_if_new_etag("etag-a".to_string()).await;
+        notify_mgr
+            .refresh_if_new_etag("etag-a".to_string(), None)
+            .await;
     });
     for _ in 0..200 {
         if calls.load(Ordering::SeqCst) >= 2 {
@@ -2350,7 +2359,9 @@ async fn endpoint_etag_observed_fallback_discarded_after_catalog_reset_reuses_ol
     // trigger a fetch instead of being suppressed as unchanged.
     let notify_mgr = mgr.clone();
     tokio::spawn(async move {
-        notify_mgr.refresh_if_new_etag("etag-a".to_string()).await;
+        notify_mgr
+            .refresh_if_new_etag("etag-a".to_string(), None)
+            .await;
     });
     for _ in 0..200 {
         if calls.load(Ordering::SeqCst) >= 2 {
@@ -3521,7 +3532,7 @@ async fn etag_refresh_joins_in_flight_global_fetch() {
     let etag_mgr = mgr.clone();
     let etag_task = tokio::spawn(async move {
         etag_mgr
-            .refresh_if_new_etag("\"etag-new\"".to_string())
+            .refresh_if_new_etag("\"etag-new\"".to_string(), None)
             .await;
     });
     tokio::task::yield_now().await;
@@ -4278,7 +4289,7 @@ fn switching_current_model_invalidates_endpoint_catalog_cache() {
 
     assert!(
         !mgr.apply_refresh_result_fenced(
-            &cfg,
+            None,
             Some(make_prefetched(&["stale-global-model"])),
             None,
             Some(stale_generation),
@@ -5098,7 +5109,7 @@ fn apply_config_revalidates_pending_endpoint_owner() {
     let generation = mgr.inner.catalog.read().generation;
     assert!(
         mgr.apply_refresh_result_fenced(
-            &new_cfg,
+            None,
             Some(make_prefetched(&["global-model"])),
             None,
             Some(generation),
@@ -6569,7 +6580,7 @@ async fn etag_refresh_waits_for_active_fetch_when_catalog_already_ready() {
     let etag_mgr = mgr.clone();
     let etag_task = tokio::spawn(async move {
         etag_mgr
-            .refresh_if_new_etag("\"etag-new\"".to_string())
+            .refresh_if_new_etag("\"etag-new\"".to_string(), None)
             .await;
     });
     tokio::task::yield_now().await;
@@ -6778,7 +6789,7 @@ async fn etag_refresh_does_not_block_sampling_path_behind_active_fetch() {
     // waiting out the full auth+fetch startup bounds.
     tokio::time::timeout(
         std::time::Duration::from_millis(100),
-        mgr.refresh_if_new_etag("\"etag-new\"".to_string()),
+        mgr.refresh_if_new_etag("\"etag-new\"".to_string(), None),
     )
     .await
     .expect("etag refresh must not block the sampling path behind an active fetch");
@@ -7429,5 +7440,221 @@ async fn explicit_reselection_clears_pending_owner_after_automatic_fallback() {
     assert!(
         !mgr.current_model_has_endpoint(),
         "without the pending owner the current model must not route through the old endpoint",
+    );
+}
+
+// ── config publication lock / ETag routing / owner-filter invalidation ──
+
+#[test]
+fn global_refresh_resolves_against_latest_published_config() {
+    let old_cfg = config_from_toml("[endpoints]\ndeployment_key = \"deploy-key\"");
+    let mgr = cold_manager(old_cfg.clone(), Arc::new(FailingEndpoint));
+    let seed_cfg = config::Config::default();
+    assert!(
+        mgr.apply_refresh_result(
+            &seed_cfg,
+            Some(make_prefetched(&["grok-4", "legacy-model"])),
+            Some("\"etag-old\"".into()),
+        ),
+        "seeding a real global catalog should succeed",
+    );
+
+    // A settings-only publication lands after the fetch's request snapshot was
+    // taken. The apply must resolve against the published allowlist, not the
+    // stale snapshot captured before the catalog lock.
+    let new_cfg = config_from_toml(
+        "[models]\nallowed_models = [\"grok-4\"]\n[endpoints]\ndeployment_key = \"deploy-key\"",
+    );
+    mgr.apply_config(new_cfg)
+        .expect("a settings-only reload should apply");
+
+    let generation = mgr.inner.catalog.read().generation;
+    assert!(mgr.apply_refresh_result_fenced(
+        None,
+        Some(make_prefetched(&["grok-4", "new-model"])),
+        Some("\"etag-new\"".into()),
+        Some(generation),
+        None,
+        None,
+        CatalogSource::Global,
+        None,
+    ));
+
+    let cat = mgr.inner.catalog.read();
+    assert!(
+        cat.models["grok-4"].info.user_selectable,
+        "the allowed model must remain selectable",
+    );
+    assert!(
+        !cat.models["new-model"].info.user_selectable,
+        "the fetched catalog must be resolved against the config published while the fetch was in flight",
+    );
+}
+
+#[tokio::test]
+async fn global_session_etag_is_not_stamped_on_endpoint_catalog() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct DualEndpoint {
+        global_calls: Arc<AtomicUsize>,
+        endpoint_calls: Arc<AtomicUsize>,
+    }
+    impl ModelsEndpoint for DualEndpoint {
+        fn fetch_models(
+            &self,
+            _endpoints: config::EndpointsConfig,
+            _auth: Option<GrokAuth>,
+            _fetch_auth: ModelFetchAuth,
+        ) -> ModelsFetchFuture {
+            self.global_calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Some(make_prefetched(&["grok-4"])) })
+        }
+
+        fn fetch_model_endpoint(&self, _request: ModelEndpointRequest) -> ModelEndpointFetchFuture {
+            self.endpoint_calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async {
+                Some((
+                    make_prefetched(&["endpoint-model"]),
+                    Some("\"endpoint-new\"".into()),
+                ))
+            })
+        }
+    }
+
+    let old_cfg = config_from_toml(
+        r#"
+            [model.endpoint-model]
+            base_url = "https://provider.example/v1"
+            api_key = "model-api-key"
+            [endpoints]
+            deployment_key = "deploy-key"
+            "#,
+    );
+    let global_calls = Arc::new(AtomicUsize::new(0));
+    let endpoint_calls = Arc::new(AtomicUsize::new(0));
+    let tmp = tempfile::TempDir::new().unwrap();
+    let auth_manager = Arc::new(AuthManager::new(tmp.path(), GrokComConfig::default()));
+    let mgr = ModelsManagerBuilder::new(
+        None,
+        IndexMap::new(),
+        acp::ModelId::new("endpoint-model"),
+        auth_manager,
+        old_cfg.clone(),
+    )
+    .endpoint(Arc::new(DualEndpoint {
+        global_calls: global_calls.clone(),
+        endpoint_calls: endpoint_calls.clone(),
+    }))
+    .cache(test_cache_manager(tmp.path()))
+    .build();
+    {
+        let mut cat = mgr.inner.catalog.write();
+        cat.prefetched = Some(make_prefetched(&["endpoint-model"]));
+        cat.models = resolve_model_catalog(&old_cfg, cat.prefetched.clone());
+        cat.has_fetched_real_catalog = true;
+        cat.model_endpoint_catalog_loaded = true;
+        cat.catalog_source = CatalogSource::ModelEndpoint;
+        cat.catalog_owner = Some(acp::ModelId::new("endpoint-model"));
+        cat.etag = Some("\"endpoint-etag\"".to_string());
+    }
+
+    // A session on the global model emits an ETag while the process default
+    // owns an endpoint catalog. It must not refresh or stamp the endpoint.
+    mgr.refresh_if_new_etag(
+        "\"global-etag\"".to_string(),
+        Some(acp::ModelId::new("grok-4")),
+    )
+    .await;
+    for _ in 0..200 {
+        if global_calls.load(Ordering::SeqCst) > 0 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(endpoint_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        mgr.inner.catalog.read().etag.as_deref(),
+        Some("\"endpoint-etag\""),
+        "the endpoint catalog must not absorb a global ETag",
+    );
+
+    // An ETag emitted by the endpoint owner itself still routes to the
+    // endpoint catalog.
+    mgr.refresh_if_new_etag(
+        "\"endpoint-new\"".to_string(),
+        Some(acp::ModelId::new("endpoint-model")),
+    )
+    .await;
+    for _ in 0..200 {
+        if endpoint_calls.load(Ordering::SeqCst) > 0 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(endpoint_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        mgr.inner.catalog.read().etag.as_deref(),
+        Some("\"endpoint-new\""),
+        "an owner-emitted ETag must still refresh the endpoint catalog",
+    );
+}
+
+#[test]
+fn apply_config_invalidates_endpoint_catalog_when_filter_removes_owner() {
+    let old_cfg = config_from_toml(
+        r#"
+            [model.endpoint-model]
+            base_url = "https://provider.example/v1"
+            api_key = "model-api-key"
+            "#,
+    );
+    let tmp = tempfile::TempDir::new().unwrap();
+    let auth_manager = Arc::new(AuthManager::new(tmp.path(), GrokComConfig::default()));
+    let mgr = ModelsManagerBuilder::new(
+        None,
+        resolve_model_catalog(&old_cfg, None),
+        acp::ModelId::new("endpoint-model"),
+        auth_manager,
+        old_cfg.clone(),
+    )
+    .cache(test_cache_manager(tmp.path()))
+    .build();
+    {
+        let mut cat = mgr.inner.catalog.write();
+        cat.prefetched = Some(make_prefetched(&["endpoint-model", "sibling-model"]));
+        cat.models = resolve_model_catalog(&old_cfg, cat.prefetched.clone());
+        cat.has_fetched_real_catalog = true;
+        cat.model_endpoint_catalog_loaded = true;
+        cat.catalog_source = CatalogSource::ModelEndpoint;
+        cat.catalog_owner = Some(acp::ModelId::new("endpoint-model"));
+    }
+    let endpoint_generation_before = mgr.inner.catalog.read().endpoint_generation;
+
+    let new_cfg = config_from_toml(
+        r#"
+            [models]
+            disabled_models = ["endpoint-model"]
+            [model.endpoint-model]
+            base_url = "https://provider.example/v1"
+            api_key = "model-api-key"
+            "#,
+    );
+    mgr.apply_config(new_cfg)
+        .expect("config reload should apply");
+
+    let cat = mgr.inner.catalog.read();
+    assert_eq!(cat.catalog_source, CatalogSource::Global);
+    assert!(!cat.model_endpoint_catalog_loaded);
+    assert_eq!(
+        cat.catalog_owner.as_ref().map(|o| o.0.as_ref()),
+        None,
+        "a disabled owner must not stay as the pending endpoint owner",
+    );
+    assert!(cat.prefetched.is_none());
+    assert!(!cat.models.contains_key("endpoint-model"));
+    assert!(!cat.models.contains_key("sibling-model"));
+    assert!(
+        cat.endpoint_generation > endpoint_generation_before,
+        "removing the owner must advance the endpoint fence so stale refreshes cannot reapply",
     );
 }

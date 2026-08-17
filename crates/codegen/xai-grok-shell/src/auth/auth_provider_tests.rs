@@ -519,6 +519,7 @@ async fn provider_command_times_out() {
     );
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn run_capped_cancellation_kills_provider_process_group() {
     use std::time::Duration;

@@ -690,14 +690,36 @@ impl ModelsManager {
                 .unwrap_or_else(|| current_model_key.clone());
             model_endpoint_changed(&old_config, &new_config, &owner_key)
         };
-        let endpoint_catalog_still_valid = endpoint_catalog_active && !endpoint_catalog_invalidated;
         let retained_prefetched = if endpoint_catalog_invalidated {
             None
         } else {
             prefetched
         };
-        let retained_real_catalog = has_real_catalog && !endpoint_catalog_invalidated;
         let new_catalog = resolve_model_catalog(&new_config, retained_prefetched.clone());
+        // Filters can remove the endpoint owner from a retained catalog (for
+        // example `disabled_models` matching the owner key). The owner can no
+        // longer resolve its own credentials or refresh the endpoint, and
+        // keeping the endpoint source would fence global results forever, so
+        // invalidate the catalog and rebuild from config only.
+        let owner_removed_by_filters = endpoint_catalog_active
+            && !endpoint_catalog_invalidated
+            && catalog_owner
+                .as_ref()
+                .is_some_and(|owner| resolve_catalog_key(&new_catalog, owner).is_none());
+        let endpoint_catalog_invalidated = endpoint_catalog_invalidated || owner_removed_by_filters;
+        let endpoint_catalog_still_valid = endpoint_catalog_active && !endpoint_catalog_invalidated;
+        let retained_prefetched = if endpoint_catalog_invalidated {
+            None
+        } else {
+            retained_prefetched
+        };
+        let retained_real_catalog = has_real_catalog && !endpoint_catalog_invalidated;
+        let new_catalog = if owner_removed_by_filters {
+            resolve_model_catalog(&new_config, None)
+        } else {
+            new_catalog
+        };
+        let endpoint_context_changed = endpoint_context_changed || owner_removed_by_filters;
         // Keep the owner as a pending refresh target when the endpoint
         // context changes (or a replacement is already pending) and the new
         // config still configures that endpoint. A stale owner whose endpoint
@@ -1137,14 +1159,44 @@ impl ModelsManager {
     }
 
     /// Refresh models when the etag changes.
-    pub(crate) async fn refresh_if_new_etag(&self, etag: String) {
+    ///
+    /// `emitting_model` is the model whose response carried the ETag. Session
+    /// model switches (Leader mode) do not update `current_model_id`, so an
+    /// ETag from a global-model session must not be routed to the tracked
+    /// endpoint catalog just because the process default owns one.
+    pub(crate) async fn refresh_if_new_etag(
+        &self,
+        etag: String,
+        emitting_model: Option<acp::ModelId>,
+    ) {
         let current_has_endpoint = self.current_model_has_endpoint();
         let (same_etag, endpoint_owned, catalog_is_endpoint_owned, observed_endpoint_generation) = {
             let cat = self.inner.catalog.read();
             let catalog_is_endpoint_owned = cat.catalog_source == CatalogSource::ModelEndpoint;
-            let endpoint_owned = catalog_is_endpoint_owned
-                || (!cat.model_endpoint_catalog_loaded
-                    && (cat.catalog_owner.is_some() || current_has_endpoint));
+            let endpoint_owned = match emitting_model.as_ref() {
+                Some(model) => match cat.catalog_owner.as_ref() {
+                    // The ETag belongs to the tracked endpoint only when it
+                    // came from its configured owner or from a model its
+                    // `/models` response returned. Anything else is scoped to
+                    // the global resource.
+                    Some(owner) => {
+                        owner == model
+                            || (catalog_is_endpoint_owned
+                                && cat.prefetched.as_ref().is_some_and(|models| {
+                                    resolve_catalog_key(models, model).is_some()
+                                }))
+                    }
+                    None => {
+                        model == &*self.inner.current_model_id.read()
+                            && self.model_has_endpoint(model)
+                    }
+                },
+                None => {
+                    catalog_is_endpoint_owned
+                        || (!cat.model_endpoint_catalog_loaded
+                            && (cat.catalog_owner.is_some() || current_has_endpoint))
+                }
+            };
             (
                 cat.etag.as_deref() == Some(etag.as_str()),
                 endpoint_owned,
@@ -1336,9 +1388,8 @@ impl ModelsManager {
             return;
         }
 
-        let cfg = self.inner.cfg.read().clone();
         let count = cached.models.len();
-        self.apply_catalog(&cfg, cached.models, cached.etag);
+        self.apply_catalog(cached.models, cached.etag);
         tracing::info!(count, "model catalog hot-reloaded from disk cache");
         xai_grok_telemetry::unified_log::info(
             "model catalog: reloaded from external disk-cache write",
@@ -1675,9 +1726,8 @@ impl ModelsManager {
                     None
                 }
             };
-            let apply_cfg = mgr.inner.cfg.read().clone();
             if !mgr.apply_refresh_result_fenced(
-                &apply_cfg,
+                None,
                 new_prefetched,
                 new_etag,
                 Some(generation),
@@ -2034,9 +2084,8 @@ impl ModelsManager {
                 None
             };
         let new_etag = response_etag.or(observed_etag);
-        let cfg = self.inner.cfg.read().clone();
         if !self.apply_refresh_result_fenced(
-            &cfg,
+            None,
             models,
             new_etag,
             None,
@@ -2231,9 +2280,8 @@ impl ModelsManager {
                 None
             }
         };
-        let apply_cfg = self.inner.cfg.read().clone();
         let success = self.apply_refresh_result_fenced(
-            &apply_cfg,
+            None,
             new_prefetched,
             None,
             Some(generation),
@@ -2254,14 +2302,9 @@ impl ModelsManager {
     }
 
     /// Publish a resolved catalog under one atomic write, then reselect the model (default on first real catalog, else keep current if present).
-    fn apply_catalog(
-        &self,
-        cfg: &config::Config,
-        models: IndexMap<String, ModelEntry>,
-        new_etag: Option<String>,
-    ) {
+    fn apply_catalog(&self, models: IndexMap<String, ModelEntry>, new_etag: Option<String>) {
         let _ = self.apply_catalog_fenced(
-            cfg,
+            None,
             models,
             new_etag,
             None,
@@ -2277,7 +2320,7 @@ impl ModelsManager {
     /// returns whether the catalog applied.
     fn apply_catalog_fenced(
         &self,
-        cfg: &config::Config,
+        cfg: Option<&config::Config>,
         models: IndexMap<String, ModelEntry>,
         new_etag: Option<String>,
         generation: Option<u64>,
@@ -2336,14 +2379,14 @@ impl ModelsManager {
                 );
                 return false;
             }
-            // A settings-only publication intentionally leaves the endpoint
+            // A settings-only publication intentionally leaves the catalog
             // fence unchanged so an in-flight fetch can still publish. Re-read
-            // the current config at apply time so a stale snapshot cannot
-            // overwrite the latest filters/defaults.
-            let apply_cfg = if source == CatalogSource::ModelEndpoint {
-                self.inner.cfg.read().clone()
-            } else {
-                cfg.clone()
+            // the current config under the catalog lock so a stale snapshot
+            // cannot overwrite the latest filters/defaults. Production callers
+            // pass `None`; tests may pin an explicit snapshot.
+            let apply_cfg = match cfg {
+                Some(cfg) => cfg.clone(),
+                None => self.inner.cfg.read().clone(),
             };
             let first_real_catalog = !cat.has_fetched_real_catalog;
             cat.has_fetched_real_catalog = true;
@@ -2383,9 +2426,11 @@ impl ModelsManager {
         new_prefetched: Option<IndexMap<String, ModelEntry>>,
         new_etag: Option<String>,
     ) -> bool {
+        // Resolve under the explicit snapshot; production callers pass `None`
+        // and read the config published under the catalog lock.
         let generation = self.inner.catalog.read().generation;
         self.apply_refresh_result_fenced(
-            config,
+            Some(config),
             new_prefetched,
             new_etag,
             Some(generation),
@@ -2398,7 +2443,7 @@ impl ModelsManager {
 
     fn apply_refresh_result_fenced(
         &self,
-        config: &config::Config,
+        config: Option<&config::Config>,
         new_prefetched: Option<IndexMap<String, ModelEntry>>,
         new_etag: Option<String>,
         generation: Option<u64>,

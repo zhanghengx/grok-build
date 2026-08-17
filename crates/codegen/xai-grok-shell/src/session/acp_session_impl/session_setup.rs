@@ -500,7 +500,15 @@ impl SessionActor {
         metadata: crate::sampling::ResponseModelMetadata,
     ) {
         if let Some(ref etag) = metadata.models_etag {
-            self.models_manager.refresh_if_new_etag(etag.clone()).await;
+            let emitting_model = self
+                .chat_state_handle
+                .get_sampling_config()
+                .await
+                .map(|cfg| acp::ModelId::new(Arc::from(cfg.model)))
+                .filter(|model| !model.0.is_empty());
+            self.models_manager
+                .refresh_if_new_etag(etag.clone(), emitting_model)
+                .await;
         }
         let current_config = match self.chat_state_handle.get_sampling_config().await {
             Some(cfg) => cfg,
