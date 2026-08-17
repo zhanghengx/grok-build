@@ -1180,8 +1180,24 @@ impl ModelsManager {
                     // model = "provider-slug"`). Resolve it back to its catalog
                     // key before classifying the ETag so a cold configured
                     // endpoint is not misrouted to the global fetch.
-                    let resolved =
-                        resolve_catalog_key(&cat.models, model).unwrap_or_else(|| model.clone());
+                    // Prefer the tracked endpoint owner (falling back to the
+                    // current model) when the emitted slug is its routing slug:
+                    // an alias whose slug collides with an exact catalog key
+                    // (for example bundled `grok-4` plus `[model.alias] model =
+                    // "grok-4"`) must still classify as endpoint-owned.
+                    let resolved = {
+                        let current = &*self.inner.current_model_id.read();
+                        let candidate = cat.catalog_owner.as_ref().unwrap_or(current);
+                        if cat
+                            .models
+                            .get(candidate.0.as_ref())
+                            .is_some_and(|entry| entry.info.model == model.0.as_ref())
+                        {
+                            candidate.clone()
+                        } else {
+                            resolve_catalog_key(&cat.models, model).unwrap_or_else(|| model.clone())
+                        }
+                    };
                     match cat.catalog_owner.as_ref() {
                         // The ETag belongs to the tracked endpoint only when it
                         // came from its configured owner or from a model its

@@ -1756,6 +1756,99 @@ async fn etag_refresh_resolves_routing_slug_to_configured_endpoint_owner() {
 }
 
 #[tokio::test]
+async fn etag_refresh_prefers_alias_owner_when_slug_collides_with_catalog_key() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct AliasSlugCollisionEndpoint {
+        global_calls: Arc<AtomicUsize>,
+        endpoint_calls: Arc<AtomicUsize>,
+    }
+    impl ModelsEndpoint for AliasSlugCollisionEndpoint {
+        fn fetch_models(
+            &self,
+            _endpoints: config::EndpointsConfig,
+            _auth: Option<GrokAuth>,
+            _fetch_auth: ModelFetchAuth,
+        ) -> ModelsFetchFuture {
+            self.global_calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Some(make_prefetched(&["global-model"])) })
+        }
+
+        fn fetch_model_endpoint(&self, _request: ModelEndpointRequest) -> ModelEndpointFetchFuture {
+            self.endpoint_calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async {
+                Some((
+                    make_prefetched(&["alias-model"]),
+                    Some("\"etag-new\"".to_string()),
+                ))
+            })
+        }
+    }
+
+    let cfg = config_from_toml(
+        r#"
+            [model.alias]
+            model = "grok-4.5"
+            base_url = "https://provider.example/v1"
+            api_key = "model-api-key"
+            "#,
+    );
+    let tmp = tempfile::TempDir::new().unwrap();
+    let auth_manager = Arc::new(AuthManager::new(tmp.path(), GrokComConfig::default()));
+    let global_calls = Arc::new(AtomicUsize::new(0));
+    let endpoint_calls = Arc::new(AtomicUsize::new(0));
+    let mgr = ModelsManagerBuilder::new(
+        None,
+        resolve_model_catalog(&cfg, None),
+        acp::ModelId::new("alias"),
+        auth_manager,
+        cfg,
+    )
+    .endpoint(Arc::new(AliasSlugCollisionEndpoint {
+        global_calls: global_calls.clone(),
+        endpoint_calls: endpoint_calls.clone(),
+    }))
+    .cache(test_cache_manager(tmp.path()))
+    .build();
+    // `grok-4.5` exists both as a bundled catalog key and as the alias's
+    // routing slug; exact-key resolution must not win over the endpoint.
+    assert!(mgr.models().contains_key("grok-4.5"));
+    assert!(mgr.models().contains_key("alias"));
+    assert!(mgr.inner.catalog.read().catalog_owner.is_none());
+
+    mgr.refresh_if_new_etag(
+        "\"etag-new\"".to_string(),
+        Some(acp::ModelId::new("grok-4.5")),
+    )
+    .await;
+
+    for _ in 0..200 {
+        if mgr.inner.catalog.read().catalog_source == CatalogSource::ModelEndpoint {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+
+    assert_eq!(
+        endpoint_calls.load(Ordering::SeqCst),
+        1,
+        "an alias ETag whose slug is also a bundled key must refresh the endpoint catalog",
+    );
+    assert_eq!(
+        global_calls.load(Ordering::SeqCst),
+        0,
+        "an alias ETag must not launch a global fetch",
+    );
+    let cat = mgr.inner.catalog.read();
+    assert_eq!(cat.catalog_source, CatalogSource::ModelEndpoint);
+    assert_eq!(
+        cat.catalog_owner.as_ref().map(|owner| owner.0.as_ref()),
+        Some("alias")
+    );
+    assert_eq!(cat.etag.as_deref(), Some("\"etag-new\""));
+}
+
+#[tokio::test]
 async fn global_etag_equal_to_endpoint_etag_still_refreshes_global() {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
