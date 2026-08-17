@@ -1719,7 +1719,10 @@ async fn etag_refresh_resolves_routing_slug_to_configured_endpoint_owner() {
     // The session emits the routing slug, not the configured key `alias`.
     mgr.refresh_if_new_etag(
         "\"etag-new\"".to_string(),
-        Some(acp::ModelId::new("provider-slug")),
+        Some(EtagOrigin::new(
+            "provider-slug",
+            "https://provider.example/v1",
+        )),
     )
     .await;
 
@@ -1818,7 +1821,7 @@ async fn etag_refresh_prefers_alias_owner_when_slug_collides_with_catalog_key() 
 
     mgr.refresh_if_new_etag(
         "\"etag-new\"".to_string(),
-        Some(acp::ModelId::new("grok-4.5")),
+        Some(EtagOrigin::new("grok-4.5", "https://provider.example/v1")),
     )
     .await;
 
@@ -1846,6 +1849,109 @@ async fn etag_refresh_prefers_alias_owner_when_slug_collides_with_catalog_key() 
         Some("alias")
     );
     assert_eq!(cat.etag.as_deref(), Some("\"etag-new\""));
+}
+
+#[tokio::test]
+async fn leader_global_session_slug_collision_stays_global() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct CollidingSessionEndpoint {
+        global_calls: Arc<AtomicUsize>,
+        endpoint_calls: Arc<AtomicUsize>,
+    }
+    impl ModelsEndpoint for CollidingSessionEndpoint {
+        fn fetch_models(
+            &self,
+            _endpoints: config::EndpointsConfig,
+            _auth: Option<GrokAuth>,
+            _fetch_auth: ModelFetchAuth,
+        ) -> ModelsFetchFuture {
+            self.global_calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Some(make_prefetched(&["global-model"])) })
+        }
+
+        fn fetch_model_endpoint(&self, _request: ModelEndpointRequest) -> ModelEndpointFetchFuture {
+            self.endpoint_calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async {
+                Some((
+                    make_prefetched(&["alias-model"]),
+                    Some("\"endpoint-etag\"".to_string()),
+                ))
+            })
+        }
+    }
+
+    let cfg = config_from_toml(
+        r#"
+            [model.alias]
+            model = "grok-4.5"
+            base_url = "https://provider.example/v1"
+            api_key = "model-api-key"
+            "#,
+    );
+    let tmp = tempfile::TempDir::new().unwrap();
+    let auth_manager = Arc::new(AuthManager::new(tmp.path(), GrokComConfig::default()));
+    let global_calls = Arc::new(AtomicUsize::new(0));
+    let endpoint_calls = Arc::new(AtomicUsize::new(0));
+    let mgr = ModelsManagerBuilder::new(
+        None,
+        resolve_model_catalog(&cfg, None),
+        // The process default is the bundled `grok-4.5`, not the alias.
+        acp::ModelId::new("grok-4.5"),
+        auth_manager,
+        cfg,
+    )
+    .endpoint(Arc::new(CollidingSessionEndpoint {
+        global_calls: global_calls.clone(),
+        endpoint_calls: endpoint_calls.clone(),
+    }))
+    .cache(test_cache_manager(tmp.path()))
+    .build();
+    assert!(mgr.models().contains_key("grok-4.5"));
+    assert!(mgr.models().contains_key("alias"));
+    assert!(mgr.inner.catalog.read().catalog_owner.is_none());
+
+    // A Leader session on the bundled `grok-4.5` emits the same slug the alias
+    // routes with. Its origin is the global URL, so it must refresh the global
+    // catalog even though a configured endpoint shares the slug.
+    mgr.refresh_if_new_etag(
+        "\"global-etag\"".to_string(),
+        Some(EtagOrigin::new("grok-4.5", "https://global.example/v1")),
+    )
+    .await;
+    for _ in 0..200 {
+        if global_calls.load(Ordering::SeqCst) > 0 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert_eq!(
+        endpoint_calls.load(Ordering::SeqCst),
+        0,
+        "a global-session ETag must not refresh the colliding endpoint alias",
+    );
+    assert_eq!(global_calls.load(Ordering::SeqCst), 1);
+
+    // The same slug emitted from the alias's endpoint URL still refreshes the
+    // endpoint catalog.
+    mgr.refresh_if_new_etag(
+        "\"endpoint-etag\"".to_string(),
+        Some(EtagOrigin::new("grok-4.5", "https://provider.example/v1")),
+    )
+    .await;
+    for _ in 0..200 {
+        if endpoint_calls.load(Ordering::SeqCst) > 0 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert_eq!(endpoint_calls.load(Ordering::SeqCst), 1);
+    let cat = mgr.inner.catalog.read();
+    assert_eq!(cat.catalog_source, CatalogSource::ModelEndpoint);
+    assert_eq!(
+        cat.catalog_owner.as_ref().map(|owner| owner.0.as_ref()),
+        Some("alias")
+    );
 }
 
 #[tokio::test]
@@ -1918,8 +2024,11 @@ async fn global_etag_equal_to_endpoint_etag_still_refreshes_global() {
     // A global-model session emits an opaque ETag that happens to equal the
     // endpoint catalog ETag. ETags are origin-scoped: the string collision must
     // not renew the global cache without a fetch.
-    mgr.refresh_if_new_etag("\"same\"".to_string(), Some(acp::ModelId::new("grok-4")))
-        .await;
+    mgr.refresh_if_new_etag(
+        "\"same\"".to_string(),
+        Some(EtagOrigin::new("grok-4", "https://global.example/v1")),
+    )
+    .await;
 
     for _ in 0..200 {
         if global_calls.load(Ordering::SeqCst) > 0 {
@@ -2350,6 +2459,7 @@ async fn endpoint_etag_observed_fallback_discarded_after_endpoint_switch() {
                 Some("etag-a".to_string()),
                 Some(1),
                 Some(observed_endpoint_generation),
+                None,
             )
             .await
         }
@@ -2481,6 +2591,7 @@ async fn endpoint_etag_cold_owner_switch_discards_observed_fallback() {
                 Some("etag-a".to_string()),
                 Some(1),
                 Some(observed_endpoint_generation),
+                None,
             )
             .await
         }
@@ -2614,6 +2725,7 @@ async fn endpoint_etag_observed_fallback_discarded_after_catalog_reset_reuses_ol
                 Some("etag-a".to_string()),
                 Some(1),
                 Some(observed_endpoint_generation),
+                None,
             )
             .await
         }
@@ -7941,7 +8053,7 @@ async fn global_session_etag_is_not_stamped_on_endpoint_catalog() {
     // owns an endpoint catalog. It must not refresh or stamp the endpoint.
     mgr.refresh_if_new_etag(
         "\"global-etag\"".to_string(),
-        Some(acp::ModelId::new("grok-4")),
+        Some(EtagOrigin::new("grok-4", "https://global.example/v1")),
     )
     .await;
     for _ in 0..200 {
@@ -7961,7 +8073,10 @@ async fn global_session_etag_is_not_stamped_on_endpoint_catalog() {
     // endpoint catalog.
     mgr.refresh_if_new_etag(
         "\"endpoint-new\"".to_string(),
-        Some(acp::ModelId::new("endpoint-model")),
+        Some(EtagOrigin::new(
+            "endpoint-model",
+            "https://provider.example/v1",
+        )),
     )
     .await;
     for _ in 0..200 {

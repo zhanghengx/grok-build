@@ -118,6 +118,27 @@ impl Default for CatalogSource {
     }
 }
 
+/// Origin of a response ETag, carried by the emitting session.
+///
+/// `model` is the routing slug the session sent and `base_url` is the request
+/// origin the ETag came from. Both are session-local: a Leader session on the
+/// bundled catalog must not be treated as endpoint-owned just because the
+/// process default endpoint exposes the same slug.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct EtagOrigin {
+    model: acp::ModelId,
+    base_url: String,
+}
+
+impl EtagOrigin {
+    pub(crate) fn new(model: impl Into<String>, base_url: impl Into<String>) -> Self {
+        Self {
+            model: acp::ModelId::new(Arc::from(model.into())),
+            base_url: base_url.into(),
+        }
+    }
+}
+
 /// Catalog fields written together under one lock, so readers never see a torn mix.
 #[derive(Default)]
 struct CatalogState {
@@ -1160,71 +1181,38 @@ impl ModelsManager {
 
     /// Refresh models when the etag changes.
     ///
-    /// `emitting_model` is the model whose response carried the ETag. Session
-    /// model switches (Leader mode) do not update `current_model_id`, so an
-    /// ETag from a global-model session must not be routed to the tracked
-    /// endpoint catalog just because the process default owns one.
-    pub(crate) async fn refresh_if_new_etag(
-        &self,
-        etag: String,
-        emitting_model: Option<acp::ModelId>,
-    ) {
+    /// `emitting` identifies the session whose response carried the ETag.
+    /// Session model switches (Leader mode) do not update `current_model_id`,
+    /// so an ETag from a global-model session must not be routed to the
+    /// tracked endpoint catalog just because the process default owns one.
+    pub(crate) async fn refresh_if_new_etag(&self, etag: String, emitting: Option<EtagOrigin>) {
         let current_has_endpoint = self.current_model_has_endpoint();
-        let (same_etag, endpoint_owned, catalog_is_endpoint_owned, observed_endpoint_generation) = {
+        let (
+            same_etag,
+            endpoint_owned,
+            endpoint_owner,
+            catalog_is_endpoint_owned,
+            observed_endpoint_generation,
+        ) = {
             let cat = self.inner.catalog.read();
             let catalog_is_endpoint_owned = cat.catalog_source == CatalogSource::ModelEndpoint;
-            let endpoint_owned = match emitting_model.as_ref() {
-                Some(model) => {
-                    // The session emits the routing slug (`SamplingConfig.model`),
-                    // which can differ from the configured key (`[model.alias]
-                    // model = "provider-slug"`). Resolve it back to its catalog
-                    // key before classifying the ETag so a cold configured
-                    // endpoint is not misrouted to the global fetch.
-                    // Prefer the tracked endpoint owner (falling back to the
-                    // current model) when the emitted slug is its routing slug:
-                    // an alias whose slug collides with an exact catalog key
-                    // (for example bundled `grok-4` plus `[model.alias] model =
-                    // "grok-4"`) must still classify as endpoint-owned.
-                    let resolved = {
-                        let current = &*self.inner.current_model_id.read();
-                        let candidate = cat.catalog_owner.as_ref().unwrap_or(current);
-                        if cat
-                            .models
-                            .get(candidate.0.as_ref())
-                            .is_some_and(|entry| entry.info.model == model.0.as_ref())
-                        {
-                            candidate.clone()
-                        } else {
-                            resolve_catalog_key(&cat.models, model).unwrap_or_else(|| model.clone())
-                        }
-                    };
-                    match cat.catalog_owner.as_ref() {
-                        // The ETag belongs to the tracked endpoint only when it
-                        // came from its configured owner or from a model its
-                        // `/models` response returned. Anything else is scoped to
-                        // the global resource.
-                        Some(owner) => {
-                            owner == &resolved
-                                || (catalog_is_endpoint_owned
-                                    && cat.prefetched.as_ref().is_some_and(|models| {
-                                        resolve_catalog_key(models, &resolved).is_some()
-                                    }))
-                        }
-                        None => {
-                            &resolved == &*self.inner.current_model_id.read()
-                                && self.model_has_endpoint(&resolved)
-                        }
-                    }
-                }
-                None => {
-                    catalog_is_endpoint_owned
+            let endpoint_owner = emitting.as_ref().and_then(|origin| {
+                // The session carries the request origin (routing slug plus
+                // base URL). Only a session that actually hit the configured
+                // endpoint resource may route into its catalog; a process
+                // default endpoint with a colliding slug does not make a
+                // global session's ETag endpoint-scoped.
+                self.session_origin_endpoint_owner(&cat, origin)
+            });
+            let endpoint_owned = endpoint_owner.is_some()
+                || (emitting.is_none()
+                    && (catalog_is_endpoint_owned
                         || (!cat.model_endpoint_catalog_loaded
-                            && (cat.catalog_owner.is_some() || current_has_endpoint))
-                }
-            };
+                            && (cat.catalog_owner.is_some() || current_has_endpoint))));
             (
                 cat.etag.as_deref() == Some(etag.as_str()),
                 endpoint_owned,
+                endpoint_owner,
                 catalog_is_endpoint_owned,
                 cat.endpoint_generation,
             )
@@ -1252,6 +1240,7 @@ impl ModelsManager {
                     Some(etag),
                     Some(seq),
                     Some(observed_endpoint_generation),
+                    endpoint_owner,
                 )
                 .await;
             });
@@ -1921,6 +1910,43 @@ impl ModelsManager {
             .unwrap_or(current)
     }
 
+    /// Resolve the configured endpoint owner for a response ETag's
+    /// session-local origin. Reads catalog before cfg to preserve the lock
+    /// order used by the catalog apply path. It never reacquires the catalog
+    /// lock, so a queued writer cannot deadlock behind this read guard.
+    fn session_origin_endpoint_owner(
+        &self,
+        cat: &CatalogState,
+        origin: &EtagOrigin,
+    ) -> Option<acp::ModelId> {
+        if origin.base_url.is_empty() {
+            return None;
+        }
+        let cfg = self.inner.cfg.read();
+        let configured = config::resolve_model_list(&cfg, None)
+            .into_iter()
+            .find(|(key, entry)| {
+                entry.info.model == origin.model.0.as_ref()
+                    && entry.has_own_credentials()
+                    && config_model_has_endpoint(&cfg, &key)
+                    && resolve_credentials(&entry, None).base_url == origin.base_url
+            })
+            .map(|(key, _)| acp::ModelId::new(Arc::from(key)));
+        configured.or_else(|| {
+            if cat.catalog_source != CatalogSource::ModelEndpoint {
+                return None;
+            }
+            cat.models
+                .iter()
+                .find(|(_, entry)| {
+                    entry.info.model == origin.model.0.as_ref()
+                        && entry.has_own_credentials()
+                        && resolve_credentials(entry, None).base_url == origin.base_url
+                })
+                .map(|(key, _)| acp::ModelId::new(Arc::from(key.clone())))
+        })
+    }
+
     /// Whether `model_id` has a configured model-owned endpoint plus a
     /// credential for it. Reads catalog before cfg to preserve the lock order
     /// used by the catalog apply path.
@@ -1985,6 +2011,7 @@ impl ModelsManager {
             observed_etag,
             observed_seq,
             None,
+            None,
         )
         .await
     }
@@ -1995,6 +2022,7 @@ impl ModelsManager {
         observed_etag: Option<String>,
         observed_seq: Option<u64>,
         observed_endpoint_generation: Option<u64>,
+        origin_owner: Option<acp::ModelId>,
     ) -> bool {
         if !remote_fetch_enabled {
             tracing::info!("model-specific catalog refresh skipped: remote_fetch disabled");
@@ -2036,6 +2064,7 @@ impl ModelsManager {
             observed_etag,
             observed_seq,
             observed_endpoint_generation,
+            origin_owner,
         )
         .await
     }
@@ -2054,7 +2083,7 @@ impl ModelsManager {
         if self.inner.catalog.read().model_endpoint_catalog_loaded {
             return true;
         }
-        self.refresh_current_model_endpoint_locked(None, None, None)
+        self.refresh_current_model_endpoint_locked(None, None, None, None)
             .await
     }
 
@@ -2063,6 +2092,7 @@ impl ModelsManager {
         observed_etag: Option<String>,
         observed_seq: Option<u64>,
         observed_endpoint_generation: Option<u64>,
+        origin_owner: Option<acp::ModelId>,
     ) -> bool {
         // Capture the endpoint identity and its config fence before the
         // request: `model_endpoint_request` awaits a provider refresh, during
@@ -2080,13 +2110,28 @@ impl ModelsManager {
                 // ETag refreshes must use the configured owner of an
                 // endpoint-owned catalog, not the currently selected returned
                 // slug or metadata-only overlay.
-                cat.catalog_owner.clone().unwrap_or_else(|| current.clone()),
+                origin_owner
+                    .as_ref()
+                    .cloned()
+                    .or_else(|| cat.catalog_owner.clone())
+                    .unwrap_or_else(|| current.clone()),
                 cat.endpoint_generation,
             )
         };
         let Some(request) = self.model_endpoint_request(&catalog_owner).await else {
             return false;
         };
+        // An ETag watcher can target an endpoint configured for a session
+        // model while the process current model is global. Record that owner
+        // as pending so a result from the emitting session can publish even
+        // when it is not the current model, and so an in-flight global result
+        // cannot overwrite the endpoint catalog while it loads.
+        if origin_owner.is_some() {
+            let mut cat = self.inner.catalog.write();
+            if cat.catalog_owner.is_none() {
+                cat.catalog_owner = origin_owner.clone();
+            }
+        }
         let endpoint = self.inner.endpoint.clone();
         let (models, response_etag) = match tokio::time::timeout(
             crate::http::STARTUP_FETCH_TIMEOUT,
