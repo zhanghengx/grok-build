@@ -8153,8 +8153,38 @@ fn apply_config_invalidates_endpoint_catalog_when_filter_removes_owner() {
     );
 }
 
-#[test]
-fn session_origin_keeps_dynamic_returned_model_tied_to_configured_owner() {
+#[tokio::test]
+async fn session_origin_keeps_dynamic_returned_model_tied_to_configured_owner() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct CaptureOwner {
+        calls: Arc<AtomicUsize>,
+        last_key: Arc<std::sync::Mutex<Option<String>>>,
+        last_url: Arc<std::sync::Mutex<Option<String>>>,
+    }
+    impl ModelsEndpoint for CaptureOwner {
+        fn fetch_models(
+            &self,
+            _endpoints: config::EndpointsConfig,
+            _auth: Option<GrokAuth>,
+            _fetch_auth: ModelFetchAuth,
+        ) -> ModelsFetchFuture {
+            Box::pin(async { None })
+        }
+
+        fn fetch_model_endpoint(&self, request: ModelEndpointRequest) -> ModelEndpointFetchFuture {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            *self.last_key.lock().unwrap() = Some(request.api_key.clone());
+            *self.last_url.lock().unwrap() = Some(request.base_url.clone());
+            Box::pin(async {
+                Some((
+                    make_prefetched(&["provider-model"]),
+                    Some("etag-next".into()),
+                ))
+            })
+        }
+    }
+
     let cfg = config_from_toml(
         r#"
             [model.alias]
@@ -8165,39 +8195,86 @@ fn session_origin_keeps_dynamic_returned_model_tied_to_configured_owner() {
     );
     let tmp = tempfile::TempDir::new().unwrap();
     let auth_manager = Arc::new(AuthManager::new(tmp.path(), GrokComConfig::default()));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let last_key = Arc::new(std::sync::Mutex::new(None));
+    let last_url = Arc::new(std::sync::Mutex::new(None));
     let mgr = ModelsManagerBuilder::new(
         None,
         resolve_model_catalog(&cfg, None),
+        // Leader: process current stays on the configured owner.
         acp::ModelId::new("alias"),
         auth_manager,
         cfg.clone(),
     )
+    .endpoint(Arc::new(CaptureOwner {
+        calls: calls.clone(),
+        last_key: last_key.clone(),
+        last_url: last_url.clone(),
+    }))
     .cache(test_cache_manager(tmp.path()))
     .build();
+
+    // Production `/models` entries inherit the configured owner's credential
+    // context. A session then samples with the returned slug.
+    let inherit = ModelEndpointRequest {
+        base_url: "https://provider.example/v1".to_string(),
+        api_key: "alias-key".to_string(),
+        api_backend: Default::default(),
+        auth_scheme: Default::default(),
+        configured_api_key: Some("alias-key".to_string()),
+        configured_env_key: None,
+        auth_provider: None,
+        extra_headers: IndexMap::new(),
+        query_params: IndexMap::new(),
+        env_http_headers: IndexMap::new(),
+    };
+    let mut returned_cfg = make_entry_config("provider-model", None);
+    returned_cfg.base_url = "https://provider.example/v1".to_string();
+    let returned = build_prefetched_map_with_model_context(vec![returned_cfg], &inherit);
     {
         let mut cat = mgr.inner.catalog.write();
-        let mut returned = make_prefetched(&["provider-model"]);
-        if let Some(entry) = returned.get_mut("provider-model") {
-            entry.api_key = Some("alias-key".to_string());
-            entry.info.base_url = "https://provider.example/v1".to_string();
-            entry.info.model = "provider-model".to_string();
-        }
         cat.prefetched = Some(returned.clone());
         cat.models = resolve_model_catalog(&cfg, cat.prefetched.clone());
         cat.has_fetched_real_catalog = true;
         cat.model_endpoint_catalog_loaded = true;
         cat.catalog_source = CatalogSource::ModelEndpoint;
         cat.catalog_owner = Some(acp::ModelId::new("alias"));
+        cat.etag = Some("etag-loaded".to_string());
     }
-    let origin = EtagOrigin::new("provider-model", "https://provider.example/v1");
-    let cat = mgr.inner.catalog.read();
-    let owner = mgr
-        .session_origin_endpoint_owner(&cat, &origin)
-        .expect("returned slug must resolve to the configured owner");
+
+    mgr.refresh_if_new_etag(
+        "etag-next".to_string(),
+        Some(
+            EtagOrigin::new("provider-model", "https://provider.example/v1")
+                .with_catalog_key("provider-model"),
+        ),
+    )
+    .await;
+    for _ in 0..200 {
+        if calls.load(Ordering::SeqCst) > 0 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
     assert_eq!(
-        owner.0.as_ref(),
-        "alias",
-        "a dynamic returned model must stay owned by the configured endpoint"
+        calls.load(Ordering::SeqCst),
+        1,
+        "an ETag from a session using the returned model must still refresh the owning endpoint"
+    );
+    assert_eq!(
+        last_url.lock().unwrap().as_deref(),
+        Some("https://provider.example/v1")
+    );
+    assert_eq!(last_key.lock().unwrap().as_deref(), Some("alias-key"));
+    assert_eq!(
+        mgr.inner
+            .catalog
+            .read()
+            .catalog_owner
+            .as_ref()
+            .map(|o| o.0.as_ref()),
+        Some("alias"),
+        "the configured catalog owner must remain the fence target"
     );
 }
 
