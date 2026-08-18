@@ -499,13 +499,49 @@ impl SessionActor {
         &self,
         metadata: crate::sampling::ResponseModelMetadata,
     ) {
+        self.handle_model_metadata_update_for_request(None, metadata)
+            .await;
+    }
+
+    /// Bind the immutable request origin captured at submit time so a later
+    /// `set_session_model` cannot relabel an in-flight ETag.
+    pub(super) fn bind_request_etag_origin(
+        &self,
+        request_id: &str,
+        origin: crate::agent::models::EtagOrigin,
+    ) {
+        self.inflight_etag_origins
+            .lock()
+            .insert(request_id.to_string(), origin);
+    }
+
+    pub(super) async fn capture_request_etag_origin(
+        &self,
+    ) -> Option<crate::agent::models::EtagOrigin> {
+        let catalog_key = self.session_catalog_key.lock().clone();
+        self.chat_state_handle
+            .get_sampling_config()
+            .await
+            .filter(|cfg| !cfg.model.is_empty())
+            .map(|cfg| {
+                crate::agent::models::EtagOrigin::new(cfg.model, cfg.base_url)
+                    .with_catalog_key(catalog_key)
+            })
+    }
+
+    pub(super) async fn handle_model_metadata_update_for_request(
+        &self,
+        request_id: Option<&str>,
+        metadata: crate::sampling::ResponseModelMetadata,
+    ) {
         if let Some(ref etag) = metadata.models_etag {
-            let emitting_origin = self
-                .chat_state_handle
-                .get_sampling_config()
-                .await
-                .filter(|cfg| !cfg.model.is_empty())
-                .map(|cfg| crate::agent::models::EtagOrigin::new(cfg.model, cfg.base_url));
+            // A request-bound event uses only the origin captured at submit
+            // time. Re-reading live sampling config after `set_session_model`
+            // would stamp A's ETag onto B.
+            let emitting_origin = match request_id {
+                Some(id) => self.inflight_etag_origins.lock().remove(id),
+                None => self.capture_request_etag_origin().await,
+            };
             self.models_manager
                 .refresh_if_new_etag(etag.clone(), emitting_origin)
                 .await;

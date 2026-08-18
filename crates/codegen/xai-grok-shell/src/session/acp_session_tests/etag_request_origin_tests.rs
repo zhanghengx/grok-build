@@ -1,0 +1,156 @@
+use super::support::*;
+use super::*;
+use crate::agent::models::resolve_model_catalog;
+use crate::agent::models::{
+    ModelEndpointFetchFuture, ModelEndpointRequest, ModelFetchAuth, ModelsEndpoint,
+    ModelsFetchFuture, ModelsManagerBuilder,
+};
+use crate::auth::{AuthManager, GrokAuth, GrokComConfig};
+use indexmap::IndexMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use tokio::sync::mpsc;
+
+fn endpoint_cfg() -> crate::agent::config::Config {
+    crate::agent::config::Config::new_from_toml_cfg(
+        &toml::from_str(
+            r#"
+            [model.alias-a]
+            model = "slug-a"
+            base_url = "https://provider-a.example/v1"
+            api_key = "a-key"
+
+            [model.alias-b]
+            model = "slug-b"
+            base_url = "https://provider-b.example/v1"
+            api_key = "b-key"
+            "#,
+        )
+        .expect("toml"),
+    )
+    .expect("config")
+}
+
+struct OriginCapture {
+    calls: Arc<AtomicUsize>,
+    last_url: Arc<std::sync::Mutex<Option<String>>>,
+}
+impl ModelsEndpoint for OriginCapture {
+    fn fetch_models(
+        &self,
+        _endpoints: crate::agent::config::EndpointsConfig,
+        _auth: Option<GrokAuth>,
+        _fetch_auth: ModelFetchAuth,
+    ) -> ModelsFetchFuture {
+        Box::pin(async { None })
+    }
+
+    fn fetch_model_endpoint(&self, request: ModelEndpointRequest) -> ModelEndpointFetchFuture {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        *self.last_url.lock().unwrap() = Some(request.base_url.clone());
+        Box::pin(async { Some((IndexMap::new(), Some("etag-from-a".to_string()))) })
+    }
+}
+
+fn sampling(model: &str, url: &str) -> xai_grok_sampler::SamplerConfig {
+    xai_grok_sampler::SamplerConfig {
+        model: model.to_string(),
+        base_url: url.to_string(),
+        api_key: Some("k".to_string()),
+        context_window: 256_000,
+        ..Default::default()
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn inflight_etag_keeps_origin_after_set_session_model() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (gateway_tx, _gateway_rx) =
+                mpsc::unbounded_channel::<xai_acp_lib::AcpClientMessage>();
+            let (persistence_tx, _persistence_rx) = mpsc::unbounded_channel::<PersistenceMsg>();
+            let mut actor = create_test_actor(0, 256_000, 85, gateway_tx, persistence_tx).await;
+
+            let cfg = endpoint_cfg();
+            let tmp = tempfile::TempDir::new().unwrap();
+            let auth_manager = Arc::new(AuthManager::new(tmp.path(), GrokComConfig::default()));
+            let calls = Arc::new(AtomicUsize::new(0));
+            let last_url = Arc::new(std::sync::Mutex::new(None));
+            actor.models_manager = ModelsManagerBuilder::new(
+                None,
+                resolve_model_catalog(&cfg, None),
+                agent_client_protocol::ModelId::new("alias-a"),
+                auth_manager,
+                cfg,
+            )
+            .endpoint(Arc::new(OriginCapture {
+                calls: calls.clone(),
+                last_url: last_url.clone(),
+            }))
+            .build();
+
+            actor.chat_state_handle.update_sampling_config(
+                xai_grok_sampling_types::SamplingConfig {
+                    model: "slug-a".to_string(),
+                    base_url: "https://provider-a.example/v1".to_string(),
+                    max_completion_tokens: None,
+                    temperature: None,
+                    top_p: None,
+                    api_backend: Default::default(),
+                    extra_headers: Default::default(),
+                    query_params: Default::default(),
+                    env_http_headers: Default::default(),
+                    context_window: std::num::NonZeroU64::new(256_000).unwrap(),
+                    reasoning_effort: None,
+                    stream_tool_calls: None,
+                },
+            );
+            *actor.session_catalog_key.lock() = "alias-a".to_string();
+
+            let origin = actor
+                .capture_request_etag_origin()
+                .await
+                .expect("origin at submit");
+            actor.bind_request_etag_origin("req-a", origin);
+
+            let _ = actor
+                .handle_set_session_model(
+                    sampling("slug-b", "https://provider-b.example/v1"),
+                    "alias-b".to_string(),
+                    false,
+                    false,
+                    true,
+                    85,
+                )
+                .await;
+            let live = actor.chat_state_handle.get_sampling_config().await.unwrap();
+            assert_eq!(live.model, "slug-b");
+            assert_eq!(actor.session_catalog_key.lock().as_str(), "alias-b");
+
+            actor
+                .handle_model_metadata_update_for_request(
+                    Some("req-a"),
+                    crate::sampling::ResponseModelMetadata {
+                        context_window: None,
+                        max_completion_tokens: None,
+                        models_etag: Some("etag-from-a".to_string()),
+                    },
+                )
+                .await;
+
+            for _ in 0..200 {
+                if calls.load(Ordering::SeqCst) > 0 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                last_url.lock().unwrap().as_deref(),
+                Some("https://provider-a.example/v1"),
+                "A's in-flight ETag must keep A's origin after the session switched to B"
+            );
+        })
+        .await;
+}

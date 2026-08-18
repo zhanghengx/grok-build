@@ -5,6 +5,7 @@ impl SessionActor {
     pub(super) async fn handle_set_session_model(
         &self,
         sampling_config: xai_grok_sampler::SamplerConfig,
+        catalog_key: String,
         use_concise: bool,
         apply_prompt_override: bool,
         skip_prompt_rewrite: bool,
@@ -45,6 +46,9 @@ impl SessionActor {
                 "supports_backend_search": sampling_config.supports_backend_search,
             })),
         );
+        if !catalog_key.is_empty() {
+            *self.session_catalog_key.lock() = catalog_key;
+        }
         self.chat_state_handle
             .update_sampling_config(xai_grok_sampling_types::SamplingConfig {
                 base_url: sampling_config.base_url.clone(),

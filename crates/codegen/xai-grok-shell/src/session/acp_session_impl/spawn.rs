@@ -1663,6 +1663,8 @@ pub(crate) async fn spawn_session_actor(
         last_reported_branch: Arc::new(Mutex::new(None)),
         git_head_enabled: fs_watch_caps.git_head,
         models_manager,
+        session_catalog_key: parking_lot::Mutex::new(session_model_id.0.to_string()),
+        inflight_etag_origins: parking_lot::Mutex::new(std::collections::HashMap::new()),
         display_cwd: {
             let lock = std::sync::OnceLock::new();
             if let Some(ref cwd) = prompt_display_cwd {

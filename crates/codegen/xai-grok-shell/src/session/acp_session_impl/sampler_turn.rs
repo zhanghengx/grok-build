@@ -1151,6 +1151,9 @@ impl SessionActor {
         };
         let request_id = xai_grok_sampler::RequestId::random();
         let request_id_str = request_id.as_str().to_string();
+        if let Some(origin) = self.capture_request_etag_origin().await {
+            self.bind_request_etag_origin(&request_id_str, origin);
+        }
         match self
             .sampler_handle
             .submit_and_collect(request_id, request)
