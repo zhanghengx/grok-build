@@ -515,6 +515,29 @@ impl SessionActor {
             .insert(request_id.to_string(), origin);
     }
 
+    /// Origin of the `SamplerConfig` actually submitted to the sampler.
+    ///
+    /// Must not be rebuilt from a later `get_sampling_config()` reread: a
+    /// concurrent `SetSessionModel` can change live chat state after
+    /// `reconstruct_full_config` / `update_config` already committed model A.
+    pub(super) fn etag_origin_from_submitted_config(
+        cfg: &xai_grok_sampler::SamplerConfig,
+        catalog_key: impl Into<String>,
+    ) -> Option<crate::agent::models::EtagOrigin> {
+        Self::etag_origin_from_model_url(&cfg.model, &cfg.base_url, catalog_key)
+    }
+
+    pub(super) fn etag_origin_from_model_url(
+        model: &str,
+        base_url: &str,
+        catalog_key: impl Into<String>,
+    ) -> Option<crate::agent::models::EtagOrigin> {
+        if model.is_empty() {
+            return None;
+        }
+        Some(crate::agent::models::EtagOrigin::new(model, base_url).with_catalog_key(catalog_key))
+    }
+
     pub(super) async fn capture_request_etag_origin(
         &self,
     ) -> Option<crate::agent::models::EtagOrigin> {
@@ -522,11 +545,16 @@ impl SessionActor {
         self.chat_state_handle
             .get_sampling_config()
             .await
-            .filter(|cfg| !cfg.model.is_empty())
-            .map(|cfg| {
-                crate::agent::models::EtagOrigin::new(cfg.model, cfg.base_url)
-                    .with_catalog_key(catalog_key)
+            .and_then(|cfg| {
+                Self::etag_origin_from_model_url(&cfg.model, &cfg.base_url, catalog_key)
             })
+    }
+
+    pub(super) fn bound_request_etag_origin(
+        &self,
+        request_id: &str,
+    ) -> Option<crate::agent::models::EtagOrigin> {
+        self.inflight_etag_origins.lock().get(request_id).cloned()
     }
 
     pub(super) async fn handle_model_metadata_update_for_request(
@@ -537,9 +565,11 @@ impl SessionActor {
         if let Some(ref etag) = metadata.models_etag {
             // A request-bound event uses only the origin captured at submit
             // time. Re-reading live sampling config after `set_session_model`
-            // would stamp A's ETag onto B.
+            // would stamp A's ETag onto B. Clone (do not remove) so sampler
+            // retries that reuse the same RequestId still have the origin;
+            // Completed/Failed drop the entry.
             let emitting_origin = match request_id {
-                Some(id) => self.inflight_etag_origins.lock().remove(id),
+                Some(id) => self.bound_request_etag_origin(id),
                 None => self.capture_request_etag_origin().await,
             };
             self.models_manager

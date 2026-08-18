@@ -7,6 +7,7 @@ use crate::agent::models::{
 };
 use crate::auth::{AuthManager, GrokAuth, GrokComConfig};
 use indexmap::IndexMap;
+use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::mpsc;
@@ -151,6 +152,254 @@ async fn inflight_etag_keeps_origin_after_set_session_model() {
                 Some("https://provider-a.example/v1"),
                 "A's in-flight ETag must keep A's origin after the session switched to B"
             );
+        })
+        .await;
+}
+
+fn wait_for_fetch(calls: &AtomicUsize, min: usize) -> impl Future<Output = ()> + '_ {
+    async move {
+        for _ in 0..200 {
+            if calls.load(Ordering::SeqCst) >= min {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    }
+}
+
+/// After `prepare_sampler_for_turn` has already snapshotted model A, a
+/// concurrent `SetSessionModel` to B must not rebind that request's origin
+/// from a live chat-state reread. Bind from the submitted `SamplerConfig`.
+#[tokio::test(flavor = "current_thread")]
+async fn submitted_sampler_config_origin_survives_set_session_model() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (gateway_tx, _gateway_rx) =
+                mpsc::unbounded_channel::<xai_acp_lib::AcpClientMessage>();
+            let (persistence_tx, _persistence_rx) = mpsc::unbounded_channel::<PersistenceMsg>();
+            let mut actor = create_test_actor(0, 256_000, 85, gateway_tx, persistence_tx).await;
+
+            let cfg = endpoint_cfg();
+            let tmp = tempfile::TempDir::new().unwrap();
+            let auth_manager = Arc::new(AuthManager::new(tmp.path(), GrokComConfig::default()));
+            let calls = Arc::new(AtomicUsize::new(0));
+            let last_url = Arc::new(std::sync::Mutex::new(None));
+            actor.models_manager = ModelsManagerBuilder::new(
+                None,
+                resolve_model_catalog(&cfg, None),
+                agent_client_protocol::ModelId::new("alias-a"),
+                auth_manager,
+                cfg,
+            )
+            .endpoint(Arc::new(OriginCapture {
+                calls: calls.clone(),
+                last_url: last_url.clone(),
+            }))
+            .build();
+
+            actor.chat_state_handle.update_sampling_config(
+                xai_grok_sampling_types::SamplingConfig {
+                    model: "slug-a".to_string(),
+                    base_url: "https://provider-a.example/v1".to_string(),
+                    max_completion_tokens: None,
+                    temperature: None,
+                    top_p: None,
+                    api_backend: Default::default(),
+                    extra_headers: Default::default(),
+                    query_params: Default::default(),
+                    env_http_headers: Default::default(),
+                    context_window: std::num::NonZeroU64::new(256_000).unwrap(),
+                    reasoning_effort: None,
+                    stream_tool_calls: None,
+                },
+            );
+            *actor.session_catalog_key.lock() = "alias-a".to_string();
+
+            let (submitted, catalog_key) = actor.prepare_sampler_for_turn_with_origin_key().await;
+            assert_eq!(submitted.model, "slug-a");
+            assert_eq!(submitted.base_url, "https://provider-a.example/v1");
+            assert_eq!(catalog_key, "alias-a");
+
+            let _ = actor
+                .handle_set_session_model(
+                    sampling("slug-b", "https://provider-b.example/v1"),
+                    "alias-b".to_string(),
+                    false,
+                    false,
+                    true,
+                    85,
+                )
+                .await;
+            let live = actor.chat_state_handle.get_sampling_config().await.unwrap();
+            assert_eq!(live.model, "slug-b");
+            assert_eq!(actor.session_catalog_key.lock().as_str(), "alias-b");
+
+            let live_origin = actor
+                .capture_request_etag_origin()
+                .await
+                .expect("live origin after switch");
+            assert_eq!(live_origin.model(), "slug-b");
+            assert_eq!(live_origin.base_url(), "https://provider-b.example/v1");
+
+            let origin = SessionActor::etag_origin_from_submitted_config(&submitted, catalog_key)
+                .expect("origin from submitted config");
+            assert_eq!(origin.model(), "slug-a");
+            assert_eq!(origin.base_url(), "https://provider-a.example/v1");
+            assert_eq!(origin.catalog_key(), Some("alias-a"));
+            assert_ne!(
+                origin, live_origin,
+                "submitted A origin must not equal the post-switch live B origin"
+            );
+
+            actor.bind_request_etag_origin("req-submit-a", origin);
+            let bound = actor
+                .bound_request_etag_origin("req-submit-a")
+                .expect("bound after submit");
+            assert_eq!(bound.model(), "slug-a");
+            assert_eq!(bound.base_url(), "https://provider-a.example/v1");
+
+            actor
+                .handle_model_metadata_update_for_request(
+                    Some("req-submit-a"),
+                    crate::sampling::ResponseModelMetadata {
+                        context_window: None,
+                        max_completion_tokens: None,
+                        models_etag: Some("etag-from-submitted-a".to_string()),
+                    },
+                )
+                .await;
+
+            wait_for_fetch(&calls, 1).await;
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                last_url.lock().unwrap().as_deref(),
+                Some("https://provider-a.example/v1"),
+                "metadata after A-submit then switch-to-B must refresh A's origin"
+            );
+            let still_bound = actor
+                .bound_request_etag_origin("req-submit-a")
+                .expect("first metadata must retain the origin");
+            assert_eq!(still_bound.model(), "slug-a");
+            assert_eq!(still_bound.base_url(), "https://provider-a.example/v1");
+        })
+        .await;
+}
+
+/// Sampler retries reuse one `RequestId` and emit another `ModelMetadata`.
+/// The first event must not drop the origin, or a later attempt falls back
+/// to live catalog/session state after the owner changes.
+#[tokio::test(flavor = "current_thread")]
+async fn retry_metadata_keeps_bound_origin_after_owner_change() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (gateway_tx, _gateway_rx) =
+                mpsc::unbounded_channel::<xai_acp_lib::AcpClientMessage>();
+            let (persistence_tx, _persistence_rx) = mpsc::unbounded_channel::<PersistenceMsg>();
+            let mut actor = create_test_actor(0, 256_000, 85, gateway_tx, persistence_tx).await;
+
+            let cfg = endpoint_cfg();
+            let tmp = tempfile::TempDir::new().unwrap();
+            let auth_manager = Arc::new(AuthManager::new(tmp.path(), GrokComConfig::default()));
+            let calls = Arc::new(AtomicUsize::new(0));
+            let last_url = Arc::new(std::sync::Mutex::new(None));
+            actor.models_manager = ModelsManagerBuilder::new(
+                None,
+                resolve_model_catalog(&cfg, None),
+                agent_client_protocol::ModelId::new("alias-a"),
+                auth_manager,
+                cfg,
+            )
+            .endpoint(Arc::new(OriginCapture {
+                calls: calls.clone(),
+                last_url: last_url.clone(),
+            }))
+            .build();
+
+            actor.chat_state_handle.update_sampling_config(
+                xai_grok_sampling_types::SamplingConfig {
+                    model: "slug-a".to_string(),
+                    base_url: "https://provider-a.example/v1".to_string(),
+                    max_completion_tokens: None,
+                    temperature: None,
+                    top_p: None,
+                    api_backend: Default::default(),
+                    extra_headers: Default::default(),
+                    query_params: Default::default(),
+                    env_http_headers: Default::default(),
+                    context_window: std::num::NonZeroU64::new(256_000).unwrap(),
+                    reasoning_effort: None,
+                    stream_tool_calls: None,
+                },
+            );
+            *actor.session_catalog_key.lock() = "alias-a".to_string();
+
+            let origin = actor
+                .capture_request_etag_origin()
+                .await
+                .expect("origin at first attempt");
+            actor.bind_request_etag_origin("req-retry", origin);
+
+            actor
+                .handle_model_metadata_update_for_request(
+                    Some("req-retry"),
+                    crate::sampling::ResponseModelMetadata {
+                        context_window: None,
+                        max_completion_tokens: None,
+                        models_etag: Some("etag-attempt-1".to_string()),
+                    },
+                )
+                .await;
+            wait_for_fetch(&calls, 1).await;
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            assert!(
+                actor.bound_request_etag_origin("req-retry").is_some(),
+                "first ModelMetadata must clone, not remove, the request origin"
+            );
+
+            let _ = actor
+                .handle_set_session_model(
+                    sampling("slug-b", "https://provider-b.example/v1"),
+                    "alias-b".to_string(),
+                    false,
+                    false,
+                    true,
+                    85,
+                )
+                .await;
+            assert_eq!(
+                actor
+                    .chat_state_handle
+                    .get_sampling_config()
+                    .await
+                    .unwrap()
+                    .model,
+                "slug-b"
+            );
+
+            actor
+                .handle_model_metadata_update_for_request(
+                    Some("req-retry"),
+                    crate::sampling::ResponseModelMetadata {
+                        context_window: None,
+                        max_completion_tokens: None,
+                        models_etag: Some("etag-attempt-2".to_string()),
+                    },
+                )
+                .await;
+            wait_for_fetch(&calls, 2).await;
+            assert_eq!(calls.load(Ordering::SeqCst), 2);
+            assert_eq!(
+                last_url.lock().unwrap().as_deref(),
+                Some("https://provider-a.example/v1"),
+                "retry ModelMetadata on the same RequestId must keep A's bound origin"
+            );
+            let still = actor
+                .bound_request_etag_origin("req-retry")
+                .expect("origin lives until Completed/Failed");
+            assert_eq!(still.model(), "slug-a");
+            assert_eq!(still.base_url(), "https://provider-a.example/v1");
         })
         .await;
 }

@@ -151,6 +151,18 @@ impl EtagOrigin {
         }
         self
     }
+
+    pub(crate) fn model(&self) -> &str {
+        self.model.0.as_ref()
+    }
+
+    pub(crate) fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
+    pub(crate) fn catalog_key(&self) -> Option<&str> {
+        self.catalog_key.as_ref().map(|key| key.0.as_ref())
+    }
 }
 
 /// Catalog fields written together under one lock, so readers never see a torn mix.
