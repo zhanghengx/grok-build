@@ -2408,6 +2408,7 @@ mod inline_auto_compact_flow_tests {
             git_head_enabled: false,
             models_manager: Default::default(),
             session_catalog_key: parking_lot::Mutex::new(String::new()),
+            session_endpoint_owner: parking_lot::Mutex::new(None),
             inflight_etag_origins: parking_lot::Mutex::new(std::collections::HashMap::new()),
             display_cwd: std::sync::OnceLock::new(),
             active_agent_type: parking_lot::Mutex::new(None),

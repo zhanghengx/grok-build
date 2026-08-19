@@ -400,11 +400,11 @@ impl SessionActor {
     }
 
     /// Same as [`Self::reconstruct_full_config`], plus the session catalog
-    /// key snapshotted with the sampling config so a later
-    /// `SetSessionModel` cannot mix B's key onto A's submitted origin.
+    /// identity snapshotted with the sampling config so a later
+    /// `SetSessionModel` cannot mix B's key/owner onto A's submitted origin.
     pub(super) async fn reconstruct_full_config_with_catalog_key(
         &self,
-    ) -> (SamplingConfig, String) {
+    ) -> (SamplingConfig, String, Option<String>) {
         #[allow(clippy::items_after_statements)]
         #[derive(Debug)]
         struct TraceContextInjector;
@@ -417,12 +417,12 @@ impl SessionActor {
                 }
             }
         }
-        // Snapshot the catalog key before enqueueing the sampling-config
+        // Snapshot the catalog identity before enqueueing the sampling-config
         // query. `get_sampling_config` can park behind the chat-state
-        // actor; `SetSessionModel` can write B's key (and enqueue B's
-        // config) while A's query is already in flight. Reading the key
-        // after the await would pair A's config with B's key.
-        let catalog_key = self.session_catalog_key.lock().clone();
+        // actor; `SetSessionModel` can write B's key/owner (and enqueue B's
+        // config) while A's query is already in flight. Reading after the
+        // await would pair A's config with B's identity.
+        let (catalog_key, persisted_owner) = self.snapshot_session_catalog_identity();
         let cfg = self
             .chat_state_handle
             .get_sampling_config()
@@ -533,7 +533,7 @@ impl SessionActor {
             doom_loop_recovery: self.doom_loop_recovery,
             header_injector: Some(std::sync::Arc::new(TraceContextInjector)),
         };
-        (built, catalog_key)
+        (built, catalog_key, persisted_owner)
     }
     /// Install auto-mode permission classifier with a live LLM side-query
     /// (laziness-classifier pattern: `prepare_chat_completion` +
@@ -751,13 +751,13 @@ impl SessionActor {
         self.prepare_sampler_for_turn_with_origin_key().await.0
     }
 
-    /// Push config and return it together with the catalog key captured
+    /// Push config and return it together with the catalog identity captured
     /// on the same snapshot as `reconstruct_full_config`.
     pub(crate) async fn prepare_sampler_for_turn_with_origin_key(
         &self,
-    ) -> (xai_grok_sampler::SamplerConfig, String) {
+    ) -> (xai_grok_sampler::SamplerConfig, String, Option<String>) {
         self.refresh_token_if_expired().await;
-        let (mut sampler_config, catalog_key) =
+        let (mut sampler_config, catalog_key, persisted_owner) =
             self.reconstruct_full_config_with_catalog_key().await;
         if self.tool_context.task_output_token_budget.is_some()
             || self.tool_context.sampler_retry_only_before_output
@@ -766,7 +766,7 @@ impl SessionActor {
         }
         sampler_config.idle_timeout_secs = Some(self.inference_idle_timeout.as_secs());
         self.sampler_handle.update_config(sampler_config.clone());
-        (sampler_config, catalog_key)
+        (sampler_config, catalog_key, persisted_owner)
     }
     /// Fold an auth remedy into a turn failure: its advice becomes the tail of
     /// the message, and its `turn_error_type` the classification the client
@@ -1172,7 +1172,8 @@ impl SessionActor {
         self: &Arc<Self>,
         request: ConversationRequest,
     ) -> Result<SamplerTurnOutcome, acp::Error> {
-        let (submitted, catalog_key) = self.prepare_sampler_for_turn_with_origin_key().await;
+        let (submitted, catalog_key, persisted_owner) =
+            self.prepare_sampler_for_turn_with_origin_key().await;
         let stream_drained_rx = {
             let (tx, rx) = tokio::sync::oneshot::channel();
             *self.turn_stream_drained.lock() = Some(tx);
@@ -1183,7 +1184,9 @@ impl SessionActor {
         // Bind from the submitted snapshot, not a live `get_sampling_config`
         // reread: `reconstruct_full_config` may have already captured model A
         // and then awaited auth while `SetSessionModel` switched the actor to B.
-        if let Some(origin) = self.etag_origin_from_submitted_config(&submitted, catalog_key) {
+        if let Some(origin) =
+            self.etag_origin_from_submitted_config(&submitted, catalog_key, persisted_owner)
+        {
             self.bind_request_etag_origin(&request_id_str, origin);
         }
         match self

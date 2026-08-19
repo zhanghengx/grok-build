@@ -515,6 +515,25 @@ impl SessionActor {
             .insert(request_id.to_string(), origin);
     }
 
+    /// Snapshot the session catalog key and persisted endpoint owner under
+    /// one lock pair so a concurrent `SetSessionModel` cannot mix B's
+    /// identity onto A's in-flight reconstruct.
+    pub(super) fn snapshot_session_catalog_identity(&self) -> (String, Option<String>) {
+        let catalog_key = self.session_catalog_key.lock();
+        let endpoint_owner = self.session_endpoint_owner.lock();
+        (catalog_key.clone(), endpoint_owner.clone())
+    }
+
+    /// Persist a resolved configured owner with the session catalog key.
+    /// Later requests must not re-derive a dynamic model's owner from the
+    /// shared resident catalog.
+    pub(super) fn remember_session_endpoint_owner(&self, owner: impl Into<String>) {
+        let owner = owner.into();
+        if !owner.is_empty() {
+            *self.session_endpoint_owner.lock() = Some(owner);
+        }
+    }
+
     /// Origin of the `SamplerConfig` actually submitted to the sampler.
     ///
     /// Must not be rebuilt from a later `get_sampling_config()` reread: a
@@ -524,8 +543,9 @@ impl SessionActor {
         &self,
         cfg: &xai_grok_sampler::SamplerConfig,
         catalog_key: impl Into<String>,
+        persisted_owner: Option<String>,
     ) -> Option<crate::agent::models::EtagOrigin> {
-        self.etag_origin_from_model_url(&cfg.model, &cfg.base_url, catalog_key)
+        self.etag_origin_from_model_url(&cfg.model, &cfg.base_url, catalog_key, persisted_owner)
     }
 
     pub(super) fn etag_origin_from_model_url(
@@ -533,17 +553,26 @@ impl SessionActor {
         model: &str,
         base_url: &str,
         catalog_key: impl Into<String>,
+        persisted_owner: Option<String>,
     ) -> Option<crate::agent::models::EtagOrigin> {
         if model.is_empty() {
             return None;
         }
         let catalog_key = catalog_key.into();
-        let endpoint_owner =
-            self.models_manager
-                .configured_endpoint_owner_for_origin(model, base_url, &catalog_key);
         let mut origin =
-            crate::agent::models::EtagOrigin::new(model, base_url).with_catalog_key(catalog_key);
-        if let Some(owner) = endpoint_owner {
+            crate::agent::models::EtagOrigin::new(model, base_url).with_catalog_key(&catalog_key);
+        if let Some(owner) = persisted_owner.filter(|owner| !owner.is_empty()) {
+            origin = origin.with_endpoint_owner(owner);
+            return Some(origin);
+        }
+        // First successful resolve for this selection: capture from the
+        // shared catalog while it still matches, then persist on the session
+        // so subsequent requests no longer depend on it remaining resident.
+        if let Some(owner) =
+            self.models_manager
+                .configured_endpoint_owner_for_origin(model, base_url, &catalog_key)
+        {
+            self.remember_session_endpoint_owner(&owner);
             origin = origin.with_endpoint_owner(owner);
         }
         Some(origin)
@@ -552,13 +581,20 @@ impl SessionActor {
     pub(super) async fn capture_request_etag_origin(
         &self,
     ) -> Option<crate::agent::models::EtagOrigin> {
-        // Same atomicity rule as reconstruct: key first, then the config
-        // query, so a SetSessionModel interleaving cannot mix A/B.
-        let catalog_key = self.session_catalog_key.lock().clone();
+        // Same atomicity rule as reconstruct: identity first, then the
+        // config query, so a SetSessionModel interleaving cannot mix A/B.
+        let (catalog_key, persisted_owner) = self.snapshot_session_catalog_identity();
         self.chat_state_handle
             .get_sampling_config()
             .await
-            .and_then(|cfg| self.etag_origin_from_model_url(&cfg.model, &cfg.base_url, catalog_key))
+            .and_then(|cfg| {
+                self.etag_origin_from_model_url(
+                    &cfg.model,
+                    &cfg.base_url,
+                    catalog_key,
+                    persisted_owner,
+                )
+            })
     }
 
     pub(super) fn bound_request_etag_origin(

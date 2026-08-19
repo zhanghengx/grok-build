@@ -1071,6 +1071,41 @@ impl ModelsManager {
         self.inner.catalog.write().models.insert(id.into(), entry);
     }
 
+    /// Test-only: publish an endpoint-owned catalog as if `/models` just
+    /// returned `prefetched` for `owner`. Session tests use this to replace
+    /// the resident catalog without touching private `CatalogState` fields.
+    #[cfg(test)]
+    pub(crate) fn install_test_endpoint_catalog(
+        &self,
+        owner: &str,
+        prefetched: IndexMap<String, ModelEntry>,
+        etag: &str,
+    ) {
+        let owner_id = acp::ModelId::new(Arc::from(owner));
+        let endpoint_generation = {
+            let mut cat = self.inner.catalog.write();
+            if cat.catalog_owner.as_ref() != Some(&owner_id) {
+                if cat.catalog_owner.is_some() {
+                    cat.endpoint_generation = cat.endpoint_generation.saturating_add(1);
+                    cat.etag = None;
+                }
+                cat.catalog_owner = Some(owner_id.clone());
+            }
+            cat.endpoint_generation
+        };
+        let applied = self.apply_refresh_result_fenced(
+            None,
+            Some(prefetched),
+            Some(etag.to_string()),
+            None,
+            Some(endpoint_generation),
+            None,
+            CatalogSource::ModelEndpoint,
+            Some(owner_id),
+        );
+        debug_assert!(applied, "test endpoint catalog must apply");
+    }
+
     pub(crate) fn current_reasoning_effort(&self) -> Option<ReasoningEffort> {
         *self.inner.current_reasoning_effort.read()
     }

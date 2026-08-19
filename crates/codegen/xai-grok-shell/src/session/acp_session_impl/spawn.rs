@@ -1662,8 +1662,15 @@ pub(crate) async fn spawn_session_actor(
         agent: std::cell::RefCell::new(agent),
         last_reported_branch: Arc::new(Mutex::new(None)),
         git_head_enabled: fs_watch_caps.git_head,
-        models_manager,
+        models_manager: models_manager.clone(),
         session_catalog_key: parking_lot::Mutex::new(session_model_id.0.to_string()),
+        session_endpoint_owner: parking_lot::Mutex::new(
+            models_manager.configured_endpoint_owner_for_origin(
+                sampling_config.model.as_str(),
+                sampling_config.base_url.as_str(),
+                session_model_id.0.as_ref(),
+            ),
+        ),
         inflight_etag_origins: parking_lot::Mutex::new(std::collections::HashMap::new()),
         display_cwd: {
             let lock = std::sync::OnceLock::new();

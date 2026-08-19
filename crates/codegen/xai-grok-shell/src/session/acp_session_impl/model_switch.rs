@@ -47,7 +47,15 @@ impl SessionActor {
             })),
         );
         if !catalog_key.is_empty() {
-            *self.session_catalog_key.lock() = catalog_key;
+            let owner = self.models_manager.configured_endpoint_owner_for_origin(
+                sampling_config.model.as_str(),
+                sampling_config.base_url.as_str(),
+                &catalog_key,
+            );
+            let mut catalog_key_slot = self.session_catalog_key.lock();
+            let mut owner_slot = self.session_endpoint_owner.lock();
+            *catalog_key_slot = catalog_key;
+            *owner_slot = owner;
         }
         self.chat_state_handle
             .update_sampling_config(xai_grok_sampling_types::SamplingConfig {

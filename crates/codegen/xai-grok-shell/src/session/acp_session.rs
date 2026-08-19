@@ -774,6 +774,11 @@ pub(crate) struct SessionActor {
     /// Distinct from the routing slug in `SamplingConfig.model`; aliases can
     /// share a slug+URL while using different credentials.
     pub(crate) session_catalog_key: parking_lot::Mutex<String>,
+    /// Configured endpoint owner captured with [`Self::session_catalog_key`].
+    /// A dynamically returned catalog id is not itself a configured owner;
+    /// this must outlive the shared resident catalog so a later Leader
+    /// session cannot reclassify this session's ETags as global.
+    pub(crate) session_endpoint_owner: parking_lot::Mutex<Option<String>>,
     /// Immutable ETag origin captured when a sampling request is submitted,
     /// keyed by `request_id`. Metadata events must not re-read live sampling
     /// config after a later `set_session_model`.
