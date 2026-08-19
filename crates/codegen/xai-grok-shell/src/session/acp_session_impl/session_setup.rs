@@ -527,10 +527,23 @@ impl SessionActor {
     /// Persist a resolved configured owner with the session catalog key.
     /// Later requests must not re-derive a dynamic model's owner from the
     /// shared resident catalog.
-    pub(super) fn remember_session_endpoint_owner(&self, owner: impl Into<String>) {
+    ///
+    /// Only writes when the live catalog key still matches `for_catalog_key`.
+    /// An in-flight first-resolve (`persisted_owner = None`) that captured A
+    /// must not clobber B after `SetSessionModel` has already switched.
+    pub(super) fn remember_session_endpoint_owner(
+        &self,
+        for_catalog_key: &str,
+        owner: impl Into<String>,
+    ) {
         let owner = owner.into();
-        if !owner.is_empty() {
-            *self.session_endpoint_owner.lock() = Some(owner);
+        if owner.is_empty() || for_catalog_key.is_empty() {
+            return;
+        }
+        let catalog_key = self.session_catalog_key.lock();
+        let mut endpoint_owner = self.session_endpoint_owner.lock();
+        if catalog_key.as_str() == for_catalog_key {
+            *endpoint_owner = Some(owner);
         }
     }
 
@@ -572,7 +585,7 @@ impl SessionActor {
             self.models_manager
                 .configured_endpoint_owner_for_origin(model, base_url, &catalog_key)
         {
-            self.remember_session_endpoint_owner(&owner);
+            self.remember_session_endpoint_owner(&catalog_key, &owner);
             origin = origin.with_endpoint_owner(owner);
         }
         Some(origin)

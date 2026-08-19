@@ -514,6 +514,11 @@ async fn reconstruct_catalog_key_survives_set_session_model_during_config_query(
                 )
                 .await;
             assert_eq!(actor.session_catalog_key.lock().as_str(), "alias-b");
+            assert_eq!(
+                actor.session_endpoint_owner.lock().as_deref(),
+                Some("alias-b"),
+                "SetSessionModel must persist B's owner with B's key"
+            );
 
             let (submitted, catalog_key, persisted_owner) =
                 reconstruct.await.expect("reconstruct joined");
@@ -522,6 +527,10 @@ async fn reconstruct_catalog_key_survives_set_session_model_during_config_query(
             assert_eq!(
                 catalog_key, "alias-a",
                 "catalog key must be captured before the config query, not after SetSessionModel"
+            );
+            assert_eq!(
+                persisted_owner, None,
+                "A's reconstruct snapshot must not carry a later B owner"
             );
 
             let origin = actor
@@ -534,6 +543,11 @@ async fn reconstruct_catalog_key_survives_set_session_model_during_config_query(
                 origin.endpoint_owner(),
                 Some("alias-a"),
                 "A's submitted origin must keep A's configured owner"
+            );
+            assert_eq!(
+                actor.session_endpoint_owner.lock().as_deref(),
+                Some("alias-b"),
+                "A's first-resolve must not clobber B's session-held owner"
             );
 
             actor.bind_request_etag_origin("req-race-a", origin);
@@ -557,6 +571,92 @@ async fn reconstruct_catalog_key_survives_set_session_model_during_config_query(
                 last_key.lock().unwrap().as_deref(),
                 Some("a-key"),
                 "A's ETag must refresh A's credentials, not B's colliding alias"
+            );
+        })
+        .await;
+}
+
+/// An in-flight first-resolve (`persisted_owner = None`) for A after
+/// `SetSessionModel` has already written B must still stamp A's origin,
+/// but must not overwrite B's session-held owner.
+#[tokio::test(flavor = "current_thread")]
+async fn first_resolve_does_not_clobber_switched_session_owner() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (gateway_tx, _gateway_rx) =
+                mpsc::unbounded_channel::<xai_acp_lib::AcpClientMessage>();
+            let (persistence_tx, _persistence_rx) = mpsc::unbounded_channel::<PersistenceMsg>();
+            let mut actor = create_test_actor(0, 256_000, 85, gateway_tx, persistence_tx).await;
+
+            let cfg = colliding_alias_cfg();
+            let tmp = tempfile::TempDir::new().unwrap();
+            let auth_manager = Arc::new(AuthManager::new(tmp.path(), GrokComConfig::default()));
+            actor.models_manager = ModelsManagerBuilder::new(
+                None,
+                resolve_model_catalog(&cfg, None),
+                agent_client_protocol::ModelId::new("alias-a"),
+                auth_manager,
+                cfg,
+            )
+            .build();
+
+            actor.chat_state_handle.update_sampling_config(
+                xai_grok_sampling_types::SamplingConfig {
+                    model: "shared-slug".to_string(),
+                    base_url: "https://shared.example/v1".to_string(),
+                    max_completion_tokens: None,
+                    temperature: None,
+                    top_p: None,
+                    api_backend: Default::default(),
+                    extra_headers: Default::default(),
+                    query_params: Default::default(),
+                    env_http_headers: Default::default(),
+                    context_window: std::num::NonZeroU64::new(256_000).unwrap(),
+                    reasoning_effort: None,
+                    stream_tool_calls: None,
+                },
+            );
+            *actor.session_catalog_key.lock() = "alias-a".to_string();
+            *actor.session_endpoint_owner.lock() = None;
+
+            let _ = actor
+                .handle_set_session_model(
+                    sampling("shared-slug", "https://shared.example/v1"),
+                    "alias-b".to_string(),
+                    false,
+                    false,
+                    true,
+                    85,
+                )
+                .await;
+            assert_eq!(actor.session_catalog_key.lock().as_str(), "alias-b");
+            assert_eq!(
+                actor.session_endpoint_owner.lock().as_deref(),
+                Some("alias-b")
+            );
+
+            let submitted = sampling("shared-slug", "https://shared.example/v1");
+            let origin = actor
+                .etag_origin_from_submitted_config(&submitted, "alias-a", None)
+                .expect("A origin from late first-resolve");
+            assert_eq!(origin.catalog_key(), Some("alias-a"));
+            assert_eq!(origin.endpoint_owner(), Some("alias-a"));
+            assert_eq!(
+                actor.session_endpoint_owner.lock().as_deref(),
+                Some("alias-b"),
+                "late first-resolve for A must not overwrite B's persisted owner"
+            );
+
+            let later = actor
+                .capture_request_etag_origin()
+                .await
+                .expect("live B origin after late A first-resolve");
+            assert_eq!(later.catalog_key(), Some("alias-b"));
+            assert_eq!(
+                later.endpoint_owner(),
+                Some("alias-b"),
+                "subsequent live requests must keep B's session-held owner"
             );
         })
         .await;
