@@ -2,7 +2,7 @@ use super::support::*;
 use super::*;
 use crate::agent::models::resolve_model_catalog;
 use crate::agent::models::{
-    ModelEndpointFetchFuture, ModelEndpointRequest, ModelFetchAuth, ModelsEndpoint,
+    EtagOrigin, ModelEndpointFetchFuture, ModelEndpointRequest, ModelFetchAuth, ModelsEndpoint,
     ModelsFetchFuture, ModelsManagerBuilder, build_prefetched_map_with_model_context,
 };
 use crate::auth::{AuthManager, GrokAuth, GrokComConfig};
@@ -864,6 +864,201 @@ async fn persisted_session_owner_survives_catalog_replacement_on_later_request()
                 Some("a-key"),
                 "A's later ETag must use A's credentials, not B's"
             );
+        })
+        .await;
+}
+
+fn merged_catalog_cfg() -> crate::agent::config::Config {
+    crate::agent::config::Config::new_from_toml_cfg(
+        &toml::from_str(
+            r#"
+            [model.alias]
+            model = "endpoint-model"
+            base_url = "https://provider.example/v1"
+            api_key = "alias-key"
+
+            [model.byok]
+            model = "byok-slug"
+            base_url = "https://provider.example/v1"
+            api_key = "byok-key"
+            "#,
+        )
+        .expect("toml"),
+    )
+    .expect("config")
+}
+
+/// A config-only BYOK overlay that shares the resident endpoint URL is
+/// present in merged `cat.models` but absent from `cat.prefetched`. Submit
+/// must not persist the resident owner, and an ETag from that session must
+/// not refresh `/models` with the resident credentials.
+#[tokio::test(flavor = "current_thread")]
+async fn config_only_byok_sharing_url_does_not_inherit_resident_owner() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (gateway_tx, _gateway_rx) =
+                mpsc::unbounded_channel::<xai_acp_lib::AcpClientMessage>();
+            let (persistence_tx, _persistence_rx) = mpsc::unbounded_channel::<PersistenceMsg>();
+            let mut actor = create_test_actor(0, 256_000, 85, gateway_tx, persistence_tx).await;
+
+            let cfg = merged_catalog_cfg();
+            let tmp = tempfile::TempDir::new().unwrap();
+            let auth_manager = Arc::new(AuthManager::new(tmp.path(), GrokComConfig::default()));
+            let calls = Arc::new(AtomicUsize::new(0));
+            let last_url = Arc::new(std::sync::Mutex::new(None));
+            let last_key = Arc::new(std::sync::Mutex::new(None));
+            actor.models_manager = ModelsManagerBuilder::new(
+                None,
+                resolve_model_catalog(&cfg, None),
+                agent_client_protocol::ModelId::new("alias"),
+                auth_manager,
+                cfg.clone(),
+            )
+            .endpoint(Arc::new(OriginCapture {
+                calls: calls.clone(),
+                last_url: last_url.clone(),
+                last_key: last_key.clone(),
+            }))
+            .build();
+
+            let inherit = inherit_request("https://provider.example/v1", "alias-key");
+            let returned = build_prefetched_map_with_model_context(
+                vec![returned_entry(
+                    "from-endpoint",
+                    "https://provider.example/v1",
+                )],
+                &inherit,
+            );
+            actor
+                .models_manager
+                .install_test_endpoint_catalog("alias", returned, "etag-loaded");
+            assert!(
+                actor.models_manager.model_in_catalog("byok"),
+                "the BYOK overlay must appear in the merged catalog"
+            );
+            assert!(
+                actor.models_manager.model_in_catalog("from-endpoint"),
+                "the genuine returned model must remain catalogued"
+            );
+
+            actor.chat_state_handle.update_sampling_config(
+                xai_grok_sampling_types::SamplingConfig {
+                    model: "byok-slug".to_string(),
+                    base_url: "https://provider.example/v1".to_string(),
+                    max_completion_tokens: None,
+                    temperature: None,
+                    top_p: None,
+                    api_backend: Default::default(),
+                    extra_headers: Default::default(),
+                    query_params: Default::default(),
+                    env_http_headers: Default::default(),
+                    context_window: std::num::NonZeroU64::new(256_000).unwrap(),
+                    reasoning_effort: None,
+                    stream_tool_calls: None,
+                },
+            );
+            // Use the merged overlay's routing slug so submit-time ownership
+            // is not granted merely because `catalog_key` is a configured
+            // `[model.byok]` entry.
+            *actor.session_catalog_key.lock() = "byok-slug".to_string();
+            *actor.session_endpoint_owner.lock() = None;
+
+            let first = actor
+                .capture_request_etag_origin()
+                .await
+                .expect("origin for the config-only BYOK session");
+            assert_eq!(first.model(), "byok-slug");
+            assert_eq!(first.catalog_key(), Some("byok-slug"));
+            assert_eq!(
+                first.endpoint_owner(),
+                None,
+                "a config-only BYOK overlay must not persist the resident endpoint owner"
+            );
+            assert_eq!(
+                actor.session_endpoint_owner.lock().as_deref(),
+                None,
+                "the unrelated session must not remember the resident owner"
+            );
+
+            // Drive the returned-from-endpoint fallback: origin.model is the
+            // merged overlay key (not a unique configured routing slug), and
+            // no owner was persisted. Unique-slug matching would otherwise
+            // treat `[model.byok]` as its own endpoint and is not this P1.
+            let byok_fallback = EtagOrigin::new("byok", "https://provider.example/v1")
+                .with_catalog_key("byok-slug");
+            actor.bind_request_etag_origin("req-byok", byok_fallback);
+            actor
+                .handle_model_metadata_update_for_request(
+                    Some("req-byok"),
+                    crate::sampling::ResponseModelMetadata {
+                        context_window: None,
+                        max_completion_tokens: None,
+                        models_etag: Some("etag-byok".to_string()),
+                    },
+                )
+                .await;
+            for _ in 0..40 {
+                assert_eq!(
+                    calls.load(Ordering::SeqCst),
+                    0,
+                    "an ETag from the BYOK session must not refresh /models with the resident owner's credentials"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            assert_eq!(last_key.lock().unwrap().as_deref(), None);
+            assert_eq!(last_url.lock().unwrap().as_deref(), None);
+            assert!(
+                actor.models_manager.model_in_catalog("from-endpoint"),
+                "the BYOK ETag path must not replace the resident endpoint catalog"
+            );
+
+            actor.chat_state_handle.update_sampling_config(
+                xai_grok_sampling_types::SamplingConfig {
+                    model: "from-endpoint".to_string(),
+                    base_url: "https://provider.example/v1".to_string(),
+                    max_completion_tokens: None,
+                    temperature: None,
+                    top_p: None,
+                    api_backend: Default::default(),
+                    extra_headers: Default::default(),
+                    query_params: Default::default(),
+                    env_http_headers: Default::default(),
+                    context_window: std::num::NonZeroU64::new(256_000).unwrap(),
+                    reasoning_effort: None,
+                    stream_tool_calls: None,
+                },
+            );
+            *actor.session_catalog_key.lock() = "from-endpoint".to_string();
+            *actor.session_endpoint_owner.lock() = None;
+
+            let genuine = actor
+                .capture_request_etag_origin()
+                .await
+                .expect("origin for a genuinely returned model");
+            assert_eq!(
+                genuine.endpoint_owner(),
+                Some("alias"),
+                "a genuine prefetched/returned model must still keep the resident configured owner"
+            );
+            actor.bind_request_etag_origin("req-returned", genuine);
+            actor
+                .handle_model_metadata_update_for_request(
+                    Some("req-returned"),
+                    crate::sampling::ResponseModelMetadata {
+                        context_window: None,
+                        max_completion_tokens: None,
+                        models_etag: Some("etag-next".to_string()),
+                    },
+                )
+                .await;
+            wait_for_fetch(&calls, 1).await;
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                last_url.lock().unwrap().as_deref(),
+                Some("https://provider.example/v1")
+            );
+            assert_eq!(last_key.lock().unwrap().as_deref(), Some("alias-key"));
         })
         .await;
 }

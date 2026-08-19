@@ -8795,3 +8795,199 @@ async fn persisted_origin_owner_survives_resident_catalog_replacement() {
         "A's persisted origin owner must become the refresh target"
     );
 }
+
+/// A config-only BYOK overlay shares the resident endpoint URL and therefore
+/// appears in merged `cat.models`, but it was never in `cat.prefetched`.
+/// Ownership must be proven against the prefetched catalog so that overlay
+/// is not treated as returned by the resident endpoint.
+#[tokio::test]
+async fn config_only_byok_sharing_url_is_not_treated_as_returned_by_endpoint() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct CaptureOwner {
+        calls: Arc<AtomicUsize>,
+        last_key: Arc<std::sync::Mutex<Option<String>>>,
+        last_url: Arc<std::sync::Mutex<Option<String>>>,
+    }
+    impl ModelsEndpoint for CaptureOwner {
+        fn fetch_models(
+            &self,
+            _endpoints: config::EndpointsConfig,
+            _auth: Option<GrokAuth>,
+            _fetch_auth: ModelFetchAuth,
+        ) -> ModelsFetchFuture {
+            Box::pin(async { None })
+        }
+
+        fn fetch_model_endpoint(&self, request: ModelEndpointRequest) -> ModelEndpointFetchFuture {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            *self.last_key.lock().unwrap() = Some(request.api_key.clone());
+            *self.last_url.lock().unwrap() = Some(request.base_url.clone());
+            Box::pin(async {
+                Some((
+                    make_prefetched(&["should-not-publish"]),
+                    Some("etag-should-not-publish".into()),
+                ))
+            })
+        }
+    }
+
+    let cfg = config_from_toml(
+        r#"
+            [model.alias]
+            model = "endpoint-model"
+            base_url = "https://provider.example/v1"
+            api_key = "alias-key"
+
+            [model.byok]
+            model = "byok-slug"
+            base_url = "https://provider.example/v1"
+            api_key = "byok-key"
+            "#,
+    );
+    let tmp = tempfile::TempDir::new().unwrap();
+    let auth_manager = Arc::new(AuthManager::new(tmp.path(), GrokComConfig::default()));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let last_key = Arc::new(std::sync::Mutex::new(None));
+    let last_url = Arc::new(std::sync::Mutex::new(None));
+    let mgr = ModelsManagerBuilder::new(
+        None,
+        resolve_model_catalog(&cfg, None),
+        acp::ModelId::new("alias"),
+        auth_manager,
+        cfg.clone(),
+    )
+    .endpoint(Arc::new(CaptureOwner {
+        calls: calls.clone(),
+        last_key: last_key.clone(),
+        last_url: last_url.clone(),
+    }))
+    .cache(test_cache_manager(tmp.path()))
+    .build();
+
+    let inherit = ModelEndpointRequest {
+        base_url: "https://provider.example/v1".to_string(),
+        api_key: "alias-key".to_string(),
+        api_backend: Default::default(),
+        auth_scheme: Default::default(),
+        configured_api_key: Some("alias-key".to_string()),
+        configured_env_key: None,
+        auth_provider: None,
+        extra_headers: IndexMap::new(),
+        query_params: IndexMap::new(),
+        env_http_headers: IndexMap::new(),
+    };
+    let mut returned_cfg = make_entry_config("from-endpoint", None);
+    returned_cfg.base_url = "https://provider.example/v1".to_string();
+    let returned = build_prefetched_map_with_model_context(vec![returned_cfg], &inherit);
+    {
+        let mut cat = mgr.inner.catalog.write();
+        cat.prefetched = Some(returned.clone());
+        cat.models = resolve_model_catalog(&cfg, cat.prefetched.clone());
+        cat.has_fetched_real_catalog = true;
+        cat.model_endpoint_catalog_loaded = true;
+        cat.catalog_source = CatalogSource::ModelEndpoint;
+        cat.catalog_owner = Some(acp::ModelId::new("alias"));
+        cat.etag = Some("etag-loaded".to_string());
+    }
+    {
+        let cat = mgr.inner.catalog.read();
+        assert!(
+            cat.models.contains_key("byok"),
+            "the BYOK overlay must be present in the merged catalog"
+        );
+        assert!(
+            cat.prefetched
+                .as_ref()
+                .is_some_and(|m| !m.contains_key("byok")
+                    && !m.contains_key("byok-slug")
+                    && m.contains_key("from-endpoint")),
+            "the BYOK overlay must be absent from the prefetched catalog; the returned model must be present"
+        );
+        assert!(
+            cat.models.contains_key("from-endpoint"),
+            "the genuine returned model must also appear in the merged overlay"
+        );
+    }
+
+    // Routing-slug session identity: not a configured key, so submit-time
+    // ownership falls through to the returned-from-endpoint scan.
+    let byok_owner = mgr.configured_endpoint_owner_for_origin(
+        "byok-slug",
+        "https://provider.example/v1",
+        "byok-slug",
+    );
+    assert_eq!(
+        byok_owner, None,
+        "a config-only BYOK overlay must not inherit the resident endpoint owner"
+    );
+
+    let genuine_owner = mgr
+        .configured_endpoint_owner_for_origin(
+            "from-endpoint",
+            "https://provider.example/v1",
+            "from-endpoint",
+        )
+        .expect("submit-time owner for a genuinely returned model");
+    assert_eq!(genuine_owner, "alias");
+
+    // Analogous ETag fallback: no persisted owner. Origin model is the
+    // merged overlay key (not a unique configured routing slug) so this
+    // reaches `session_origin_endpoint_owner`'s returned-from-endpoint
+    // scan instead of the configured-key / unique-slug branches.
+    mgr.refresh_if_new_etag(
+        "etag-byok".to_string(),
+        Some(EtagOrigin::new("byok", "https://provider.example/v1").with_catalog_key("byok-slug")),
+    )
+    .await;
+    for _ in 0..40 {
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "an ETag from the BYOK session must not refresh /models with the resident owner's credentials"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert_eq!(last_key.lock().unwrap().as_deref(), None);
+    {
+        let cat = mgr.inner.catalog.read();
+        assert_eq!(
+            cat.catalog_owner.as_ref().map(|o| o.0.as_ref()),
+            Some("alias")
+        );
+        assert_eq!(cat.etag.as_deref(), Some("etag-loaded"));
+        assert!(
+            cat.prefetched.as_ref().is_some_and(
+                |m| m.contains_key("from-endpoint") && !m.contains_key("should-not-publish")
+            ),
+            "the BYOK ETag path must not replace the resident endpoint catalog"
+        );
+    }
+
+    // No persisted owner: this must take the returned-from-endpoint fallback
+    // in `session_origin_endpoint_owner`, not a configured-key match.
+    mgr.refresh_if_new_etag(
+        "etag-next".to_string(),
+        Some(
+            EtagOrigin::new("from-endpoint", "https://provider.example/v1")
+                .with_catalog_key("from-endpoint"),
+        ),
+    )
+    .await;
+    for _ in 0..200 {
+        if calls.load(Ordering::SeqCst) > 0 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "a genuine prefetched/returned model must still refresh the owning endpoint"
+    );
+    assert_eq!(
+        last_url.lock().unwrap().as_deref(),
+        Some("https://provider.example/v1")
+    );
+    assert_eq!(last_key.lock().unwrap().as_deref(), Some("alias-key"));
+}

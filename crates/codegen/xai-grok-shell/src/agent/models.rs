@@ -256,6 +256,37 @@ fn endpoint_entry_context_differs(raw: &config::ModelEntry, resolved: &config::M
         || raw.api_base_url != resolved.api_base_url
 }
 
+/// True when `model` / `catalog_key` was returned by the resident endpoint
+/// (`cat.prefetched`) and the merged overlay still carries that endpoint's
+/// connection context. Config-only `[model.*]` overlays live in `cat.models`
+/// even when they were never in the `/models` response, so membership must
+/// not be proven against the merged catalog.
+fn returned_from_resident_endpoint(
+    cat: &CatalogState,
+    model: &str,
+    catalog_key: &str,
+    base_url: &str,
+) -> bool {
+    let Some(prefetched) = cat.prefetched.as_ref() else {
+        return false;
+    };
+    let id_matches = |key: &str, entry: &config::ModelEntry| {
+        key == model
+            || entry.info.model == model
+            || (!catalog_key.is_empty() && (key == catalog_key || entry.info.model == catalog_key))
+    };
+    let Some((key, _)) = prefetched
+        .iter()
+        .find(|(key, entry)| id_matches(key, entry))
+    else {
+        return false;
+    };
+    // Overlay context lives on the merged catalog entry; membership does not.
+    cat.models.get(key).is_some_and(|entry| {
+        entry.has_own_credentials() && resolve_credentials(entry, None).base_url == base_url
+    })
+}
+
 /// Whether a `[model.<key>]` entry, directly or through its provider, defines
 /// a model-owned endpoint URL.
 fn config_model_has_endpoint(cfg: &config::Config, key: &str) -> bool {
@@ -2052,15 +2083,9 @@ impl ModelsManager {
                     && config_model_has_endpoint(&cfg, owner_key)
                     && resolve_credentials(entry, None).base_url == base_url
             });
-            let returned_from_owner = cat.models.iter().any(|(key, entry)| {
-                (key == model
-                    || entry.info.model == model
-                    || (!catalog_key.is_empty()
-                        && (key == catalog_key || entry.info.model == catalog_key)))
-                    && entry.has_own_credentials()
-                    && resolve_credentials(entry, None).base_url == base_url
-            });
-            if owner_matches_url && returned_from_owner {
+            if owner_matches_url
+                && returned_from_resident_endpoint(&cat, model, catalog_key, base_url)
+            {
                 return Some(owner_key.to_string());
             }
         }
@@ -2131,15 +2156,17 @@ impl ModelsManager {
         // A dynamic model returned by a configured endpoint stays owned by
         // that catalog owner. Using the returned key as the owner would
         // fail the Leader fence and then stop later ETag refreshes.
-        let returned_match = cat.models.iter().any(|(_, entry)| {
-            (entry.info.model == origin.model.0.as_ref()
-                || origin.catalog_key.as_ref().is_some_and(|key| {
-                    entry.info.model == key.0.as_ref() || key.0.as_ref() == origin.model.0.as_ref()
-                }))
-                && entry.has_own_credentials()
-                && resolve_credentials(entry, None).base_url == origin.base_url
-        });
-        if returned_match {
+        let catalog_key = origin
+            .catalog_key
+            .as_ref()
+            .map(|key| key.0.as_ref())
+            .unwrap_or("");
+        if returned_from_resident_endpoint(
+            cat,
+            origin.model.0.as_ref(),
+            catalog_key,
+            &origin.base_url,
+        ) {
             return cat.catalog_owner.clone();
         }
         None
