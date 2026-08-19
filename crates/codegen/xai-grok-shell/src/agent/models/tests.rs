@@ -8242,11 +8242,20 @@ async fn session_origin_keeps_dynamic_returned_model_tied_to_configured_owner() 
         cat.etag = Some("etag-loaded".to_string());
     }
 
+    let owner = mgr
+        .configured_endpoint_owner_for_origin(
+            "provider-model",
+            "https://provider.example/v1",
+            "provider-model",
+        )
+        .expect("submit-time owner for returned model");
+    assert_eq!(owner, "alias");
     mgr.refresh_if_new_etag(
         "etag-next".to_string(),
         Some(
             EtagOrigin::new("provider-model", "https://provider.example/v1")
-                .with_catalog_key("provider-model"),
+                .with_catalog_key("provider-model")
+                .with_endpoint_owner(owner),
         ),
     )
     .await;
@@ -8603,5 +8612,186 @@ async fn colliding_alias_etag_uses_session_catalog_key() {
             .as_ref()
             .map(|o| o.0.as_ref()),
         Some("second")
+    );
+}
+
+/// Session A submits a dynamically returned model while owning endpoint A.
+/// Session B then replaces the resident catalog. A's ETag must still
+/// refresh A's endpoint from the owner persisted on the request origin,
+/// not from a live catalog scan that no longer contains A's dynamic entry.
+#[tokio::test]
+async fn persisted_origin_owner_survives_resident_catalog_replacement() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct DualCapture {
+        calls: Arc<AtomicUsize>,
+        last_url: Arc<std::sync::Mutex<Option<String>>>,
+        last_key: Arc<std::sync::Mutex<Option<String>>>,
+    }
+    impl ModelsEndpoint for DualCapture {
+        fn fetch_models(
+            &self,
+            _endpoints: config::EndpointsConfig,
+            _auth: Option<GrokAuth>,
+            _fetch_auth: ModelFetchAuth,
+        ) -> ModelsFetchFuture {
+            Box::pin(async { None })
+        }
+
+        fn fetch_model_endpoint(&self, request: ModelEndpointRequest) -> ModelEndpointFetchFuture {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            *self.last_url.lock().unwrap() = Some(request.base_url.clone());
+            *self.last_key.lock().unwrap() = Some(request.api_key.clone());
+            let is_a = request.base_url.contains("provider-a");
+            Box::pin(async move {
+                if is_a {
+                    Some((
+                        make_prefetched(&["from-a-refresh"]),
+                        Some("etag-a-next".into()),
+                    ))
+                } else {
+                    Some((make_prefetched(&["from-b"]), Some("etag-b".into())))
+                }
+            })
+        }
+    }
+
+    let cfg = config_from_toml(
+        r#"
+            [model.endpoint-a]
+            model = "slug-a"
+            base_url = "https://provider-a.example/v1"
+            api_key = "a-key"
+
+            [model.endpoint-b]
+            model = "slug-b"
+            base_url = "https://provider-b.example/v1"
+            api_key = "b-key"
+            "#,
+    );
+    let tmp = tempfile::TempDir::new().unwrap();
+    let auth_manager = Arc::new(AuthManager::new(tmp.path(), GrokComConfig::default()));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let last_url = Arc::new(std::sync::Mutex::new(None));
+    let last_key = Arc::new(std::sync::Mutex::new(None));
+    let mgr = ModelsManagerBuilder::new(
+        None,
+        resolve_model_catalog(&cfg, None),
+        acp::ModelId::new("endpoint-a"),
+        auth_manager,
+        cfg.clone(),
+    )
+    .endpoint(Arc::new(DualCapture {
+        calls: calls.clone(),
+        last_url: last_url.clone(),
+        last_key: last_key.clone(),
+    }))
+    .cache(test_cache_manager(tmp.path()))
+    .build();
+
+    let inherit_a = ModelEndpointRequest {
+        base_url: "https://provider-a.example/v1".to_string(),
+        api_key: "a-key".to_string(),
+        api_backend: Default::default(),
+        auth_scheme: Default::default(),
+        configured_api_key: Some("a-key".to_string()),
+        configured_env_key: None,
+        auth_provider: None,
+        extra_headers: IndexMap::new(),
+        query_params: IndexMap::new(),
+        env_http_headers: IndexMap::new(),
+    };
+    let mut returned_cfg = make_entry_config("dynamic-from-a", None);
+    returned_cfg.base_url = "https://provider-a.example/v1".to_string();
+    let returned = build_prefetched_map_with_model_context(vec![returned_cfg], &inherit_a);
+    {
+        let mut cat = mgr.inner.catalog.write();
+        cat.prefetched = Some(returned.clone());
+        cat.models = resolve_model_catalog(&cfg, cat.prefetched.clone());
+        cat.has_fetched_real_catalog = true;
+        cat.model_endpoint_catalog_loaded = true;
+        cat.catalog_source = CatalogSource::ModelEndpoint;
+        cat.catalog_owner = Some(acp::ModelId::new("endpoint-a"));
+        cat.etag = Some("etag-a-loaded".to_string());
+    }
+
+    // Submit-time capture while A owns the resident catalog.
+    let owner = mgr
+        .configured_endpoint_owner_for_origin(
+            "dynamic-from-a",
+            "https://provider-a.example/v1",
+            "dynamic-from-a",
+        )
+        .expect("submit-time owner for A's dynamic model");
+    assert_eq!(owner, "endpoint-a");
+    let origin = EtagOrigin::new("dynamic-from-a", "https://provider-a.example/v1")
+        .with_catalog_key("dynamic-from-a")
+        .with_endpoint_owner(owner);
+    assert_eq!(origin.endpoint_owner(), Some("endpoint-a"));
+    assert_eq!(origin.catalog_key(), Some("dynamic-from-a"));
+
+    // Session B replaces the resident catalog before A's ETag arrives.
+    {
+        let inherit_b = ModelEndpointRequest {
+            base_url: "https://provider-b.example/v1".to_string(),
+            api_key: "b-key".to_string(),
+            api_backend: Default::default(),
+            auth_scheme: Default::default(),
+            configured_api_key: Some("b-key".to_string()),
+            configured_env_key: None,
+            auth_provider: None,
+            extra_headers: IndexMap::new(),
+            query_params: IndexMap::new(),
+            env_http_headers: IndexMap::new(),
+        };
+        let mut returned_b = make_entry_config("dynamic-from-b", None);
+        returned_b.base_url = "https://provider-b.example/v1".to_string();
+        let returned_b = build_prefetched_map_with_model_context(vec![returned_b], &inherit_b);
+        let mut cat = mgr.inner.catalog.write();
+        cat.prefetched = Some(returned_b.clone());
+        cat.models = resolve_model_catalog(&cfg, cat.prefetched.clone());
+        cat.has_fetched_real_catalog = true;
+        cat.model_endpoint_catalog_loaded = true;
+        cat.catalog_source = CatalogSource::ModelEndpoint;
+        cat.catalog_owner = Some(acp::ModelId::new("endpoint-b"));
+        cat.etag = Some("etag-b-loaded".to_string());
+        cat.endpoint_generation = cat.endpoint_generation.saturating_add(1);
+    }
+    assert!(
+        !mgr.inner
+            .catalog
+            .read()
+            .models
+            .contains_key("dynamic-from-a"),
+        "B's catalog must have replaced A's dynamic entry"
+    );
+
+    mgr.refresh_if_new_etag("etag-a-next".to_string(), Some(origin))
+        .await;
+    for _ in 0..200 {
+        if last_url.lock().unwrap().as_deref() == Some("https://provider-a.example/v1") {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "A's ETag must still refresh after B replaced the resident catalog"
+    );
+    assert_eq!(
+        last_url.lock().unwrap().as_deref(),
+        Some("https://provider-a.example/v1")
+    );
+    assert_eq!(last_key.lock().unwrap().as_deref(), Some("a-key"));
+    assert_eq!(
+        mgr.inner
+            .catalog
+            .read()
+            .catalog_owner
+            .as_ref()
+            .map(|o| o.0.as_ref()),
+        Some("endpoint-a"),
+        "A's persisted origin owner must become the refresh target"
     );
 }

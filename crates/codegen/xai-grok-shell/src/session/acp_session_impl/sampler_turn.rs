@@ -417,6 +417,12 @@ impl SessionActor {
                 }
             }
         }
+        // Snapshot the catalog key before enqueueing the sampling-config
+        // query. `get_sampling_config` can park behind the chat-state
+        // actor; `SetSessionModel` can write B's key (and enqueue B's
+        // config) while A's query is already in flight. Reading the key
+        // after the await would pair A's config with B's key.
+        let catalog_key = self.session_catalog_key.lock().clone();
         let cfg = self
             .chat_state_handle
             .get_sampling_config()
@@ -435,7 +441,6 @@ impl SessionActor {
                 reasoning_effort: None,
                 stream_tool_calls: None,
             });
-        let catalog_key = self.session_catalog_key.lock().clone();
         let creds = self.chat_state_handle.get_credentials().await;
         let model_facts = self.model_auth_facts(cfg.model.as_str());
         let auth_method = self.auth_method_id.load();
@@ -1178,7 +1183,7 @@ impl SessionActor {
         // Bind from the submitted snapshot, not a live `get_sampling_config`
         // reread: `reconstruct_full_config` may have already captured model A
         // and then awaited auth while `SetSessionModel` switched the actor to B.
-        if let Some(origin) = Self::etag_origin_from_submitted_config(&submitted, catalog_key) {
+        if let Some(origin) = self.etag_origin_from_submitted_config(&submitted, catalog_key) {
             self.bind_request_etag_origin(&request_id_str, origin);
         }
         match self

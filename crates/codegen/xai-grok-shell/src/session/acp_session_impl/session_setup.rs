@@ -521,13 +521,15 @@ impl SessionActor {
     /// concurrent `SetSessionModel` can change live chat state after
     /// `reconstruct_full_config` / `update_config` already committed model A.
     pub(super) fn etag_origin_from_submitted_config(
+        &self,
         cfg: &xai_grok_sampler::SamplerConfig,
         catalog_key: impl Into<String>,
     ) -> Option<crate::agent::models::EtagOrigin> {
-        Self::etag_origin_from_model_url(&cfg.model, &cfg.base_url, catalog_key)
+        self.etag_origin_from_model_url(&cfg.model, &cfg.base_url, catalog_key)
     }
 
     pub(super) fn etag_origin_from_model_url(
+        &self,
         model: &str,
         base_url: &str,
         catalog_key: impl Into<String>,
@@ -535,19 +537,28 @@ impl SessionActor {
         if model.is_empty() {
             return None;
         }
-        Some(crate::agent::models::EtagOrigin::new(model, base_url).with_catalog_key(catalog_key))
+        let catalog_key = catalog_key.into();
+        let endpoint_owner =
+            self.models_manager
+                .configured_endpoint_owner_for_origin(model, base_url, &catalog_key);
+        let mut origin =
+            crate::agent::models::EtagOrigin::new(model, base_url).with_catalog_key(catalog_key);
+        if let Some(owner) = endpoint_owner {
+            origin = origin.with_endpoint_owner(owner);
+        }
+        Some(origin)
     }
 
     pub(super) async fn capture_request_etag_origin(
         &self,
     ) -> Option<crate::agent::models::EtagOrigin> {
+        // Same atomicity rule as reconstruct: key first, then the config
+        // query, so a SetSessionModel interleaving cannot mix A/B.
         let catalog_key = self.session_catalog_key.lock().clone();
         self.chat_state_handle
             .get_sampling_config()
             .await
-            .and_then(|cfg| {
-                Self::etag_origin_from_model_url(&cfg.model, &cfg.base_url, catalog_key)
-            })
+            .and_then(|cfg| self.etag_origin_from_model_url(&cfg.model, &cfg.base_url, catalog_key))
     }
 
     pub(super) fn bound_request_etag_origin(

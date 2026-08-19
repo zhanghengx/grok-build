@@ -35,6 +35,7 @@ fn endpoint_cfg() -> crate::agent::config::Config {
 struct OriginCapture {
     calls: Arc<AtomicUsize>,
     last_url: Arc<std::sync::Mutex<Option<String>>>,
+    last_key: Arc<std::sync::Mutex<Option<String>>>,
 }
 impl ModelsEndpoint for OriginCapture {
     fn fetch_models(
@@ -49,8 +50,31 @@ impl ModelsEndpoint for OriginCapture {
     fn fetch_model_endpoint(&self, request: ModelEndpointRequest) -> ModelEndpointFetchFuture {
         self.calls.fetch_add(1, Ordering::SeqCst);
         *self.last_url.lock().unwrap() = Some(request.base_url.clone());
+        *self.last_key.lock().unwrap() = Some(request.api_key.clone());
         Box::pin(async { Some((IndexMap::new(), Some("etag-from-a".to_string()))) })
     }
+}
+
+fn colliding_alias_cfg() -> crate::agent::config::Config {
+    crate::agent::config::Config::new_from_toml_cfg(
+        &toml::from_str(
+            r#"
+            [model.alias-a]
+            model = "shared-slug"
+            base_url = "https://shared.example/v1"
+            api_key = "a-key"
+            extra_headers = { X-Tenant = "one" }
+
+            [model.alias-b]
+            model = "shared-slug"
+            base_url = "https://shared.example/v1"
+            api_key = "b-key"
+            extra_headers = { X-Tenant = "two" }
+            "#,
+        )
+        .expect("toml"),
+    )
+    .expect("config")
 }
 
 fn sampling(model: &str, url: &str) -> xai_grok_sampler::SamplerConfig {
@@ -88,6 +112,7 @@ async fn inflight_etag_keeps_origin_after_set_session_model() {
             .endpoint(Arc::new(OriginCapture {
                 calls: calls.clone(),
                 last_url: last_url.clone(),
+                last_key: Arc::new(std::sync::Mutex::new(None)),
             }))
             .build();
 
@@ -195,6 +220,7 @@ async fn submitted_sampler_config_origin_survives_set_session_model() {
             .endpoint(Arc::new(OriginCapture {
                 calls: calls.clone(),
                 last_url: last_url.clone(),
+                last_key: Arc::new(std::sync::Mutex::new(None)),
             }))
             .build();
 
@@ -242,7 +268,8 @@ async fn submitted_sampler_config_origin_survives_set_session_model() {
             assert_eq!(live_origin.model(), "slug-b");
             assert_eq!(live_origin.base_url(), "https://provider-b.example/v1");
 
-            let origin = SessionActor::etag_origin_from_submitted_config(&submitted, catalog_key)
+            let origin = actor
+                .etag_origin_from_submitted_config(&submitted, catalog_key)
                 .expect("origin from submitted config");
             assert_eq!(origin.model(), "slug-a");
             assert_eq!(origin.base_url(), "https://provider-a.example/v1");
@@ -314,6 +341,7 @@ async fn retry_metadata_keeps_bound_origin_after_owner_change() {
             .endpoint(Arc::new(OriginCapture {
                 calls: calls.clone(),
                 last_url: last_url.clone(),
+                last_key: Arc::new(std::sync::Mutex::new(None)),
             }))
             .build();
 
@@ -400,6 +428,134 @@ async fn retry_metadata_keeps_bound_origin_after_owner_change() {
                 .expect("origin lives until Completed/Failed");
             assert_eq!(still.model(), "slug-a");
             assert_eq!(still.base_url(), "https://provider-a.example/v1");
+        })
+        .await;
+}
+
+/// `get_sampling_config` can enqueue while A is active; after yield,
+/// `SetSessionModel` writes B's catalog key before reconstruct resumes.
+/// The shipped reconstruct must still bind A's key, not B's.
+#[tokio::test(flavor = "current_thread")]
+async fn reconstruct_catalog_key_survives_set_session_model_during_config_query() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (gateway_tx, _gateway_rx) =
+                mpsc::unbounded_channel::<xai_acp_lib::AcpClientMessage>();
+            let (persistence_tx, _persistence_rx) = mpsc::unbounded_channel::<PersistenceMsg>();
+            let mut actor = create_test_actor(0, 256_000, 85, gateway_tx, persistence_tx).await;
+
+            let cfg = colliding_alias_cfg();
+            let tmp = tempfile::TempDir::new().unwrap();
+            let auth_manager = Arc::new(AuthManager::new(tmp.path(), GrokComConfig::default()));
+            let calls = Arc::new(AtomicUsize::new(0));
+            let last_url = Arc::new(std::sync::Mutex::new(None));
+            let last_key = Arc::new(std::sync::Mutex::new(None));
+            actor.models_manager = ModelsManagerBuilder::new(
+                None,
+                resolve_model_catalog(&cfg, None),
+                agent_client_protocol::ModelId::new("alias-a"),
+                auth_manager,
+                cfg,
+            )
+            .endpoint(Arc::new(OriginCapture {
+                calls: calls.clone(),
+                last_url: last_url.clone(),
+                last_key: last_key.clone(),
+            }))
+            .build();
+
+            actor.chat_state_handle.update_sampling_config(
+                xai_grok_sampling_types::SamplingConfig {
+                    model: "shared-slug".to_string(),
+                    base_url: "https://shared.example/v1".to_string(),
+                    max_completion_tokens: None,
+                    temperature: None,
+                    top_p: None,
+                    api_backend: Default::default(),
+                    extra_headers: Default::default(),
+                    query_params: Default::default(),
+                    env_http_headers: Default::default(),
+                    context_window: std::num::NonZeroU64::new(256_000).unwrap(),
+                    reasoning_effort: None,
+                    stream_tool_calls: None,
+                },
+            );
+            *actor.session_catalog_key.lock() = "alias-a".to_string();
+            // Flush A's config through the chat-state actor before the race.
+            let primed = actor.chat_state_handle.get_sampling_config().await.unwrap();
+            assert_eq!(primed.model, "shared-slug");
+            assert_eq!(primed.base_url, "https://shared.example/v1");
+
+            // Fill the chat-state queue so GetSamplingConfig stays pending
+            // while SetSessionModel writes B's catalog key (the interleaving
+            // the review describes).
+            for _ in 0..64 {
+                actor.chat_state_handle.record_token_usage(0);
+            }
+
+            let actor = std::sync::Arc::new(actor);
+            let reconstruct = tokio::task::spawn_local({
+                let actor = actor.clone();
+                async move { actor.reconstruct_full_config_with_catalog_key().await }
+            });
+            // Yield so reconstruct can snapshot A's key and enqueue
+            // GetSamplingConfig, then switch the session to B.
+            tokio::task::yield_now().await;
+            let _ = actor
+                .handle_set_session_model(
+                    sampling("shared-slug", "https://shared.example/v1"),
+                    "alias-b".to_string(),
+                    false,
+                    false,
+                    true,
+                    85,
+                )
+                .await;
+            assert_eq!(actor.session_catalog_key.lock().as_str(), "alias-b");
+
+            let (submitted, catalog_key) = reconstruct.await.expect("reconstruct joined");
+            assert_eq!(submitted.model, "shared-slug");
+            assert_eq!(submitted.base_url, "https://shared.example/v1");
+            assert_eq!(
+                catalog_key, "alias-a",
+                "catalog key must be captured before the config query, not after SetSessionModel"
+            );
+
+            let origin = actor
+                .etag_origin_from_submitted_config(&submitted, catalog_key)
+                .expect("origin from reconstruct snapshot");
+            assert_eq!(origin.model(), "shared-slug");
+            assert_eq!(origin.base_url(), "https://shared.example/v1");
+            assert_eq!(origin.catalog_key(), Some("alias-a"));
+            assert_eq!(
+                origin.endpoint_owner(),
+                Some("alias-a"),
+                "A's submitted origin must keep A's configured owner"
+            );
+
+            actor.bind_request_etag_origin("req-race-a", origin);
+            actor
+                .handle_model_metadata_update_for_request(
+                    Some("req-race-a"),
+                    crate::sampling::ResponseModelMetadata {
+                        context_window: None,
+                        max_completion_tokens: None,
+                        models_etag: Some("etag-from-shared-a".to_string()),
+                    },
+                )
+                .await;
+            wait_for_fetch(&calls, 1).await;
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                last_url.lock().unwrap().as_deref(),
+                Some("https://shared.example/v1")
+            );
+            assert_eq!(
+                last_key.lock().unwrap().as_deref(),
+                Some("a-key"),
+                "A's ETag must refresh A's credentials, not B's colliding alias"
+            );
         })
         .await;
 }

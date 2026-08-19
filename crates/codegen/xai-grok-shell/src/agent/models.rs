@@ -128,11 +128,17 @@ impl Default for CatalogSource {
 /// `catalog_key` is the configured model key the session selected (the ACP
 /// model id). Aliases can share a routing slug and URL while differing in
 /// credentials, so slug+URL alone is not a unique endpoint identity.
+///
+/// `endpoint_owner` is the configured endpoint that produced this request,
+/// captured at submit. A dynamically returned catalog id is not itself a
+/// configured owner; without this field, a later Leader session can replace
+/// the resident catalog and the ETag would no longer resolve to that owner.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct EtagOrigin {
     model: acp::ModelId,
     base_url: String,
     catalog_key: Option<acp::ModelId>,
+    endpoint_owner: Option<acp::ModelId>,
 }
 
 impl EtagOrigin {
@@ -141,6 +147,7 @@ impl EtagOrigin {
             model: acp::ModelId::new(Arc::from(model.into())),
             base_url: base_url.into(),
             catalog_key: None,
+            endpoint_owner: None,
         }
     }
 
@@ -148,6 +155,14 @@ impl EtagOrigin {
         let key = key.into();
         if !key.is_empty() {
             self.catalog_key = Some(acp::ModelId::new(Arc::from(key)));
+        }
+        self
+    }
+
+    pub(crate) fn with_endpoint_owner(mut self, owner: impl Into<String>) -> Self {
+        let owner = owner.into();
+        if !owner.is_empty() {
+            self.endpoint_owner = Some(acp::ModelId::new(Arc::from(owner)));
         }
         self
     }
@@ -162,6 +177,10 @@ impl EtagOrigin {
 
     pub(crate) fn catalog_key(&self) -> Option<&str> {
         self.catalog_key.as_ref().map(|key| key.0.as_ref())
+    }
+
+    pub(crate) fn endpoint_owner(&self) -> Option<&str> {
+        self.endpoint_owner.as_ref().map(|owner| owner.0.as_ref())
     }
 }
 
@@ -1962,6 +1981,57 @@ impl ModelsManager {
             .unwrap_or(current)
     }
 
+    /// Configured endpoint owner that should be stamped onto a request
+    /// origin at submit. Uses the session catalog key when that key is a
+    /// configured endpoint; otherwise the currently resident/pending owner
+    /// if the request is sampling a dynamically returned model from it.
+    /// Never searches the live catalog at ETag time for this value.
+    pub(crate) fn configured_endpoint_owner_for_origin(
+        &self,
+        model: &str,
+        base_url: &str,
+        catalog_key: &str,
+    ) -> Option<String> {
+        if base_url.is_empty() {
+            return None;
+        }
+        let cat = self.inner.catalog.read();
+        let cfg = self.inner.cfg.read();
+        let configured = config::resolve_model_list(&cfg, None);
+        if !catalog_key.is_empty()
+            && let Some(entry) = configured.get(catalog_key)
+            && entry.has_own_credentials()
+            && config_model_has_endpoint(&cfg, catalog_key)
+            && resolve_credentials(entry, None).base_url == base_url
+        {
+            return Some(catalog_key.to_string());
+        }
+        // Dynamic / returned slug: persist the resident configured owner
+        // that produced this catalog, not the returned id.
+        if cat.catalog_source == CatalogSource::ModelEndpoint
+            && let Some(owner) = cat.catalog_owner.as_ref()
+        {
+            let owner_key = owner.0.as_ref();
+            let owner_matches_url = configured.get(owner_key).is_some_and(|entry| {
+                entry.has_own_credentials()
+                    && config_model_has_endpoint(&cfg, owner_key)
+                    && resolve_credentials(entry, None).base_url == base_url
+            });
+            let returned_from_owner = cat.models.iter().any(|(key, entry)| {
+                (key == model
+                    || entry.info.model == model
+                    || (!catalog_key.is_empty()
+                        && (key == catalog_key || entry.info.model == catalog_key)))
+                    && entry.has_own_credentials()
+                    && resolve_credentials(entry, None).base_url == base_url
+            });
+            if owner_matches_url && returned_from_owner {
+                return Some(owner_key.to_string());
+            }
+        }
+        None
+    }
+
     /// Resolve the configured endpoint owner for a response ETag's
     /// session-local origin. Reads catalog before cfg to preserve the lock
     /// order used by the catalog apply path. It never reacquires the catalog
@@ -1976,6 +2046,19 @@ impl ModelsManager {
         }
         let cfg = self.inner.cfg.read();
         let configured = config::resolve_model_list(&cfg, None);
+        // Prefer the owner captured at submit: a dynamically returned
+        // catalog id is not a configured key, and the resident catalog
+        // may have been replaced by another Leader session since then.
+        if let Some(owner) = origin.endpoint_owner.as_ref() {
+            let owner_key = owner.0.as_ref();
+            if let Some(entry) = configured.get(owner_key)
+                && entry.has_own_credentials()
+                && config_model_has_endpoint(&cfg, owner_key)
+                && resolve_credentials(entry, None).base_url == origin.base_url
+            {
+                return Some(owner.clone());
+            }
+        }
         // Prefer the session catalog key: two aliases can share a routing
         // slug and base URL while using different credentials/headers.
         if let Some(key) = origin.catalog_key.as_ref() {
