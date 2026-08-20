@@ -9243,3 +9243,199 @@ async fn failed_leader_etag_refresh_does_not_relabel_resident_owner() {
         Some("endpoint-a"),
     );
 }
+
+fn manager_with_resident_a_and_pending_b() -> (ModelsManager, tempfile::TempDir) {
+    let cfg = config_from_toml(
+        r#"
+            [model.endpoint-a]
+            model = "slug-a"
+            base_url = "https://provider-a.example/v1"
+            api_key = "a-key"
+
+            [model.endpoint-b]
+            model = "slug-b"
+            base_url = "https://provider-b.example/v1"
+            api_key = "b-key"
+            "#,
+    );
+    let tmp = tempfile::TempDir::new().unwrap();
+    let auth_manager = Arc::new(AuthManager::new(tmp.path(), GrokComConfig::default()));
+    let mgr = ModelsManagerBuilder::new(
+        None,
+        resolve_model_catalog(&cfg, None),
+        acp::ModelId::new("endpoint-a"),
+        auth_manager,
+        cfg.clone(),
+    )
+    .cache(test_cache_manager(tmp.path()))
+    .build();
+    {
+        let mut cat = mgr.inner.catalog.write();
+        cat.prefetched = Some(make_prefetched(&["from-a"]));
+        cat.models = resolve_model_catalog(&cfg, cat.prefetched.clone());
+        cat.has_fetched_real_catalog = true;
+        cat.model_endpoint_catalog_loaded = true;
+        cat.catalog_source = CatalogSource::ModelEndpoint;
+        cat.catalog_owner = Some(acp::ModelId::new("endpoint-a"));
+        cat.pending_catalog_owner = Some(acp::ModelId::new("endpoint-b"));
+        cat.etag = Some("etag-a".to_string());
+    }
+    (mgr, tmp)
+}
+
+fn apply_pending_b_result(mgr: &ModelsManager, observed_generation: u64) -> bool {
+    mgr.apply_catalog_fenced(
+        None,
+        make_prefetched(&["from-b"]),
+        Some("etag-b".to_string()),
+        None,
+        Some(observed_generation),
+        None,
+        CatalogSource::ModelEndpoint,
+        Some(acp::ModelId::new("endpoint-b")),
+    )
+}
+
+/// Resident A + pending B: a reload that removes B or mutates B's URL/credentials
+/// must fence the already-running B `/models` result so it cannot publish the
+/// obsolete connection context.
+#[test]
+fn apply_config_fences_pending_owner_when_endpoint_removed_or_mutated() {
+    let removed_cfg = config_from_toml(
+        r#"
+            [model.endpoint-a]
+            model = "slug-a"
+            base_url = "https://provider-a.example/v1"
+            api_key = "a-key"
+            "#,
+    );
+    let mutated_cfg = config_from_toml(
+        r#"
+            [model.endpoint-a]
+            model = "slug-a"
+            base_url = "https://provider-a.example/v1"
+            api_key = "a-key"
+
+            [model.endpoint-b]
+            model = "slug-b"
+            base_url = "https://provider-b-new.example/v1"
+            api_key = "b-key-new"
+            "#,
+    );
+
+    for (label, new_cfg) in [("removed", removed_cfg), ("mutated", mutated_cfg)] {
+        let (mgr, _tmp) = manager_with_resident_a_and_pending_b();
+        let observed_generation = mgr.inner.catalog.read().endpoint_generation;
+        mgr.apply_config(new_cfg)
+            .unwrap_or_else(|e| panic!("{label} reload should apply: {e}"));
+
+        {
+            let cat = mgr.inner.catalog.read();
+            assert!(
+                cat.endpoint_generation > observed_generation,
+                "{label}: removing or mutating pending B must advance the endpoint fence",
+            );
+            assert_eq!(
+                cat.pending_catalog_owner.as_ref().map(|o| o.0.as_ref()),
+                None,
+                "{label}: pending B must be cleared so the in-flight fetch cannot publish",
+            );
+            assert_eq!(
+                cat.catalog_owner.as_ref().map(|o| o.0.as_ref()),
+                Some("endpoint-a"),
+                "{label}: resident A must stay until a successful replacement publishes",
+            );
+            assert!(
+                cat.prefetched
+                    .as_ref()
+                    .is_some_and(|m| m.contains_key("from-a")),
+                "{label}: resident A's catalog must remain",
+            );
+        }
+
+        let applied = apply_pending_b_result(&mgr, observed_generation);
+        assert!(
+            !applied,
+            "{label}: pending B's captured /models result must be rejected by apply_catalog_fenced",
+        );
+        let cat = mgr.inner.catalog.read();
+        assert!(
+            cat.prefetched
+                .as_ref()
+                .is_some_and(|m| m.contains_key("from-a") && !m.contains_key("from-b")),
+            "{label}: obsolete B entries must not replace resident A",
+        );
+        assert_eq!(cat.etag.as_deref(), Some("etag-a"));
+        assert_eq!(
+            cat.catalog_owner.as_ref().map(|o| o.0.as_ref()),
+            Some("endpoint-a")
+        );
+    }
+}
+
+/// Settings-only reload: pending B's connection context is unchanged, so the
+/// already-running B fetch must still be able to publish.
+#[test]
+fn apply_config_keeps_pending_owner_fetch_when_endpoint_unchanged() {
+    let (mgr, _tmp) = manager_with_resident_a_and_pending_b();
+    let observed_generation = mgr.inner.catalog.read().endpoint_generation;
+    let settings_only = config_from_toml(
+        r#"
+            [models]
+            default = "endpoint-a"
+
+            [model.endpoint-a]
+            model = "slug-a"
+            base_url = "https://provider-a.example/v1"
+            api_key = "a-key"
+
+            [model.endpoint-b]
+            model = "slug-b"
+            base_url = "https://provider-b.example/v1"
+            api_key = "b-key"
+            "#,
+    );
+    mgr.apply_config(settings_only)
+        .expect("settings-only reload should apply");
+
+    {
+        let cat = mgr.inner.catalog.read();
+        assert_eq!(
+            cat.endpoint_generation, observed_generation,
+            "settings-only reload must not advance the endpoint fence",
+        );
+        assert_eq!(
+            cat.pending_catalog_owner.as_ref().map(|o| o.0.as_ref()),
+            Some("endpoint-b"),
+            "settings-only reload must leave pending B so the in-flight fetch can apply",
+        );
+        assert!(
+            cat.prefetched
+                .as_ref()
+                .is_some_and(|m| m.contains_key("from-a")),
+            "resident A stays until B's result publishes",
+        );
+    }
+
+    let applied = apply_pending_b_result(&mgr, observed_generation);
+    assert!(
+        applied,
+        "pending B's captured /models result must still apply after a settings-only reload",
+    );
+    let cat = mgr.inner.catalog.read();
+    assert!(
+        cat.prefetched
+            .as_ref()
+            .is_some_and(|m| m.contains_key("from-b")),
+        "B's catalog must publish",
+    );
+    assert_eq!(
+        cat.catalog_owner.as_ref().map(|o| o.0.as_ref()),
+        Some("endpoint-b")
+    );
+    assert_eq!(
+        cat.pending_catalog_owner.as_ref().map(|o| o.0.as_ref()),
+        None
+    );
+    assert_eq!(cat.etag.as_deref(), Some("etag-b"));
+}

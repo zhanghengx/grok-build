@@ -212,10 +212,10 @@ struct CatalogState {
     generation: u64,
     /// Bumped when the effective endpoint owner changes (including a cold
     /// switch before the endpoint catalog first loads), when the current
-    /// model's endpoint connection context changes, or when the identity is
-    /// cleared. A model-endpoint fetch captured before it must not apply;
-    /// settings-only publications leave it unchanged so an in-flight endpoint
-    /// refresh can still publish.
+    /// model's or pending owner's endpoint connection context changes, or when
+    /// the identity is cleared. A model-endpoint fetch captured before it must
+    /// not apply; settings-only publications leave it unchanged so an in-flight
+    /// endpoint refresh can still publish.
     endpoint_generation: u64,
 }
 
@@ -778,11 +778,12 @@ impl ModelsManager {
                 cfg.models.default_is_campaign_driven,
             )
         };
-        let (prefetched, has_real_catalog, catalog_source, catalog_owner) = (
+        let (prefetched, has_real_catalog, catalog_source, catalog_owner, pending_catalog_owner) = (
             cat.prefetched.clone(),
             cat.has_fetched_real_catalog,
             cat.catalog_source,
             cat.catalog_owner.clone(),
+            cat.pending_catalog_owner.clone(),
         );
         // Model-endpoint entries carry inherited routing and credentials. Keep
         // them across a config publication while the endpoint connection
@@ -825,14 +826,23 @@ impl ModelsManager {
                 }));
         // A settings-only publication must not invalidate an in-flight
         // model-endpoint fetch, but a change to the endpoint connection
-        // context must. Before the endpoint catalog loads, the current model
-        // id is the fetch's owner.
+        // context must. Compare the resident catalog owner *and* any pending
+        // Leader retarget: a hot reload that removes or mutates the pending
+        // owner's URL/credentials must advance the fence so that already-running
+        // `/models` result cannot publish through `apply_catalog_fenced` with
+        // the obsolete connection context. Before the endpoint catalog loads,
+        // the current model id is the fetch's owner.
         let endpoint_context_changed = overlay_changed_context || {
             let owner_key = catalog_owner
                 .as_ref()
                 .map(|owner| owner.0.as_ref().to_string())
                 .unwrap_or_else(|| current_model_key.clone());
-            model_endpoint_changed(&old_config, &new_config, &owner_key)
+            let resident_changed = model_endpoint_changed(&old_config, &new_config, &owner_key);
+            let pending_changed = pending_catalog_owner.as_ref().is_some_and(|pending| {
+                pending.0.as_ref() != owner_key
+                    && model_endpoint_changed(&old_config, &new_config, pending.0.as_ref())
+            });
+            resident_changed || pending_changed
         };
         let retained_prefetched = if endpoint_catalog_invalidated {
             None
