@@ -362,6 +362,17 @@ fn pending_endpoint_owner_configured(
     })
 }
 
+/// Resident or in-flight endpoint owner used as the selection-retention key.
+/// A Leader ETag can record only `pending_catalog_owner` while the catalog is
+/// still cold (`catalog_owner` unset); retention must consult that pending
+/// owner or an explicit switch to another source leaves the stale fetch able
+/// to publish.
+fn tracked_endpoint_owner(cat: &CatalogState) -> Option<&acp::ModelId> {
+    cat.catalog_owner
+        .as_ref()
+        .or(cat.pending_catalog_owner.as_ref())
+}
+
 /// Whether a pending endpoint owner should stay attached after the current
 /// model is (re)selected. The owner stays while it is the current model, while
 /// the selected model was returned by its endpoint, and while the current
@@ -373,7 +384,7 @@ fn endpoint_owner_retained_for_selected_model(
     current: &acp::ModelId,
     clear_on_other_source: bool,
 ) -> bool {
-    let Some(owner) = cat.catalog_owner.as_ref() else {
+    let Some(owner) = tracked_endpoint_owner(cat) else {
         return true;
     };
     if owner == current {
@@ -561,6 +572,15 @@ impl Drop for FetchAttemptGuard {
             unresolved
         });
     }
+}
+
+/// Outcome of a global catalog-fetch start decision. Replay callers pass the
+/// generation they joined so a concurrent identity/config bump cannot slip in
+/// between "still this generation" and the new reservation.
+enum GlobalFetchReservation {
+    Started(FetchAttemptGuard, ActiveFetchGuard, u64),
+    Join(u64),
+    Stale,
 }
 
 impl Default for ModelsManager {
@@ -1069,8 +1089,12 @@ impl ModelsManager {
             // The effective endpoint owner can change before the endpoint
             // catalog first loads. Capture the previous owner under the same
             // lock so a cold switch still advances the endpoint fence and
-            // rejects ETag/refresh work captured for the old origin.
-            let previous_endpoint_owner = cat.catalog_owner.clone().unwrap_or(previous_model_id);
+            // rejects ETag/refresh work captured for the old origin. Include
+            // `pending_catalog_owner`: a Leader ETag can target B while
+            // `catalog_owner` is still unset.
+            let previous_endpoint_owner = tracked_endpoint_owner(&cat)
+                .cloned()
+                .unwrap_or(previous_model_id);
             let cfg = self.inner.cfg.read().clone();
             if cat.catalog_source == CatalogSource::ModelEndpoint {
                 // Models returned by the endpoint inherit its connection
@@ -1118,13 +1142,17 @@ impl ModelsManager {
                 }
             }
             // A pending owner survives an endpoint invalidation. Once the
-            // selected model belongs to another source, drop it so refreshes
-            // target that source instead of the stale endpoint.
+            // selected model belongs to another source, drop both the resident
+            // and in-flight owners so refreshes target that source instead of
+            // the stale endpoint.
             if !endpoint_owner_retained_for_selected_model(&cat, &id, clear_pending_owner) {
                 tracing::info!(model = %id.0, "clearing pending endpoint owner after model switch");
                 cat.catalog_owner = None;
+                cat.pending_catalog_owner = None;
             }
-            let effective_endpoint_owner = cat.catalog_owner.clone().unwrap_or_else(|| id.clone());
+            let effective_endpoint_owner = tracked_endpoint_owner(&cat)
+                .cloned()
+                .unwrap_or_else(|| id.clone());
             if previous_endpoint_owner != effective_endpoint_owner {
                 tracing::info!(
                     model = %id.0,
@@ -1878,6 +1906,20 @@ impl ModelsManager {
     }
 
     async fn spawn_fetch_inner(&self, new_etag: Option<String>, remote_fetch_enabled: bool) {
+        self.spawn_fetch_inner_for_generation(new_etag, remote_fetch_enabled, None)
+            .await;
+    }
+
+    /// `expected_generation` is `Some` when this call is replaying an ETag
+    /// after joining an in-flight fetch. Reservation then refuses to start if
+    /// `on_auth_changed` / `apply_config` advanced the catalog generation in
+    /// the window between the join check and this start.
+    async fn spawn_fetch_inner_for_generation(
+        &self,
+        new_etag: Option<String>,
+        remote_fetch_enabled: bool,
+        expected_generation: Option<u64>,
+    ) {
         if !remote_fetch_enabled {
             tracing::info!("model catalog refresh skipped: remote_fetch disabled");
             return;
@@ -1895,31 +1937,52 @@ impl ModelsManager {
         // used by `fetch_and_apply_inner`. If `models/list` or a background
         // fetch already owns it, join that attempt instead of racing a second
         // same-generation request whose older response could land last.
-        let (started, joined_generation) = self.reserve_global_fetch().await;
-        let Some((attempt, active)) = started else {
-            self.inner.refresh_in_flight.store(false, Ordering::Release);
-            // Wait for the fetch we joined to finish, not just for the first
-            // catalog to become ready. With a real catalog already loaded,
-            // `catalog_progress` stays `Ready` during later refreshes, so the
-            // old wait returned immediately and replaying the etag here would
-            // recurse while the same active fetch was still registered.
-            self.wait_for_active_generation(joined_generation).await;
-            // The joined fetch started before this etag change and applies no
-            // etag, so it can publish the old catalog. Re-issue the refresh
-            // when the catalog still does not carry the observed etag instead
-            // of letting the change signal disappear. Never replay the etag
-            // across an identity/config generation change: `on_auth_changed`
-            // can advance the catalog generation while we wait, and the new
-            // catalog's etag is scoped to a different identity/resource.
-            if self.inner.catalog.read().generation == joined_generation
-                && new_etag
-                    .as_deref()
-                    .is_some_and(|etag| self.inner.catalog.read().etag.as_deref() != Some(etag))
-            {
-                Box::pin(self.spawn_fetch_inner(new_etag, remote_fetch_enabled)).await;
+        match self
+            .reserve_global_fetch_inner(
+                expected_generation,
+                expected_generation.and(new_etag.as_deref()),
+            )
+            .await
+        {
+            GlobalFetchReservation::Join(joined_generation) => {
+                self.inner.refresh_in_flight.store(false, Ordering::Release);
+                // Wait for the fetch we joined to finish, not just for the first
+                // catalog to become ready. With a real catalog already loaded,
+                // `catalog_progress` stays `Ready` during later refreshes, so the
+                // old wait returned immediately and replaying the etag here would
+                // recurse while the same active fetch was still registered.
+                self.wait_for_active_generation(joined_generation).await;
+                // The joined fetch started before this etag change and applies no
+                // etag, so it can publish the old catalog. Re-issue the refresh
+                // only for that same generation, under the reservation lock, so
+                // `on_auth_changed` cannot insert a generation bump between the
+                // equality check and the new start.
+                if new_etag.is_some() {
+                    Box::pin(self.spawn_fetch_inner_for_generation(
+                        new_etag,
+                        remote_fetch_enabled,
+                        Some(joined_generation),
+                    ))
+                    .await;
+                }
+                return;
             }
-            return;
-        };
+            GlobalFetchReservation::Stale => {
+                self.inner.refresh_in_flight.store(false, Ordering::Release);
+                return;
+            }
+            GlobalFetchReservation::Started(attempt, active, _) => {
+                self.spawn_fetch_reserved(new_etag, attempt, active).await;
+            }
+        }
+    }
+
+    async fn spawn_fetch_reserved(
+        &self,
+        new_etag: Option<String>,
+        attempt: FetchAttemptGuard,
+        active: ActiveFetchGuard,
+    ) {
         let generation = attempt.generation;
         let cfg = self.inner.cfg.read().clone();
         let endpoints = cfg.endpoints.clone();
@@ -2397,7 +2460,7 @@ impl ModelsManager {
         // the same endpoint must not discard the refresh, while switching to a
         // different endpoint (or clearing the identity) bumps
         // `endpoint_generation` and rejects it.
-        let (catalog_owner, endpoint_generation) = {
+        let Some((catalog_owner, endpoint_generation)) = ({
             // Catalog before current_model_id: same lock order as
             // `apply_catalog_fenced`.
             let mut cat = self.inner.catalog.write();
@@ -2417,15 +2480,28 @@ impl ModelsManager {
             // publish even when it is not the current model. Do not steal a
             // newer pending owner back to this request's origin — that
             // retarget happens in `refresh_if_new_etag`. Do not label the
-            // still-resident catalog until this fetch publishes.
-            if cat.catalog_owner.as_ref() != Some(&catalog_owner)
+            // still-resident catalog until this fetch publishes. Do not
+            // re-arm a pending owner a process-level switch already dropped
+            // (the endpoint fence has moved on).
+            // A process-level switch can drop `pending_catalog_owner` and
+            // advance the fence while this watcher waited for the lock. Do
+            // not re-arm that origin: the result would then pass
+            // `apply_catalog_fenced` against the new fence. Still fetch so a
+            // queued watcher can refresh the *current* endpoint; the observed
+            // ETag is dropped below when the fence moved.
+            let fence_moved =
+                observed_endpoint_generation.is_some_and(|g| cat.endpoint_generation != g);
+            if !fence_moved
+                && cat.catalog_owner.as_ref() != Some(&catalog_owner)
                 && cat.pending_catalog_owner.is_none()
             {
                 if let Some(origin) = origin_owner.clone() {
                     cat.pending_catalog_owner = Some(origin);
                 }
             }
-            (catalog_owner, cat.endpoint_generation)
+            Some((catalog_owner, cat.endpoint_generation))
+        }) else {
+            return false;
         };
         let Some(request) = self.model_endpoint_request(&catalog_owner).await else {
             // The retarget never left the process. Drop the unsuccessful
@@ -2574,20 +2650,49 @@ impl ModelsManager {
     /// `wait_for_active_generation` instead of racing a second same-generation
     /// request whose older response could land last.
     async fn reserve_global_fetch(&self) -> (Option<(FetchAttemptGuard, ActiveFetchGuard)>, u64) {
+        match self.reserve_global_fetch_inner(None, None).await {
+            GlobalFetchReservation::Started(attempt, active, generation) => {
+                (Some((attempt, active)), generation)
+            }
+            GlobalFetchReservation::Join(generation) => (None, generation),
+            GlobalFetchReservation::Stale => (None, self.inner.catalog.read().generation),
+        }
+    }
+
+    async fn reserve_global_fetch_inner(
+        &self,
+        expected_generation: Option<u64>,
+        expected_etag: Option<&str>,
+    ) -> GlobalFetchReservation {
         let _start = self.inner.global_fetch_start.lock().await;
         let cat = self.inner.catalog.read();
         let generation = cat.generation;
+        // Replay of an older notification must not start (or join) work for a
+        // newer identity/config generation, and must not restamp an ETag the
+        // catalog already carries. Both checks share this mutex with the
+        // reservation so `on_auth_changed` cannot advance `generation` in
+        // between. `expected_etag` is only set on the post-join replay path;
+        // an initial global ETag that collides with a resident endpoint ETag
+        // must still fetch.
+        if expected_generation.is_some_and(|expected| expected != generation) {
+            return GlobalFetchReservation::Stale;
+        }
+        if expected_generation.is_some()
+            && expected_etag.is_some_and(|etag| cat.etag.as_deref() == Some(etag))
+        {
+            return GlobalFetchReservation::Stale;
+        }
         if self
             .inner
             .active_fetch_generations
             .read()
             .contains(&generation)
         {
-            return (None, generation);
+            return GlobalFetchReservation::Join(generation);
         }
         let attempt = FetchAttemptGuard::begin_with_generation(&self.inner, generation);
         let active = ActiveFetchGuard::begin(&self.inner, generation);
-        (Some((attempt, active)), generation)
+        GlobalFetchReservation::Started(attempt, active, generation)
     }
 
     /// Wait until the active fetch that owns `generation` has finished. Uses a
@@ -2967,15 +3072,20 @@ impl ModelsManager {
     fn revalidate_pending_owner_for_selected_model(&self, clear_pending_owner: bool) {
         let mut cat = self.inner.catalog.write();
         let current = self.inner.current_model_id.read().clone();
-        let previous_endpoint_owner = cat.catalog_owner.clone().unwrap_or_else(|| current.clone());
+        let previous_endpoint_owner = tracked_endpoint_owner(&cat)
+            .cloned()
+            .unwrap_or_else(|| current.clone());
         if !endpoint_owner_retained_for_selected_model(&cat, &current, clear_pending_owner) {
             tracing::info!(
                 model = %current.0,
                 "clearing pending endpoint owner after model selection"
             );
             cat.catalog_owner = None;
+            cat.pending_catalog_owner = None;
         }
-        let effective_endpoint_owner = cat.catalog_owner.clone().unwrap_or_else(|| current.clone());
+        let effective_endpoint_owner = tracked_endpoint_owner(&cat)
+            .cloned()
+            .unwrap_or_else(|| current.clone());
         if previous_endpoint_owner != effective_endpoint_owner {
             tracing::info!(
                 model = %current.0,

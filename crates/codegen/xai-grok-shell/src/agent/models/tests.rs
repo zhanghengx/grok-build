@@ -4066,6 +4066,122 @@ async fn etag_replay_is_dropped_after_identity_generation_change() {
 }
 
 #[tokio::test]
+async fn etag_replay_cannot_start_after_generation_bump_between_join_and_reserve() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct FirstBlockingGlobalEndpoint {
+        calls: Arc<AtomicUsize>,
+        started: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+    impl ModelsEndpoint for FirstBlockingGlobalEndpoint {
+        fn fetch_models(
+            &self,
+            _endpoints: config::EndpointsConfig,
+            _auth: Option<GrokAuth>,
+            _fetch_auth: ModelFetchAuth,
+        ) -> ModelsFetchFuture {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            let started = self.started.clone();
+            let release = self.release.clone();
+            let catalog = if n == 0 {
+                make_prefetched(&["grok-4"])
+            } else {
+                make_prefetched(&["replayed-model"])
+            };
+            Box::pin(async move {
+                if n == 0 {
+                    started.notify_one();
+                    release.notified().await;
+                }
+                Some(catalog)
+            })
+        }
+
+        fn fetch_model_endpoint(&self, _request: ModelEndpointRequest) -> ModelEndpointFetchFuture {
+            Box::pin(async { None })
+        }
+    }
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let started = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let mgr = cold_manager(
+        config_from_toml("[endpoints]\ndeployment_key = \"deploy-key\""),
+        Arc::new(FirstBlockingGlobalEndpoint {
+            calls: calls.clone(),
+            started: started.clone(),
+            release: release.clone(),
+        }),
+    );
+    let joined_generation = mgr.inner.catalog.read().generation;
+
+    let fetch_mgr = mgr.clone();
+    let fetch_task = tokio::spawn(async move {
+        fetch_mgr
+            .fetch_and_apply_inner(/*remote_fetch_enabled*/ true)
+            .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(5), started.notified())
+        .await
+        .expect("the global fetch never reached the transport");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+    let join_mgr = mgr.clone();
+    let join_task = tokio::spawn(async move {
+        join_mgr
+            .spawn_fetch_inner(
+                Some("\"etag-new\"".to_string()),
+                /*remote_fetch_enabled*/ true,
+            )
+            .await;
+    });
+    for _ in 0..50 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "the etag refresh must join the in-flight fetch, not race it",
+    );
+
+    // Hold the reservation mutex so the post-join replay reaches its
+    // generation check only after we simulate `on_auth_changed` advancing
+    // the identity. The check and start share this lock.
+    let reservation = mgr.inner.global_fetch_start.lock().await;
+    release.notify_one();
+    fetch_task.await.unwrap();
+    for _ in 0..50 {
+        tokio::task::yield_now().await;
+    }
+    // Same write `on_auth_changed` performs: bump the catalog generation
+    // while a replay is already past the join wait.
+    mgr.inner.catalog.write().generation += 1;
+    drop(reservation);
+    join_task.await.unwrap();
+
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "an etag from a previous identity must not start a fetch for the new generation",
+    );
+    assert_ne!(
+        mgr.inner.catalog.read().etag.as_deref(),
+        Some("\"etag-new\""),
+        "the stale identity's etag must not be committed onto the new generation",
+    );
+    assert!(
+        !mgr.models().contains_key("replayed-model"),
+        "the replay must not publish a catalog captured for the old identity",
+    );
+    assert_eq!(
+        mgr.inner.catalog.read().generation,
+        joined_generation + 1,
+        "the injected identity bump must remain",
+    );
+}
+
+#[tokio::test]
 async fn list_models_online_if_uncached_starts_fresh_fetch_when_active_fetch_is_stale() {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -9438,4 +9554,161 @@ fn apply_config_keeps_pending_owner_fetch_when_endpoint_unchanged() {
         None
     );
     assert_eq!(cat.etag.as_deref(), Some("etag-b"));
+}
+
+#[tokio::test]
+async fn switching_from_cold_pending_owner_rejects_stale_endpoint_and_allows_global() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct BlockingEndpointThenGlobal {
+        endpoint_calls: Arc<AtomicUsize>,
+        global_calls: Arc<AtomicUsize>,
+        started: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+    impl ModelsEndpoint for BlockingEndpointThenGlobal {
+        fn fetch_models(
+            &self,
+            _endpoints: config::EndpointsConfig,
+            _auth: Option<GrokAuth>,
+            _fetch_auth: ModelFetchAuth,
+        ) -> ModelsFetchFuture {
+            self.global_calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Some(make_prefetched(&["grok-4", "global-model"])) })
+        }
+
+        fn fetch_model_endpoint(&self, _request: ModelEndpointRequest) -> ModelEndpointFetchFuture {
+            self.endpoint_calls.fetch_add(1, Ordering::SeqCst);
+            let started = self.started.clone();
+            let release = self.release.clone();
+            let catalog = make_prefetched(&["from-endpoint"]);
+            Box::pin(async move {
+                started.notify_one();
+                release.notified().await;
+                Some((catalog, Some("etag-endpoint".to_string())))
+            })
+        }
+    }
+
+    let cfg = config_from_toml(
+        r#"
+            [models]
+            default = "endpoint-a"
+
+            [model.endpoint-a]
+            model = "slug-a"
+            base_url = "https://provider-a.example/v1"
+            api_key = "a-key"
+
+            [model.grok-4]
+            model = "grok-4"
+            "#,
+    );
+    let tmp = tempfile::TempDir::new().unwrap();
+    let auth_manager = Arc::new(AuthManager::new(tmp.path(), GrokComConfig::default()));
+    let endpoint_calls = Arc::new(AtomicUsize::new(0));
+    let global_calls = Arc::new(AtomicUsize::new(0));
+    let started = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let mgr = ModelsManagerBuilder::new(
+        None,
+        resolve_model_catalog(&cfg, None),
+        acp::ModelId::new("endpoint-a"),
+        auth_manager,
+        cfg.clone(),
+    )
+    .endpoint(Arc::new(BlockingEndpointThenGlobal {
+        endpoint_calls: endpoint_calls.clone(),
+        global_calls: global_calls.clone(),
+        started: started.clone(),
+        release: release.clone(),
+    }))
+    .cache(test_cache_manager(tmp.path()))
+    .build();
+    {
+        let cat = mgr.inner.catalog.read();
+        assert!(
+            cat.catalog_owner.is_none(),
+            "the catalog must still be cold so only pending_catalog_owner is recorded",
+        );
+        assert!(cat.pending_catalog_owner.is_none());
+        assert_eq!(cat.catalog_source, CatalogSource::Global);
+    }
+
+    mgr.refresh_if_new_etag(
+        "etag-endpoint".to_string(),
+        Some(
+            EtagOrigin::new("slug-a", "https://provider-a.example/v1")
+                .with_catalog_key("endpoint-a"),
+        ),
+    )
+    .await;
+    tokio::time::timeout(std::time::Duration::from_secs(5), started.notified())
+        .await
+        .expect("the pending-owner endpoint fetch never reached the transport");
+    {
+        let cat = mgr.inner.catalog.read();
+        assert_eq!(
+            cat.pending_catalog_owner.as_ref().map(|o| o.0.as_ref()),
+            Some("endpoint-a"),
+            "a Leader ETag on a cold catalog records only pending_catalog_owner",
+        );
+        assert!(
+            cat.catalog_owner.is_none(),
+            "catalog_owner must remain unset until the endpoint result publishes",
+        );
+    }
+    assert_eq!(endpoint_calls.load(Ordering::SeqCst), 1);
+
+    let fence_before = mgr.inner.catalog.read().endpoint_generation;
+    mgr.set_current_model_id(acp::ModelId::new("grok-4"));
+    {
+        let cat = mgr.inner.catalog.read();
+        assert_eq!(
+            cat.pending_catalog_owner.as_ref().map(|o| o.0.as_ref()),
+            None,
+            "switching to a selectable model from another source must drop the cold pending owner",
+        );
+        assert!(cat.catalog_owner.is_none());
+        assert!(
+            cat.endpoint_generation > fence_before,
+            "clearing the pending owner must advance the endpoint fence",
+        );
+    }
+
+    release.notify_one();
+    for _ in 0..50 {
+        tokio::task::yield_now().await;
+    }
+    {
+        let cat = mgr.inner.catalog.read();
+        assert!(
+            !cat.models.contains_key("from-endpoint"),
+            "the stale endpoint /models result must not publish after the switch",
+        );
+        assert!(!cat.model_endpoint_catalog_loaded);
+        assert_eq!(cat.catalog_source, CatalogSource::Global);
+        assert!(cat.pending_catalog_owner.is_none());
+    }
+
+    let generation = mgr.inner.catalog.read().generation;
+    assert!(
+        mgr.apply_refresh_result_fenced(
+            None,
+            Some(make_prefetched(&["grok-4", "global-model"])),
+            Some("etag-global".into()),
+            Some(generation),
+            None,
+            None,
+            CatalogSource::Global,
+            None,
+        ),
+        "a later global refresh must not be discarded as endpoint-authoritative",
+    );
+    assert!(mgr.models().contains_key("global-model"));
+    assert!(!mgr.models().contains_key("from-endpoint"));
+    assert_eq!(
+        mgr.inner.catalog.read().catalog_source,
+        CatalogSource::Global
+    );
 }
