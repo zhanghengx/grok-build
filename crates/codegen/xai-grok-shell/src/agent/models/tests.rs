@@ -4160,6 +4160,25 @@ async fn etag_replay_cannot_start_after_generation_bump_between_join_and_reserve
     drop(reservation);
     join_task.await.unwrap();
 
+    // `spawn_fetch_reserved` fire-and-forgets the replacement fetch, so
+    // awaiting `spawn_fetch_inner` only proves the start decision returned.
+    // Poll the same window the successful-replay test uses so a wrongful
+    // Started path would be visible (second transport call / stamped ETag).
+    let mut wrongful_replay = false;
+    for _ in 0..200 {
+        if calls.load(Ordering::SeqCst) > 1
+            || mgr.inner.catalog.read().etag.as_deref() == Some("\"etag-new\"")
+            || mgr.models().contains_key("replayed-model")
+        {
+            wrongful_replay = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert!(
+        !wrongful_replay,
+        "an etag from a previous identity must not start a fetch or stamp onto the new generation",
+    );
     assert_eq!(
         calls.load(Ordering::SeqCst),
         1,
