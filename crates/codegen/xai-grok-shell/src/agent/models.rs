@@ -2418,6 +2418,10 @@ impl ModelsManager {
             (catalog_owner, cat.endpoint_generation)
         };
         let Some(request) = self.model_endpoint_request(&catalog_owner).await else {
+            // The retarget never left the process. Drop the unsuccessful
+            // pending owner so still-resident models keep the previous
+            // successful publisher as their ETag fence.
+            self.clear_failed_pending_catalog_owner(&catalog_owner);
             return false;
         };
         let endpoint = self.inner.endpoint.clone();
@@ -2837,6 +2841,15 @@ impl ModelsManager {
         )
     }
 
+    /// Drop a Leader retarget that never published so later ETags still
+    /// route through the resident successful owner.
+    fn clear_failed_pending_catalog_owner(&self, failed_owner: &acp::ModelId) {
+        let mut cat = self.inner.catalog.write();
+        if cat.pending_catalog_owner.as_ref() == Some(failed_owner) {
+            cat.pending_catalog_owner = None;
+        }
+    }
+
     fn apply_refresh_result_fenced(
         &self,
         config: Option<&config::Config>,
@@ -2852,12 +2865,23 @@ impl ModelsManager {
             tracing::warn!("model refresh failed, leaving existing models unchanged");
             // Lock held across the send: atomic against a racing `clear()`.
             {
-                let cat = self.inner.catalog.read();
+                let mut cat = self.inner.catalog.write();
                 let same_identity = match generation {
                     Some(generation) => cat.generation == generation,
                     None => endpoint_generation.is_some_and(|g| cat.endpoint_generation == g),
                 };
                 if same_identity {
+                    // A failed or timed-out Leader retarget must not leave the
+                    // unsuccessful owner as the publish fence. The resident
+                    // catalog_owner stays the previous successful publisher so
+                    // a later A-returned ETag still refreshes A, not B.
+                    if source == CatalogSource::ModelEndpoint
+                        && catalog_owner
+                            .as_ref()
+                            .is_some_and(|owner| cat.pending_catalog_owner.as_ref() == Some(owner))
+                    {
+                        cat.pending_catalog_owner = None;
+                    }
                     self.inner.catalog_progress.send_if_modified(|p| {
                         let first_failure = *p == CatalogProgress::Pending;
                         if first_failure {

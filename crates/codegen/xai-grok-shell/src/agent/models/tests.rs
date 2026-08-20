@@ -9197,6 +9197,11 @@ async fn failed_leader_etag_refresh_does_not_relabel_resident_owner() {
             Some("endpoint-a"),
             "a failed B refresh must not relabel the still-resident A catalog",
         );
+        assert_eq!(
+            cat.pending_catalog_owner.as_ref().map(|o| o.0.as_ref()),
+            None,
+            "a failed B refresh must not leave B as the pending publish fence",
+        );
         assert!(
             cat.prefetched
                 .as_ref()
