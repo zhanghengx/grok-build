@@ -199,7 +199,13 @@ struct CatalogState {
     catalog_source: CatalogSource,
     /// Configured model whose endpoint populated a model-scoped catalog, or
     /// whose replacement endpoint is pending while an invalidation reloads it.
+    /// This labels the still-resident prefetched models and must not change
+    /// until a replacement `/models` result successfully publishes.
     catalog_owner: Option<acp::ModelId>,
+    /// Endpoint a Leader ETag has targeted whose `/models` result has not
+    /// yet successfully published. Distinct from `catalog_owner` so a failed
+    /// or timed-out refresh cannot relabel still-resident prefetched models.
+    pending_catalog_owner: Option<acp::ModelId>,
     /// `allowed_models` matched nothing; the prompt path blocks instead.
     allowlist_excludes_all: bool,
     /// Bumped on identity change; a fetch captured before it must not apply.
@@ -254,6 +260,43 @@ fn endpoint_entry_context_differs(raw: &config::ModelEntry, resolved: &config::M
         || raw.env_key != resolved.env_key
         || raw.auth_provider != resolved.auth_provider
         || raw.api_base_url != resolved.api_base_url
+}
+
+/// Connection-context overlay changes across every retained prefetched key,
+/// not only the process current model. Leader sessions can sample a returned
+/// sibling without `set_current_model_id`.
+fn any_retained_prefetched_overlay_changed_context(
+    old_resolved: &IndexMap<String, ModelEntry>,
+    new_resolved: &IndexMap<String, ModelEntry>,
+    prefetched: &IndexMap<String, ModelEntry>,
+) -> bool {
+    prefetched
+        .keys()
+        .any(|key| match (old_resolved.get(key), new_resolved.get(key)) {
+            (Some(old_entry), Some(new_entry)) => {
+                endpoint_entry_context_differs(old_entry, new_entry)
+            }
+            _ => false,
+        })
+}
+
+fn selected_entry_overlay_changed_context(
+    old_resolved: &IndexMap<String, ModelEntry>,
+    new_resolved: &IndexMap<String, ModelEntry>,
+    prefetched: &IndexMap<String, ModelEntry>,
+    current: &acp::ModelId,
+) -> bool {
+    if resolve_catalog_key(prefetched, current).is_none() {
+        return false;
+    }
+    let old_entry =
+        resolve_catalog_key(old_resolved, current).and_then(|key| old_resolved.get(key.0.as_ref()));
+    let new_entry =
+        resolve_catalog_key(new_resolved, current).and_then(|key| new_resolved.get(key.0.as_ref()));
+    match (old_entry, new_entry) {
+        (Some(old_entry), Some(new_entry)) => endpoint_entry_context_differs(old_entry, new_entry),
+        _ => false,
+    }
 }
 
 /// True when `model` / `catalog_key` was returned by the resident endpoint
@@ -749,30 +792,34 @@ impl ModelsManager {
         // A returned slug that gains its own endpoint or credentials through a
         // config overlay no longer belongs to the endpoint catalog: sampling
         // routes through the overlay, so retaining the old owner would keep
-        // refreshing the previous endpoint. Compare the selected entry's
-        // resolved connection context across the publication.
-        let selected_overlay_changed_context = endpoint_catalog_active
-            && prefetched.as_ref().is_some_and(|prefetched| {
+        // refreshing the previous endpoint. Compare every retained prefetched
+        // entry — Leader sessions can sample a sibling without updating the
+        // process current model.
+        let (selected_overlay_changed_context, overlay_changed_context) = if endpoint_catalog_active
+        {
+            prefetched.as_ref().map_or((false, false), |prefetched| {
                 let current = acp::ModelId::new(Arc::from(current_model_key.clone()));
-                if !resolve_catalog_key(prefetched, &current).is_some() {
-                    return false;
-                }
-                let prefetched = prefetched.clone();
                 let old_resolved = resolve_model_catalog(&old_config, Some(prefetched.clone()));
-                let new_resolved = resolve_model_catalog(&new_config, Some(prefetched));
-                let old_entry = resolve_catalog_key(&old_resolved, &current)
-                    .and_then(|key| old_resolved.get(key.0.as_ref()));
-                let new_entry = resolve_catalog_key(&new_resolved, &current)
-                    .and_then(|key| new_resolved.get(key.0.as_ref()));
-                match (old_entry, new_entry) {
-                    (Some(old_entry), Some(new_entry)) => {
-                        endpoint_entry_context_differs(old_entry, new_entry)
-                    }
-                    _ => false,
-                }
-            });
+                let new_resolved = resolve_model_catalog(&new_config, Some(prefetched.clone()));
+                (
+                    selected_entry_overlay_changed_context(
+                        &old_resolved,
+                        &new_resolved,
+                        prefetched,
+                        &current,
+                    ),
+                    any_retained_prefetched_overlay_changed_context(
+                        &old_resolved,
+                        &new_resolved,
+                        prefetched,
+                    ),
+                )
+            })
+        } else {
+            (false, false)
+        };
         let endpoint_catalog_invalidated = endpoint_catalog_active
-            && (selected_overlay_changed_context
+            && (overlay_changed_context
                 || !catalog_owner.as_ref().is_some_and(|owner| {
                     !model_endpoint_changed(&old_config, &new_config, owner.0.as_ref())
                 }));
@@ -780,7 +827,7 @@ impl ModelsManager {
         // model-endpoint fetch, but a change to the endpoint connection
         // context must. Before the endpoint catalog loads, the current model
         // id is the fetch's owner.
-        let endpoint_context_changed = selected_overlay_changed_context || {
+        let endpoint_context_changed = overlay_changed_context || {
             let owner_key = catalog_owner
                 .as_ref()
                 .map(|owner| owner.0.as_ref().to_string())
@@ -867,6 +914,8 @@ impl ModelsManager {
         }
         if endpoint_context_changed {
             cat.endpoint_generation += 1;
+            // In-flight Leader retargets are bound to the previous fence.
+            cat.pending_catalog_owner = None;
         }
         cat.prefetched = retained_prefetched;
         cat.models = new_catalog;
@@ -1320,7 +1369,9 @@ impl ModelsManager {
                 || (emitting.is_none()
                     && (catalog_is_endpoint_owned
                         || (!cat.model_endpoint_catalog_loaded
-                            && (cat.catalog_owner.is_some() || current_has_endpoint))));
+                            && (cat.catalog_owner.is_some()
+                                || cat.pending_catalog_owner.is_some()
+                                || current_has_endpoint))));
             (
                 cat.etag.as_deref() == Some(etag.as_str()),
                 endpoint_owned,
@@ -1343,20 +1394,24 @@ impl ModelsManager {
             }
             tracing::info!(etag = %etag, "models etag changed, refreshing endpoint catalog");
             // Leader session switches do not update the process current
-            // model. Target this emitting owner immediately so its result
-            // can publish and any in-flight previous owner is fenced out.
-            // Recapture the generation after the switch so this fetch is
-            // bound to the new fence, not the previous owner's.
+            // model. Fence this emitting owner as pending so its result can
+            // publish and any in-flight previous owner is rejected. Do not
+            // relabel `catalog_owner` until that result successfully
+            // publishes: a failed/timed-out B refresh must leave A's
+            // still-resident prefetched models owned by A.
             let observed_endpoint_generation = if let Some(owner) = endpoint_owner.as_ref() {
                 let mut cat = self.inner.catalog.write();
-                if cat.catalog_owner.as_ref() != Some(owner) {
-                    if cat.catalog_owner.is_some() {
+                let already_resident = cat.catalog_owner.as_ref() == Some(owner);
+                if already_resident {
+                    cat.pending_catalog_owner = None;
+                } else if cat.pending_catalog_owner.as_ref() != Some(owner) {
+                    if cat.catalog_owner.is_some() || cat.pending_catalog_owner.is_some() {
                         cat.endpoint_generation = cat.endpoint_generation.saturating_add(1);
                         // The resident ETag belongs to the previous origin.
                         // Keep it from suppressing the newly targeted owner.
                         cat.etag = None;
                     }
-                    cat.catalog_owner = Some(owner.clone());
+                    cat.pending_catalog_owner = Some(owner.clone());
                 }
                 cat.endpoint_generation
             } else {
@@ -2343,6 +2398,7 @@ impl ModelsManager {
             let catalog_owner = origin_owner
                 .as_ref()
                 .cloned()
+                .or_else(|| cat.pending_catalog_owner.clone())
                 .or_else(|| cat.catalog_owner.clone())
                 .unwrap_or_else(|| current.clone());
             // An ETag watcher can target an endpoint configured for a session
@@ -2350,10 +2406,13 @@ impl ModelsManager {
             // owner as pending so a result from the emitting session can
             // publish even when it is not the current model. Do not steal a
             // newer pending owner back to this request's origin — that
-            // retarget happens in `refresh_if_new_etag`.
-            if cat.catalog_owner.is_none() {
+            // retarget happens in `refresh_if_new_etag`. Do not label the
+            // still-resident catalog until this fetch publishes.
+            if cat.catalog_owner.as_ref() != Some(&catalog_owner)
+                && cat.pending_catalog_owner.is_none()
+            {
                 if let Some(origin) = origin_owner.clone() {
-                    cat.catalog_owner = Some(origin);
+                    cat.pending_catalog_owner = Some(origin);
                 }
             }
             (catalog_owner, cat.endpoint_generation)
@@ -2649,12 +2708,14 @@ impl ModelsManager {
                 if let Some(expected_owner) = catalog_owner.as_ref() {
                     let current = self.inner.current_model_id.read();
                     // Leader session switches do not update the process
-                    // current model. Once a session endpoint is targeted,
-                    // only that pending/resident owner may publish — a
-                    // stale result whose owner is merely the process
-                    // current model must not win.
-                    let owner_matches = if let Some(pending) = cat.catalog_owner.as_ref() {
+                    // current model. A pending ETag target may publish even
+                    // while `catalog_owner` still labels the resident
+                    // catalog. A stale result whose owner is merely the
+                    // process current model must not win.
+                    let owner_matches = if let Some(pending) = cat.pending_catalog_owner.as_ref() {
                         expected_owner == pending
+                    } else if let Some(resident) = cat.catalog_owner.as_ref() {
+                        expected_owner == resident
                     } else {
                         expected_owner == &*current
                             || (cat.catalog_source == CatalogSource::ModelEndpoint
@@ -2684,7 +2745,8 @@ impl ModelsManager {
                 return false;
             }
             let endpoint_authoritative = cat.catalog_source == CatalogSource::ModelEndpoint
-                || (!cat.model_endpoint_catalog_loaded && cat.catalog_owner.is_some());
+                || (!cat.model_endpoint_catalog_loaded
+                    && (cat.catalog_owner.is_some() || cat.pending_catalog_owner.is_some()));
             if source == CatalogSource::Global && endpoint_authoritative {
                 tracing::info!(
                     "global model catalog result discarded: model endpoint catalog is authoritative"
@@ -2704,6 +2766,7 @@ impl ModelsManager {
             cat.has_fetched_real_catalog = true;
             cat.catalog_source = source;
             cat.catalog_owner = catalog_owner;
+            cat.pending_catalog_owner = None;
             cat.model_endpoint_catalog_loaded = source == CatalogSource::ModelEndpoint;
             cat.prefetched = Some(models);
             cat.models = resolve_model_catalog(&apply_cfg, cat.prefetched.clone());

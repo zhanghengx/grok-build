@@ -8367,8 +8367,13 @@ async fn leader_second_session_endpoint_publishes_and_rejects_stale_first() {
         let cat = mgr.inner.catalog.read();
         assert_eq!(
             cat.catalog_owner.as_ref().map(|o| o.0.as_ref()),
+            Some("endpoint-a"),
+            "the resident owner must stay A until B's /models result publishes",
+        );
+        assert_eq!(
+            cat.pending_catalog_owner.as_ref().map(|o| o.0.as_ref()),
             Some("endpoint-b"),
-            "targeting session B must update the pending owner before apply",
+            "targeting session B must record B as pending before apply",
         );
         assert!(
             cat.endpoint_generation > generation_after_a,
@@ -8990,4 +8995,246 @@ async fn config_only_byok_sharing_url_is_not_treated_as_returned_by_endpoint() {
         Some("https://provider.example/v1")
     );
     assert_eq!(last_key.lock().unwrap().as_deref(), Some("alias-key"));
+}
+
+#[test]
+fn apply_config_invalidates_connection_changing_overlay_on_non_current_prefetched_sibling() {
+    let old_cfg = config_from_toml(
+        r#"
+            [model.endpoint-a]
+            base_url = "https://provider-a.example/v1"
+            api_key = "a-key"
+            "#,
+    );
+    let tmp = tempfile::TempDir::new().unwrap();
+    let auth_manager = Arc::new(AuthManager::new(tmp.path(), GrokComConfig::default()));
+    let mgr = ModelsManagerBuilder::new(
+        None,
+        resolve_model_catalog(&old_cfg, None),
+        acp::ModelId::new("endpoint-a"),
+        auth_manager,
+        old_cfg.clone(),
+    )
+    .cache(test_cache_manager(tmp.path()))
+    .build();
+    let mut prefetched = make_prefetched(&["endpoint-a", "sibling-x"]);
+    for entry in prefetched.values_mut() {
+        entry.api_key = Some("a-key".to_string());
+        entry.info.base_url = "https://provider-a.example/v1".to_string();
+    }
+    {
+        let mut cat = mgr.inner.catalog.write();
+        cat.prefetched = Some(prefetched.clone());
+        cat.models = resolve_model_catalog(&old_cfg, Some(prefetched));
+        cat.has_fetched_real_catalog = true;
+        cat.model_endpoint_catalog_loaded = true;
+        cat.catalog_source = CatalogSource::ModelEndpoint;
+        cat.catalog_owner = Some(acp::ModelId::new("endpoint-a"));
+    }
+    assert_eq!(
+        mgr.models()["sibling-x"].api_key.as_deref(),
+        Some("a-key"),
+        "precondition: the prefetched sibling inherits owner A's credential",
+    );
+    assert_eq!(mgr.current_model_id().0.as_ref(), "endpoint-a");
+
+    let new_cfg = config_from_toml(
+        r#"
+            [model.endpoint-a]
+            base_url = "https://provider-a.example/v1"
+            api_key = "a-key"
+
+            [model.sibling-x]
+            base_url = "https://overlay-x.example/v1"
+            "#,
+    );
+    mgr.apply_config(new_cfg)
+        .expect("config reload should apply");
+
+    assert_eq!(
+        mgr.current_model_id().0.as_ref(),
+        "endpoint-a",
+        "the process current model stays A; Leader selecting X does not call set_current_model_id",
+    );
+    let cat = mgr.inner.catalog.read();
+    assert!(
+        cat.prefetched.is_none(),
+        "a connection-changing overlay on any retained prefetched sibling must invalidate the endpoint catalog",
+    );
+    assert!(!cat.model_endpoint_catalog_loaded);
+    let sibling = cat
+        .models
+        .get("sibling-x")
+        .expect("the overlay sibling remains selectable from config");
+    assert_eq!(sibling.info.base_url, "https://overlay-x.example/v1");
+    assert_eq!(
+        sibling.api_key.as_deref(),
+        None,
+        "the overlay must not inherit owner A's api_key against the new URL",
+    );
+}
+
+#[tokio::test]
+async fn failed_leader_etag_refresh_does_not_relabel_resident_owner() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct FailBThenCaptureA {
+        b_calls: Arc<AtomicUsize>,
+        a_calls: Arc<AtomicUsize>,
+        last_url: Arc<std::sync::Mutex<Option<String>>>,
+        last_key: Arc<std::sync::Mutex<Option<String>>>,
+    }
+    impl ModelsEndpoint for FailBThenCaptureA {
+        fn fetch_models(
+            &self,
+            _endpoints: config::EndpointsConfig,
+            _auth: Option<GrokAuth>,
+            _fetch_auth: ModelFetchAuth,
+        ) -> ModelsFetchFuture {
+            Box::pin(async { None })
+        }
+
+        fn fetch_model_endpoint(&self, request: ModelEndpointRequest) -> ModelEndpointFetchFuture {
+            let is_b = request.base_url.contains("provider-b");
+            if is_b {
+                self.b_calls.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async { None })
+            } else {
+                self.a_calls.fetch_add(1, Ordering::SeqCst);
+                *self.last_url.lock().unwrap() = Some(request.base_url.clone());
+                *self.last_key.lock().unwrap() = Some(request.api_key.clone());
+                Box::pin(async { Some((make_prefetched(&["from-a"]), Some("etag-a-next".into()))) })
+            }
+        }
+    }
+
+    let cfg = config_from_toml(
+        r#"
+            [model.endpoint-a]
+            model = "slug-a"
+            base_url = "https://provider-a.example/v1"
+            api_key = "a-key"
+
+            [model.endpoint-b]
+            model = "slug-b"
+            base_url = "https://provider-b.example/v1"
+            api_key = "b-key"
+            "#,
+    );
+    let tmp = tempfile::TempDir::new().unwrap();
+    let auth_manager = Arc::new(AuthManager::new(tmp.path(), GrokComConfig::default()));
+    let b_calls = Arc::new(AtomicUsize::new(0));
+    let a_calls = Arc::new(AtomicUsize::new(0));
+    let last_url = Arc::new(std::sync::Mutex::new(None));
+    let last_key = Arc::new(std::sync::Mutex::new(None));
+    let mgr = ModelsManagerBuilder::new(
+        None,
+        resolve_model_catalog(&cfg, None),
+        acp::ModelId::new("endpoint-a"),
+        auth_manager,
+        cfg.clone(),
+    )
+    .endpoint(Arc::new(FailBThenCaptureA {
+        b_calls: b_calls.clone(),
+        a_calls: a_calls.clone(),
+        last_url: last_url.clone(),
+        last_key: last_key.clone(),
+    }))
+    .cache(test_cache_manager(tmp.path()))
+    .build();
+    let inherit = ModelEndpointRequest {
+        base_url: "https://provider-a.example/v1".to_string(),
+        api_key: "a-key".to_string(),
+        api_backend: Default::default(),
+        auth_scheme: Default::default(),
+        configured_api_key: Some("a-key".to_string()),
+        configured_env_key: None,
+        auth_provider: None,
+        extra_headers: IndexMap::new(),
+        query_params: IndexMap::new(),
+        env_http_headers: IndexMap::new(),
+    };
+    let mut returned_cfg = make_entry_config("from-a", None);
+    returned_cfg.base_url = "https://provider-a.example/v1".to_string();
+    let returned = build_prefetched_map_with_model_context(vec![returned_cfg], &inherit);
+    {
+        let mut cat = mgr.inner.catalog.write();
+        cat.prefetched = Some(returned.clone());
+        cat.models = resolve_model_catalog(&cfg, cat.prefetched.clone());
+        cat.has_fetched_real_catalog = true;
+        cat.model_endpoint_catalog_loaded = true;
+        cat.catalog_source = CatalogSource::ModelEndpoint;
+        cat.catalog_owner = Some(acp::ModelId::new("endpoint-a"));
+        cat.etag = Some("etag-a".to_string());
+    }
+
+    mgr.refresh_if_new_etag(
+        "etag-b".to_string(),
+        Some(
+            EtagOrigin::new("slug-b", "https://provider-b.example/v1")
+                .with_catalog_key("endpoint-b"),
+        ),
+    )
+    .await;
+    for _ in 0..200 {
+        if b_calls.load(Ordering::SeqCst) > 0 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert_eq!(
+        b_calls.load(Ordering::SeqCst),
+        1,
+        "B's /models must be attempted"
+    );
+    // Let the failed apply settle so catalog_owner is observed after the
+    // shipped refresh_if_new_etag / fetch path, not before it.
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    {
+        let cat = mgr.inner.catalog.read();
+        assert_eq!(
+            cat.catalog_owner.as_ref().map(|o| o.0.as_ref()),
+            Some("endpoint-a"),
+            "a failed B refresh must not relabel the still-resident A catalog",
+        );
+        assert!(
+            cat.prefetched
+                .as_ref()
+                .is_some_and(|m| m.contains_key("from-a")),
+            "A's prefetched models must remain after B times out / fails",
+        );
+        assert_eq!(cat.catalog_source, CatalogSource::ModelEndpoint);
+    }
+
+    mgr.refresh_if_new_etag(
+        "etag-a-next".to_string(),
+        Some(EtagOrigin::new("from-a", "https://provider-a.example/v1").with_catalog_key("from-a")),
+    )
+    .await;
+    for _ in 0..200 {
+        if a_calls.load(Ordering::SeqCst) > 0 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert_eq!(
+        a_calls.load(Ordering::SeqCst),
+        1,
+        "a later A-returned-model ETag must still refresh A's endpoint",
+    );
+    assert_eq!(
+        last_url.lock().unwrap().as_deref(),
+        Some("https://provider-a.example/v1"),
+        "the later ETag must not refresh B",
+    );
+    assert_eq!(last_key.lock().unwrap().as_deref(), Some("a-key"));
+    assert_eq!(
+        mgr.inner
+            .catalog
+            .read()
+            .catalog_owner
+            .as_ref()
+            .map(|o| o.0.as_ref()),
+        Some("endpoint-a"),
+    );
 }
