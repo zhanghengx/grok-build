@@ -3970,6 +3970,7 @@ impl MvpAgent {
             session_meta,
             model_agent_type,
             session_model_id,
+            session_endpoint_owner,
             session_yolo_mode,
             session_auto_mode,
             prompt_display_cwd,
@@ -4596,6 +4597,13 @@ impl MvpAgent {
                 code_nav: client_code_nav_enabled,
                 git_head_changed,
             });
+            let session_endpoint_owner = self
+                .models_manager
+                .configured_endpoint_owner_for_origin(
+                    sampling_config.model.as_str(),
+                    sampling_config.base_url.as_str(),
+                    session_model_id.0.as_ref(),
+                );
             spawn_session_on_thread(
                     session_info.clone(),
                     self.gateway.clone(),
@@ -4699,6 +4707,7 @@ impl MvpAgent {
                     },
                     Some(self.plugin_registry_handle.clone()),
                     self.models_manager.clone(),
+                    session_endpoint_owner,
                     None,
                     None,
                     Some(

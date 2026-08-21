@@ -144,6 +144,7 @@ async fn inflight_etag_keeps_origin_after_set_session_model() {
                 .handle_set_session_model(
                     sampling("slug-b", "https://provider-b.example/v1"),
                     "alias-b".to_string(),
+                    Some("alias-b".to_string()),
                     false,
                     false,
                     true,
@@ -252,6 +253,7 @@ async fn submitted_sampler_config_origin_survives_set_session_model() {
                 .handle_set_session_model(
                     sampling("slug-b", "https://provider-b.example/v1"),
                     "alias-b".to_string(),
+                    Some("alias-b".to_string()),
                     false,
                     false,
                     true,
@@ -391,6 +393,7 @@ async fn retry_metadata_keeps_bound_origin_after_owner_change() {
                 .handle_set_session_model(
                     sampling("slug-b", "https://provider-b.example/v1"),
                     "alias-b".to_string(),
+                    Some("alias-b".to_string()),
                     false,
                     false,
                     true,
@@ -507,6 +510,7 @@ async fn reconstruct_catalog_key_survives_set_session_model_during_config_query(
                 .handle_set_session_model(
                     sampling("shared-slug", "https://shared.example/v1"),
                     "alias-b".to_string(),
+                    Some("alias-b".to_string()),
                     false,
                     false,
                     true,
@@ -624,6 +628,7 @@ async fn first_resolve_does_not_clobber_switched_session_owner() {
                 .handle_set_session_model(
                     sampling("shared-slug", "https://shared.example/v1"),
                     "alias-b".to_string(),
+                    Some("alias-b".to_string()),
                     false,
                     false,
                     true,
@@ -1059,6 +1064,249 @@ async fn config_only_byok_sharing_url_does_not_inherit_resident_owner() {
                 Some("https://provider.example/v1")
             );
             assert_eq!(last_key.lock().unwrap().as_deref(), Some("alias-key"));
+        })
+        .await;
+}
+
+/// When a model switch is performed, the endpoint owner captured alongside
+/// the sampling config snapshot must be installed on the session actor, even
+/// if a concurrent Leader refresh replaces the resident catalog before the
+/// actor handles `SetSessionModel`.
+#[tokio::test(flavor = "current_thread")]
+async fn model_switch_carries_endpoint_owner_across_concurrent_catalog_replacement() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (gateway_tx, _gateway_rx) =
+                mpsc::unbounded_channel::<xai_acp_lib::AcpClientMessage>();
+            let (persistence_tx, _persistence_rx) = mpsc::unbounded_channel::<PersistenceMsg>();
+            let mut actor = create_test_actor(0, 256_000, 85, gateway_tx, persistence_tx).await;
+
+            let cfg = endpoint_cfg();
+            let tmp = tempfile::TempDir::new().unwrap();
+            let auth_manager = Arc::new(AuthManager::new(tmp.path(), GrokComConfig::default()));
+            let calls = Arc::new(AtomicUsize::new(0));
+            let last_url = Arc::new(std::sync::Mutex::new(None));
+            let last_key = Arc::new(std::sync::Mutex::new(None));
+            actor.models_manager = ModelsManagerBuilder::new(
+                None,
+                resolve_model_catalog(&cfg, None),
+                agent_client_protocol::ModelId::new("alias-a"),
+                auth_manager,
+                cfg,
+            )
+            .endpoint(Arc::new(OriginCapture {
+                calls: calls.clone(),
+                last_url: last_url.clone(),
+                last_key: last_key.clone(),
+            }))
+            .build();
+
+            let inherit_a = inherit_request("https://provider-a.example/v1", "a-key");
+            let returned_a = build_prefetched_map_with_model_context(
+                vec![returned_entry(
+                    "dynamic-from-a",
+                    "https://provider-a.example/v1",
+                )],
+                &inherit_a,
+            );
+            actor
+                .models_manager
+                .install_test_endpoint_catalog("alias-a", returned_a, "etag-a-loaded");
+
+            // 1. Capture sampling config AND endpoint owner while A's catalog is resident.
+            let model_sampling = sampling("dynamic-from-a", "https://provider-a.example/v1");
+            let captured_owner = actor
+                .models_manager
+                .configured_endpoint_owner_for_origin(
+                    "dynamic-from-a",
+                    "https://provider-a.example/v1",
+                    "dynamic-from-a",
+                );
+            assert_eq!(captured_owner.as_deref(), Some("alias-a"));
+
+            // 2. Simulate concurrent Leader catalog replacement by B before SetSessionModel is handled.
+            let inherit_b = inherit_request("https://provider-b.example/v1", "b-key");
+            let returned_b = build_prefetched_map_with_model_context(
+                vec![returned_entry(
+                    "dynamic-from-b",
+                    "https://provider-b.example/v1",
+                )],
+                &inherit_b,
+            );
+            actor
+                .models_manager
+                .install_test_endpoint_catalog("alias-b", returned_b, "etag-b-loaded");
+
+            // 3. Now handle SetSessionModel passing the captured owner.
+            let _ = actor
+                .handle_set_session_model(
+                    model_sampling,
+                    "dynamic-from-a".to_string(),
+                    captured_owner,
+                    false,
+                    false,
+                    true,
+                    85,
+                )
+                .await;
+
+            assert_eq!(actor.session_catalog_key.lock().as_str(), "dynamic-from-a");
+            assert_eq!(
+                actor.session_endpoint_owner.lock().as_deref(),
+                Some("alias-a"),
+                "session actor must persist the owner passed through SetSessionModel despite resident catalog replacement"
+            );
+
+            // 4. Submit sampling request and verify ETag refreshes A.
+            let origin = actor
+                .capture_request_etag_origin()
+                .await
+                .expect("origin for dynamic-from-a");
+            assert_eq!(origin.endpoint_owner(), Some("alias-a"));
+
+            actor.bind_request_etag_origin("req-dynamic-a", origin);
+            actor
+                .handle_model_metadata_update_for_request(
+                    Some("req-dynamic-a"),
+                    crate::sampling::ResponseModelMetadata {
+                        context_window: None,
+                        max_completion_tokens: None,
+                        models_etag: Some("etag-a-updated".to_string()),
+                    },
+                )
+                .await;
+
+            wait_for_fetch(&calls, 1).await;
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                last_url.lock().unwrap().as_deref(),
+                Some("https://provider-a.example/v1")
+            );
+            assert_eq!(last_key.lock().unwrap().as_deref(), Some("a-key"));
+        })
+        .await;
+}
+
+/// When a session is spawned, the endpoint owner captured alongside the
+/// initial sampling snapshot before async setup must be installed on the
+/// session actor, even if a concurrent Leader refresh replaces the resident
+/// catalog during setup.
+#[tokio::test(flavor = "current_thread")]
+async fn session_spawn_carries_endpoint_owner_across_concurrent_catalog_replacement() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let cfg = endpoint_cfg();
+            let tmp = tempfile::TempDir::new().unwrap();
+            let auth_manager = Arc::new(AuthManager::new(tmp.path(), GrokComConfig::default()));
+            let calls = Arc::new(AtomicUsize::new(0));
+            let last_url = Arc::new(std::sync::Mutex::new(None));
+            let last_key = Arc::new(std::sync::Mutex::new(None));
+            let models_manager = ModelsManagerBuilder::new(
+                None,
+                resolve_model_catalog(&cfg, None),
+                agent_client_protocol::ModelId::new("alias-a"),
+                auth_manager,
+                cfg,
+            )
+            .endpoint(Arc::new(OriginCapture {
+                calls: calls.clone(),
+                last_url: last_url.clone(),
+                last_key: last_key.clone(),
+            }))
+            .build();
+
+            let inherit_a = inherit_request("https://provider-a.example/v1", "a-key");
+            let returned_a = build_prefetched_map_with_model_context(
+                vec![returned_entry(
+                    "dynamic-from-a",
+                    "https://provider-a.example/v1",
+                )],
+                &inherit_a,
+            );
+            models_manager
+                .install_test_endpoint_catalog("alias-a", returned_a, "etag-a-loaded");
+
+            // 1. Capture sampling config AND endpoint owner before asynchronous spawn.
+            let model_sampling = sampling("dynamic-from-a", "https://provider-a.example/v1");
+            let captured_owner = models_manager
+                .configured_endpoint_owner_for_origin(
+                    "dynamic-from-a",
+                    "https://provider-a.example/v1",
+                    "dynamic-from-a",
+                );
+            assert_eq!(captured_owner.as_deref(), Some("alias-a"));
+
+            // 2. Concurrent Leader catalog replacement by B before spawn completes.
+            let inherit_b = inherit_request("https://provider-b.example/v1", "b-key");
+            let returned_b = build_prefetched_map_with_model_context(
+                vec![returned_entry(
+                    "dynamic-from-b",
+                    "https://provider-b.example/v1",
+                )],
+                &inherit_b,
+            );
+            models_manager
+                .install_test_endpoint_catalog("alias-b", returned_b, "etag-b-loaded");
+
+            // 3. Construct actor passing the pre-captured endpoint owner.
+            let (gateway_tx, _gateway_rx) =
+                mpsc::unbounded_channel::<xai_acp_lib::AcpClientMessage>();
+            let (persistence_tx, _persistence_rx) = mpsc::unbounded_channel::<PersistenceMsg>();
+            let mut actor = create_test_actor(0, 256_000, 85, gateway_tx, persistence_tx).await;
+            actor.models_manager = models_manager;
+            *actor.session_catalog_key.lock() = "dynamic-from-a".to_string();
+            *actor.session_endpoint_owner.lock() = captured_owner;
+            actor.chat_state_handle.update_sampling_config(
+                xai_grok_sampling_types::SamplingConfig {
+                    model: model_sampling.model,
+                    base_url: model_sampling.base_url,
+                    max_completion_tokens: None,
+                    temperature: None,
+                    top_p: None,
+                    api_backend: Default::default(),
+                    extra_headers: Default::default(),
+                    query_params: Default::default(),
+                    env_http_headers: Default::default(),
+                    context_window: std::num::NonZeroU64::new(256_000).unwrap(),
+                    reasoning_effort: None,
+                    stream_tool_calls: None,
+                },
+            );
+
+            assert_eq!(
+                actor.session_endpoint_owner.lock().as_deref(),
+                Some("alias-a"),
+                "session actor must have A's captured owner installed"
+            );
+
+            // 4. Submit first request origin and verify ETag refreshes A.
+            let origin = actor
+                .capture_request_etag_origin()
+                .await
+                .expect("origin for dynamic-from-a on spawned session");
+            assert_eq!(origin.endpoint_owner(), Some("alias-a"));
+
+            actor.bind_request_etag_origin("req-spawn-a", origin);
+            actor
+                .handle_model_metadata_update_for_request(
+                    Some("req-spawn-a"),
+                    crate::sampling::ResponseModelMetadata {
+                        context_window: None,
+                        max_completion_tokens: None,
+                        models_etag: Some("etag-a-spawned".to_string()),
+                    },
+                )
+                .await;
+
+            wait_for_fetch(&calls, 1).await;
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                last_url.lock().unwrap().as_deref(),
+                Some("https://provider-a.example/v1")
+            );
+            assert_eq!(last_key.lock().unwrap().as_deref(), Some("a-key"));
         })
         .await;
 }

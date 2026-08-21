@@ -122,8 +122,19 @@ pub(crate) async fn apply(
             }
         }
     }
-    let mut model_sampling =
-        agent.prepare_sampling_config_for_model(&model, handle.origin_client.clone());
+    let (model_sampling, endpoint_owner) = {
+        let sampling =
+            agent.prepare_sampling_config_for_model(&model, handle.origin_client.clone());
+        let owner = agent
+            .models_manager
+            .configured_endpoint_owner_for_origin(
+                sampling.model.as_str(),
+                sampling.base_url.as_str(),
+                model_id.0.as_ref(),
+            );
+        (sampling, owner)
+    };
+    let mut model_sampling = model_sampling;
     if let Some(eff) = effort_override {
         if agent
             .models_manager
@@ -209,6 +220,7 @@ pub(crate) async fn apply(
     let _ = handle.cmd_tx.send(SessionCommand::SetSessionModel {
         sampling_config: model_sampling,
         catalog_key: model_id.0.to_string(),
+        endpoint_owner,
         use_concise,
         apply_prompt_override,
         skip_prompt_rewrite: did_rebuild || model_unchanged,

@@ -260,6 +260,8 @@ pub enum SessionCommand {
         /// Configured catalog key (ACP model id) for this session. Distinct
         /// from `sampling_config.model`, which is the routing slug.
         catalog_key: String,
+        /// Pre-resolved endpoint owner captured alongside the sampling snapshot.
+        endpoint_owner: Option<String>,
         use_concise: bool,
         /// When `false`, skip the system prompt rewrite (concise/default swap).
         /// Set to `false` for forked sessions so mid-session model switches

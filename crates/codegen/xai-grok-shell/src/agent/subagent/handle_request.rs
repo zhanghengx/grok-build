@@ -1118,6 +1118,7 @@ pub(crate) async fn run_shell_child(
         ctx.plugin_registry.clone(),
         None,
         ctx.models_manager.clone(),
+        None,
         parent_traceparent,
         ctx.permission_handle.clone(),
         ctx.api_key_provider.clone(),

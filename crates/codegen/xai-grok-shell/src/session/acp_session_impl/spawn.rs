@@ -295,6 +295,7 @@ pub(crate) async fn spawn_session_actor(
     plugin_registry: Option<std::sync::Arc<xai_grok_agent::plugins::PluginRegistry>>,
     plugin_registry_handle: Option<xai_grok_agent::plugins::SharedPluginRegistryHandle>,
     models_manager: crate::agent::models::ModelsManager,
+    session_endpoint_owner: Option<String>,
     inherited_permission_handle: Option<xai_grok_workspace::permission::PermissionHandle>,
     api_key_provider: Option<xai_grok_tools::types::SharedApiKeyProvider>,
     image_description_model: String,
@@ -1665,11 +1666,13 @@ pub(crate) async fn spawn_session_actor(
         models_manager: models_manager.clone(),
         session_catalog_key: parking_lot::Mutex::new(session_model_id.0.to_string()),
         session_endpoint_owner: parking_lot::Mutex::new(
-            models_manager.configured_endpoint_owner_for_origin(
-                sampling_config.model.as_str(),
-                sampling_config.base_url.as_str(),
-                session_model_id.0.as_ref(),
-            ),
+            session_endpoint_owner.or_else(|| {
+                models_manager.configured_endpoint_owner_for_origin(
+                    sampling_config.model.as_str(),
+                    sampling_config.base_url.as_str(),
+                    session_model_id.0.as_ref(),
+                )
+            }),
         ),
         inflight_etag_origins: parking_lot::Mutex::new(std::collections::HashMap::new()),
         display_cwd: {
@@ -2265,6 +2268,7 @@ pub(crate) async fn spawn_session_on_thread(
     plugin_registry: Option<std::sync::Arc<xai_grok_agent::plugins::PluginRegistry>>,
     plugin_registry_handle: Option<xai_grok_agent::plugins::SharedPluginRegistryHandle>,
     models_manager: crate::agent::models::ModelsManager,
+    session_endpoint_owner: Option<String>,
     parent_traceparent: Option<String>,
     inherited_permission_handle: Option<xai_grok_workspace::permission::PermissionHandle>,
     api_key_provider: Option<xai_grok_tools::types::SharedApiKeyProvider>,
@@ -2439,6 +2443,7 @@ pub(crate) async fn spawn_session_on_thread(
                         plugin_registry,
                         plugin_registry_handle,
                         models_manager,
+                        session_endpoint_owner,
                         inherited_permission_handle,
                         api_key_provider,
                         image_description_model,
