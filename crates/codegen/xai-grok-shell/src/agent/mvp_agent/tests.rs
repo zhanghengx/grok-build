@@ -4630,6 +4630,44 @@ async fn storage_mode_self_corrects_to_writeback_when_settings_arrive() {
     agent.on_remote_settings_changed();
     assert_eq!(agent.storage_mode(), StorageMode::Writeback);
 }
+/// Regression: a remote-settings payload the models manager rejects must not
+/// abort the rest of the settings fanout (collection gate, settings/update,
+/// announcements, heap profile).
+#[tokio::test]
+async fn remote_settings_model_rejection_still_fans_out() {
+    use crate::agent::config::AgentMode;
+    use crate::auth::GrokAuth;
+    let (agent, mut rx) = build_agent_with_auth_and_proxy(
+        GrokAuth::test_default(),
+        "http://127.0.0.1:1/".to_string(),
+        AgentMode::Leader,
+    );
+    enable_trace_upload_config(&agent);
+    agent.sync_collection_config_gate();
+    assert!(
+        agent
+            .trace_upload_live
+            .load(std::sync::atomic::Ordering::Relaxed),
+        "precondition: collection gate mirror is on"
+    );
+    {
+        let mut cfg = agent.cfg.borrow_mut();
+        cfg.features.telemetry = Some(crate::agent::config::TelemetryMode::Disabled);
+        cfg.telemetry.trace_upload = Some(false);
+        cfg.models.allowed_models = Some(vec!["grok[".to_string()]);
+    }
+    agent.on_remote_settings_changed();
+    assert!(
+        !agent
+            .trace_upload_live
+            .load(std::sync::atomic::Ordering::Relaxed),
+        "collection-gate fanout must run even when the model reload is rejected"
+    );
+    assert!(
+        drained_settings_update(&mut rx),
+        "settings/update must still be emitted when the model reload is rejected"
+    );
+}
 /// `spawn_settings_reapply` coalesces: while one reapply is in flight,
 /// repeated calls (boot + rapid `/new`) do not spawn overlapping tasks.
 #[test]

@@ -2407,6 +2407,9 @@ mod inline_auto_compact_flow_tests {
             last_reported_branch: std::sync::Arc::new(parking_lot::Mutex::new(None)),
             git_head_enabled: false,
             models_manager: Default::default(),
+            session_catalog_key: parking_lot::Mutex::new(String::new()),
+            session_endpoint_owner: parking_lot::Mutex::new(None),
+            inflight_etag_origins: parking_lot::Mutex::new(std::collections::HashMap::new()),
             display_cwd: std::sync::OnceLock::new(),
             active_agent_type: parking_lot::Mutex::new(None),
             queue_exit_reminder_on_approved_exit: Arc::new(std::sync::atomic::AtomicBool::new(

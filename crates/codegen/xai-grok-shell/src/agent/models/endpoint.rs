@@ -4,6 +4,11 @@ use super::*;
 pub(crate) type ModelsFetchFuture =
     Pin<Box<dyn Future<Output = Option<IndexMap<String, ModelEntry>>> + Send>>;
 
+/// Boxed future returned by [`ModelsEndpoint::fetch_model_endpoint`]. The
+/// resolved prefetched map is paired with the response `ETag`, if any.
+pub(crate) type ModelEndpointFetchFuture =
+    Pin<Box<dyn Future<Output = Option<(IndexMap<String, ModelEntry>, Option<String>)>> + Send>>;
+
 /// Request context for a model-owned `/models` endpoint.
 ///
 /// The credential is intentionally explicit so this request cannot
@@ -35,7 +40,7 @@ pub(crate) trait ModelsEndpoint: Send + Sync {
 
     /// Fetch the catalog from a model-specific endpoint. The default keeps
     /// existing test transports source-compatible; production uses HTTP.
-    fn fetch_model_endpoint(&self, request: ModelEndpointRequest) -> ModelsFetchFuture {
+    fn fetch_model_endpoint(&self, request: ModelEndpointRequest) -> ModelEndpointFetchFuture {
         Box::pin(fetch_model_endpoint_async(request))
     }
 }
@@ -68,7 +73,7 @@ pub(crate) async fn fetch_models_async(
 
 pub(crate) async fn fetch_model_endpoint_async(
     request: ModelEndpointRequest,
-) -> Option<IndexMap<String, ModelEntry>> {
+) -> Option<(IndexMap<String, ModelEntry>, Option<String>)> {
     tokio::task::spawn_blocking(move || {
         let result = crate::remote::client::fetch_model_models_blocking(
             &request.base_url,
@@ -83,9 +88,9 @@ pub(crate) async fn fetch_model_endpoint_async(
             tracing::warn!("Model-specific models endpoint returned an empty list");
             return None;
         }
-        Some(build_prefetched_map_with_model_context(
-            result.models,
-            &request,
+        Some((
+            build_prefetched_map_with_model_context(result.models, &request),
+            result.etag,
         ))
     })
     .await

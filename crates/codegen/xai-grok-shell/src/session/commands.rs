@@ -257,6 +257,9 @@ pub enum SessionCommand {
     },
     SetSessionModel {
         sampling_config: xai_grok_sampler::SamplerConfig,
+        /// Configured catalog key (ACP model id) for this session. Distinct
+        /// from `sampling_config.model`, which is the routing slug.
+        catalog_key: String,
         use_concise: bool,
         /// When `false`, skip the system prompt rewrite (concise/default swap).
         /// Set to `false` for forked sessions so mid-session model switches

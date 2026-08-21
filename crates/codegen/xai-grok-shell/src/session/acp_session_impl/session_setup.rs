@@ -499,8 +499,142 @@ impl SessionActor {
         &self,
         metadata: crate::sampling::ResponseModelMetadata,
     ) {
+        self.handle_model_metadata_update_for_request(None, metadata)
+            .await;
+    }
+
+    /// Bind the immutable request origin captured at submit time so a later
+    /// `set_session_model` cannot relabel an in-flight ETag.
+    pub(super) fn bind_request_etag_origin(
+        &self,
+        request_id: &str,
+        origin: crate::agent::models::EtagOrigin,
+    ) {
+        self.inflight_etag_origins
+            .lock()
+            .insert(request_id.to_string(), origin);
+    }
+
+    /// Snapshot the session catalog key and persisted endpoint owner under
+    /// one lock pair so a concurrent `SetSessionModel` cannot mix B's
+    /// identity onto A's in-flight reconstruct.
+    pub(super) fn snapshot_session_catalog_identity(&self) -> (String, Option<String>) {
+        let catalog_key = self.session_catalog_key.lock();
+        let endpoint_owner = self.session_endpoint_owner.lock();
+        (catalog_key.clone(), endpoint_owner.clone())
+    }
+
+    /// Persist a resolved configured owner with the session catalog key.
+    /// Later requests must not re-derive a dynamic model's owner from the
+    /// shared resident catalog.
+    ///
+    /// Only writes when the live catalog key still matches `for_catalog_key`.
+    /// An in-flight first-resolve (`persisted_owner = None`) that captured A
+    /// must not clobber B after `SetSessionModel` has already switched.
+    pub(super) fn remember_session_endpoint_owner(
+        &self,
+        for_catalog_key: &str,
+        owner: impl Into<String>,
+    ) {
+        let owner = owner.into();
+        if owner.is_empty() || for_catalog_key.is_empty() {
+            return;
+        }
+        let catalog_key = self.session_catalog_key.lock();
+        let mut endpoint_owner = self.session_endpoint_owner.lock();
+        if catalog_key.as_str() == for_catalog_key {
+            *endpoint_owner = Some(owner);
+        }
+    }
+
+    /// Origin of the `SamplerConfig` actually submitted to the sampler.
+    ///
+    /// Must not be rebuilt from a later `get_sampling_config()` reread: a
+    /// concurrent `SetSessionModel` can change live chat state after
+    /// `reconstruct_full_config` / `update_config` already committed model A.
+    pub(super) fn etag_origin_from_submitted_config(
+        &self,
+        cfg: &xai_grok_sampler::SamplerConfig,
+        catalog_key: impl Into<String>,
+        persisted_owner: Option<String>,
+    ) -> Option<crate::agent::models::EtagOrigin> {
+        self.etag_origin_from_model_url(&cfg.model, &cfg.base_url, catalog_key, persisted_owner)
+    }
+
+    pub(super) fn etag_origin_from_model_url(
+        &self,
+        model: &str,
+        base_url: &str,
+        catalog_key: impl Into<String>,
+        persisted_owner: Option<String>,
+    ) -> Option<crate::agent::models::EtagOrigin> {
+        if model.is_empty() {
+            return None;
+        }
+        let catalog_key = catalog_key.into();
+        let mut origin =
+            crate::agent::models::EtagOrigin::new(model, base_url).with_catalog_key(&catalog_key);
+        if let Some(owner) = persisted_owner.filter(|owner| !owner.is_empty()) {
+            origin = origin.with_endpoint_owner(owner);
+            return Some(origin);
+        }
+        // First successful resolve for this selection: capture from the
+        // shared catalog while it still matches, then persist on the session
+        // so subsequent requests no longer depend on it remaining resident.
+        if let Some(owner) =
+            self.models_manager
+                .configured_endpoint_owner_for_origin(model, base_url, &catalog_key)
+        {
+            self.remember_session_endpoint_owner(&catalog_key, &owner);
+            origin = origin.with_endpoint_owner(owner);
+        }
+        Some(origin)
+    }
+
+    pub(super) async fn capture_request_etag_origin(
+        &self,
+    ) -> Option<crate::agent::models::EtagOrigin> {
+        // Same atomicity rule as reconstruct: identity first, then the
+        // config query, so a SetSessionModel interleaving cannot mix A/B.
+        let (catalog_key, persisted_owner) = self.snapshot_session_catalog_identity();
+        self.chat_state_handle
+            .get_sampling_config()
+            .await
+            .and_then(|cfg| {
+                self.etag_origin_from_model_url(
+                    &cfg.model,
+                    &cfg.base_url,
+                    catalog_key,
+                    persisted_owner,
+                )
+            })
+    }
+
+    pub(super) fn bound_request_etag_origin(
+        &self,
+        request_id: &str,
+    ) -> Option<crate::agent::models::EtagOrigin> {
+        self.inflight_etag_origins.lock().get(request_id).cloned()
+    }
+
+    pub(super) async fn handle_model_metadata_update_for_request(
+        &self,
+        request_id: Option<&str>,
+        metadata: crate::sampling::ResponseModelMetadata,
+    ) {
         if let Some(ref etag) = metadata.models_etag {
-            self.models_manager.refresh_if_new_etag(etag.clone()).await;
+            // A request-bound event uses only the origin captured at submit
+            // time. Re-reading live sampling config after `set_session_model`
+            // would stamp A's ETag onto B. Clone (do not remove) so sampler
+            // retries that reuse the same RequestId still have the origin;
+            // Completed/Failed drop the entry.
+            let emitting_origin = match request_id {
+                Some(id) => self.bound_request_etag_origin(id),
+                None => self.capture_request_etag_origin().await,
+            };
+            self.models_manager
+                .refresh_if_new_etag(etag.clone(), emitting_origin)
+                .await;
         }
         let current_config = match self.chat_state_handle.get_sampling_config().await {
             Some(cfg) => cfg,

@@ -2663,8 +2663,14 @@ impl SessionActor {
                 .await;
             }
             SamplingEvent::Completed {
-                response, metrics, ..
+                request_id,
+                response,
+                metrics,
+                ..
             } => {
+                self.inflight_etag_origins
+                    .lock()
+                    .remove(request_id.as_str());
                 if let Some(tx) = self.turn_stream_drained.lock().take() {
                     let _ = tx.send(());
                 }
@@ -2699,8 +2705,12 @@ impl SessionActor {
                 self.record_api_request_time();
                 self.signals_handle().record_inference_metrics(metrics);
             }
-            SamplingEvent::ModelMetadata { metadata, .. } => {
-                self.handle_model_metadata_update(metadata).await;
+            SamplingEvent::ModelMetadata {
+                request_id,
+                metadata,
+            } => {
+                self.handle_model_metadata_update_for_request(Some(request_id.as_str()), metadata)
+                    .await;
             }
             SamplingEvent::Retrying {
                 request_id,
@@ -2751,6 +2761,9 @@ impl SessionActor {
                 .await;
             }
             SamplingEvent::Failed { request_id, error } => {
+                self.inflight_etag_origins
+                    .lock()
+                    .remove(request_id.as_str());
                 xai_grok_telemetry::unified_log::error(
                     "shell.turn.inference_failed",
                     Some(self.session_info.id.0.as_ref()),

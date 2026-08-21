@@ -770,6 +770,20 @@ pub(crate) struct SessionActor {
     git_head_enabled: bool,
     /// Shared models manager for etag-triggered refresh from response headers.
     pub(crate) models_manager: crate::agent::models::ModelsManager,
+    /// Configured catalog key last selected for this session (ACP model id).
+    /// Distinct from the routing slug in `SamplingConfig.model`; aliases can
+    /// share a slug+URL while using different credentials.
+    pub(crate) session_catalog_key: parking_lot::Mutex<String>,
+    /// Configured endpoint owner captured with [`Self::session_catalog_key`].
+    /// A dynamically returned catalog id is not itself a configured owner;
+    /// this must outlive the shared resident catalog so a later Leader
+    /// session cannot reclassify this session's ETags as global.
+    pub(crate) session_endpoint_owner: parking_lot::Mutex<Option<String>>,
+    /// Immutable ETag origin captured when a sampling request is submitted,
+    /// keyed by `request_id`. Metadata events must not re-read live sampling
+    /// config after a later `set_session_model`.
+    pub(crate) inflight_etag_origins:
+        parking_lot::Mutex<std::collections::HashMap<String, crate::agent::models::EtagOrigin>>,
     /// Stable display path for forked sessions (original project path).
     ///
     /// Used by `build_user_message_prefix` (user-message `Workspace Path`),
@@ -1885,6 +1899,9 @@ mod chat_history_integrity_tests;
 #[cfg(test)]
 #[path = "acp_session_tests/turn/disk_full_tests.rs"]
 mod disk_full_tests;
+#[cfg(test)]
+#[path = "acp_session_tests/etag_request_origin_tests.rs"]
+mod etag_request_origin_tests;
 #[cfg(test)]
 #[path = "acp_session_tests/feedback_turn_lookup_tests.rs"]
 mod feedback_turn_lookup_tests;

@@ -1482,13 +1482,17 @@ impl MvpAgent {
         }
         self.reapply_storage_mode();
         self.reapply_official_marketplace();
-        {
+        let applied = {
             let cfg_snapshot = self.cfg.borrow().clone();
             if self.session_registry.resident_count() == 0 {
-                self.models_manager.apply_config_reselecting_default(cfg_snapshot);
+                self.models_manager
+                    .apply_config_reselecting_default(cfg_snapshot)
             } else {
-                self.models_manager.apply_config(cfg_snapshot);
+                self.models_manager.apply_config(cfg_snapshot)
             }
+        };
+        if let Err(e) = applied {
+            tracing::error!(error = %e, "ignoring remote settings reload: rejected model config");
         }
         self.sync_collection_config_gate();
         self.emit_settings_update_notification();

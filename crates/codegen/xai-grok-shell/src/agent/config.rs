@@ -139,7 +139,7 @@ impl std::fmt::Display for EnvKeys {
     }
 }
 /// Configuration for API endpoints.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct EndpointsConfig {
     /// cli chat proxy base URL. `None` = unset (resolvers apply the default);

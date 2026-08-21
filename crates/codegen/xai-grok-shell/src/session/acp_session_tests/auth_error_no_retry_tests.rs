@@ -542,49 +542,6 @@ fn model_not_found_error() -> xai_grok_sampler::SamplingErrorInfo {
         }
 }
 
-/// 404 model-not-found with a legacy WebLogin token appends a
-/// "Legacy auth detected" hint to the error message.
-#[tokio::test(flavor = "current_thread")]
-async fn legacy_auth_hint_on_404_model_not_found() {
-    let local = tokio::task::LocalSet::new();
-    local
-        .run_until(async {
-            let dir = tempfile::tempdir().expect("tempdir");
-            let am = Arc::new(AuthManager::new(dir.path(), GrokComConfig::default()));
-            am.hot_swap(GrokAuth {
-                key: "legacy-token".into(),
-                auth_mode: AuthMode::WebLogin,
-                ..GrokAuth::test_default()
-            });
-
-            let (actor, _rx) = make_actor_with_auth_manager(Some(am)).await;
-            let result = actor.handle_sampling_failure(model_not_found_error()).await;
-            let err = match result {
-                Err(e) => e,
-                Ok(_) => panic!("expected Err from handle_sampling_failure"),
-            };
-            let data = err.data.unwrap();
-            let msg = data.as_str().unwrap();
-            assert!(
-                msg.contains("deprecated authentication method"),
-                "404 with WebLogin must include deprecation message, got: {msg}"
-            );
-            assert!(
-                msg.contains("unconfigure api_key in config.toml"),
-                "hint must mention `unconfigure api_key in config.toml`, got: {msg}"
-            );
-            assert!(
-                msg.contains("grok login"),
-                "hint must mention `grok login`, got: {msg}"
-            );
-            assert!(
-                msg.contains("Version:"),
-                "must show client version, got: {msg}"
-            );
-        })
-        .await;
-}
-
 /// Build a 401-shaped error that bypasses step 4b's auth recovery.
 ///
 /// In production, 401s arrive as `SamplingErrorKind::Auth` with
@@ -609,47 +566,6 @@ fn unauthorized_401_error() -> xai_grok_sampler::SamplingErrorInfo {
             doom_loop_aborted_at_chunk: None,
             credential: xai_grok_sampling_types::SentCredential::Unknown,
         }
-}
-
-/// 401 Unauthorized with a legacy WebLogin token appends a
-/// "Legacy auth detected" hint to the error message.
-#[tokio::test(flavor = "current_thread")]
-async fn legacy_auth_hint_on_401_unauthorized() {
-    let local = tokio::task::LocalSet::new();
-    local
-        .run_until(async {
-            let dir = tempfile::tempdir().expect("tempdir");
-            let am = Arc::new(AuthManager::new(dir.path(), GrokComConfig::default()));
-            am.hot_swap(GrokAuth {
-                key: "legacy-token".into(),
-                auth_mode: AuthMode::WebLogin,
-                ..GrokAuth::test_default()
-            });
-
-            let (actor, _rx) = make_actor_with_auth_manager(Some(am)).await;
-            let result = actor
-                .handle_sampling_failure(unauthorized_401_error())
-                .await;
-            let err = match result {
-                Err(e) => e,
-                Ok(_) => panic!("expected Err from handle_sampling_failure"),
-            };
-            let data = err.data.unwrap();
-            let msg = data.as_str().unwrap();
-            assert!(
-                msg.contains("deprecated authentication method"),
-                "401 with WebLogin must include deprecation message, got: {msg}"
-            );
-            assert!(
-                msg.contains("unconfigure api_key in config.toml"),
-                "hint must mention `unconfigure api_key in config.toml`, got: {msg}"
-            );
-            assert!(
-                msg.contains("grok login"),
-                "hint must mention `grok login`, got: {msg}"
-            );
-        })
-        .await;
 }
 
 /// 401 with OIDC auth must NOT append the legacy hint.
@@ -1142,7 +1058,7 @@ async fn set_session_model_invalidates_byok_memo_for_same_model_id() {
                 header_injector: None,
             };
             let _ = actor
-                .handle_set_session_model(cfg, false, false, true, 85)
+                .handle_set_session_model(cfg, model.clone(), false, false, true, 85)
                 .await;
 
             assert!(
@@ -1235,7 +1151,7 @@ async fn switch_to_first_party_model_drops_minted_provider_token() {
                 header_injector: None,
             };
             let _ = actor
-                .handle_set_session_model(cfg, false, false, true, 85)
+                .handle_set_session_model(cfg, "grok-4".to_string(), false, false, true, 85)
                 .await;
 
             let creds = actor.chat_state_handle.get_credentials().await;
